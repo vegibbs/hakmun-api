@@ -50,8 +50,10 @@ app.post("/v1/generate/sentences", async (req, res) => {
     const safeTier =
       tier === "intermediate" || tier === "advanced" ? tier : "beginner";
 
-    const schema = {
+    const responseFormat = {
+      type: "json_schema",
       name: "HakMunGenerateSentencesResponse",
+      strict: true,
       schema: {
         type: "object",
         additionalProperties: false,
@@ -99,13 +101,7 @@ app.post("/v1/generate/sentences", async (req, res) => {
     const r = await openai.responses.create({
       model: "gpt-5.2",
       input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          name: schema.name,
-          schema: schema.schema
-        }
-      }
+      text: { format: responseFormat }
     });
 
     const jsonText = r.output_text;
