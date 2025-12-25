@@ -17,7 +17,6 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
 
 // Sentence naturalness validation (stub)
 // POST /v1/validate/sentence
-// Body: { sentenceID: string, text: string, language: "ko" }
 app.post("/v1/validate/sentence", (req, res) => {
   const { sentenceID, text } = req.body || {};
 
@@ -36,76 +35,80 @@ app.post("/v1/validate/sentence", (req, res) => {
 });
 
 
-// Sentence generation (OpenAI)
+// Sentence generation (OpenAI, JSON mode)
 // POST /v1/generate/sentences
-// Body: { profileKey: string, tier: "beginner"|"intermediate"|"advanced", count: number }
 app.post("/v1/generate/sentences", async (req, res) => {
   try {
     const { profileKey, tier, count } = req.body || {};
 
     if (!count || typeof count !== "number" || count < 1 || count > 30) {
-      return res.status(400).json({ error: "count must be a number between 1 and 30" });
+      return res.status(400).json({
+        error: "count must be a number between 1 and 30"
+      });
     }
 
     const safeTier =
       tier === "intermediate" || tier === "advanced" ? tier : "beginner";
 
-    const responseFormat = {
-      type: "json_schema",
-      name: "HakMunGenerateSentencesResponse",
-      strict: true,
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["sentences", "generatorVersion"],
-        properties: {
-          generatorVersion: { type: "string" },
-          sentences: {
-            type: "array",
-            minItems: 1,
-            maxItems: 30,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: ["id", "ko", "naturalnessScore"],
-              properties: {
-                id: { type: "string" },
-                ko: { type: "string" },
-                literal: { type: ["string", "null"] },
-                natural: { type: ["string", "null"] },
-                naturalnessScore: { type: "number", minimum: 0, maximum: 1 }
-              }
-            }
-          }
-        }
-      }
-    };
+    const prompt = `
+You generate Korean typing practice sentences for a language-learning app.
 
-    const prompt = [
-      "You generate Korean typing practice sentences for a language-learning app.",
-      "",
-      "Return EXACT JSON matching the provided schema.",
-      `Generate ${count} unique sentences.`,
-      `Tier: ${safeTier}.`,
-      "",
-      "Constraints:",
-      "- Sentences must be natural and realistic Korean.",
-      "- Avoid profanity, hate, sexual content, or unsafe topics.",
-      "- Each sentence must be a complete sentence with punctuation.",
-      "- Provide naturalnessScore in [0,1] as your self-evaluation (higher = more natural).",
-      "- Use stable unique IDs like GEN_A1B2C3D4 (8 chars after GEN_).",
-      "",
-      `Profile key (for logging only): ${profileKey || "unknown"}.`
-    ].join("\n");
+Return ONLY valid JSON. Do not include explanations or markdown.
+
+The JSON MUST have this shape:
+
+{
+  "generatorVersion": "string",
+  "sentences": [
+    {
+      "id": "string",
+      "ko": "string",
+      "literal": "string | null",
+      "natural": "string | null",
+      "naturalnessScore": number (0 to 1)
+    }
+  ]
+}
+
+Rules:
+- Generate exactly ${count} unique sentences.
+- Tier: ${safeTier}.
+- Sentences must be natural, realistic Korean.
+- Each sentence must be complete and properly punctuated.
+- Avoid unsafe content.
+- Use stable IDs like GEN_A1B2C3D4.
+- naturalnessScore is your self-evaluation (higher = more natural).
+
+Profile key (for logging only): ${profileKey || "unknown"}.
+`.trim();
 
     const r = await openai.responses.create({
       model: "gpt-5.2",
       input: prompt,
-      text: { format: responseFormat }
+      response_format: { type: "json" }
     });
 
-    const jsonText = r.output_text;
-    const payload = JSON.parse(jsonText);
+    const text = r.output_text;
+    const payload = JSON.parse(text);
+
+    // Minimal validation before returning
+    if (
+      !payload ||
+      typeof payload.generatorVersion !== "string" ||
+      !Array.isArray(payload.sentences)
+    ) {
+      throw new Error("Invalid JSON structure from model");
+    }
+
+    for (const s of payload.sentences) {
+      if (
+        typeof s.id !== "string" ||
+        typeof s.ko !== "string" ||
+        typeof s.naturalnessScore !== "number"
+      ) {
+        throw new Error("Invalid sentence item in model output");
+      }
+    }
 
     return res.json(payload);
   } catch (err) {
