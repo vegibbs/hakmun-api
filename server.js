@@ -102,7 +102,8 @@ app.post("/v1/generate/sentences", async (req, res) => {
       text: {
         format: {
           type: "json_schema",
-          json_schema: schema
+          name: schema.name,
+          schema: schema.schema
         }
       }
     });
