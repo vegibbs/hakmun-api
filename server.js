@@ -83,10 +83,12 @@ Profile key (for logging only): ${profileKey || "unknown"}.
 `.trim();
 
     const r = await openai.responses.create({
-      model: "gpt-5.2",
-      input: prompt,
-      response_format: { type: "json" }
-    });
+  model: "gpt-5.2",
+  input: prompt,
+  text: {
+    format: { type: "json" }
+  }
+});
 
     const text = r.output_text;
     const payload = JSON.parse(text);
