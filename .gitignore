@@ -1,0 +1,12 @@
+# Node
+node_modules/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+# IDE (JetBrains / PyCharm)
+.idea/
+*.iml
