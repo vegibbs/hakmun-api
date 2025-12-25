@@ -76,5 +76,5 @@ app.post("/v1/generate/sentences", (req, res) => {
 
 
 // IMPORTANT: listen on Railway-provided PORT
-const port = process.env.PORT;
+const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`listening on ${port}`));
