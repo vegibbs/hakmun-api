@@ -86,7 +86,7 @@ Profile key (for logging only): ${profileKey || "unknown"}.
   model: "gpt-5.2",
   input: prompt,
   text: {
-    format: { type: "json" }
+    format: { type: "json_object" }
   }
 });
 
