@@ -1,23 +1,148 @@
 const express = require("express");
 const OpenAI = require("openai");
+const { createRemoteJWKSet, jwtVerify } = require("jose");
+const { Pool } = require("pg");
 
 const app = express();
-
-// Parse JSON bodies
 app.use(express.json());
 
-// OpenAI client (server-side only)
+/* ------------------------------------------------------------------
+   OpenAI (server-side only)
+------------------------------------------------------------------ */
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// Health check
+/* ------------------------------------------------------------------
+   Postgres (Railway)
+------------------------------------------------------------------ */
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.NODE_ENV === "production"
+      ? { rejectUnauthorized: false }
+      : false
+});
+
+/* ------------------------------------------------------------------
+   Apple Sign In verification
+------------------------------------------------------------------ */
+
+const APPLE_JWKS = createRemoteJWKSet(
+  new URL("https://appleid.apple.com/auth/keys")
+);
+
+async function verifyAppleToken(identityToken) {
+  const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+    issuer: "https://appleid.apple.com",
+    audience: process.env.APPLE_CLIENT_ID
+  });
+  return payload; // includes `sub`
+}
+
+/* ------------------------------------------------------------------
+   Auth middleware
+------------------------------------------------------------------ */
+async function requireUser(req, res, next) {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "missing authorization token" });
+    }
+
+    const token = header.slice("Bearer ".length);
+    const payload = await verifyAppleToken(token);
+
+    if (!payload || !payload.sub) {
+      return res.status(401).json({ error: "invalid apple token" });
+    }
+
+    req.user = { appleUserID: payload.sub };
+    return next();
+  } catch (err) {
+    console.error("Auth error:", err);
+    return res.status(401).json({ error: "authentication failed" });
+  }
+}
+
+/* ------------------------------------------------------------------
+   Bootstrap user + profile (server-side)
+------------------------------------------------------------------ */
+async function ensureUser(appleUserID) {
+  await pool.query(
+    `
+    insert into users (apple_user_id)
+    values ($1)
+    on conflict (apple_user_id) do nothing
+    `,
+    [appleUserID]
+  );
+
+  await pool.query(
+    `
+    insert into user_profiles (apple_user_id, schema_version, settings_json)
+    values ($1, 1, '{}'::jsonb)
+    on conflict (apple_user_id) do nothing
+    `,
+    [appleUserID]
+  );
+}
+
+/* ------------------------------------------------------------------
+   Health check
+------------------------------------------------------------------ */
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
+/* ------------------------------------------------------------------
+   GET /v1/me
+------------------------------------------------------------------ */
+app.get("/v1/me", requireUser, async (req, res) => {
+  const { appleUserID } = req.user;
 
-// Sentence naturalness validation (stub)
-// POST /v1/validate/sentence
-app.post("/v1/validate/sentence", (req, res) => {
+  await ensureUser(appleUserID);
+
+  const result = await pool.query(
+    `
+    select apple_user_id, schema_version, settings_json, updated_at
+    from user_profiles
+    where apple_user_id = $1
+    `,
+    [appleUserID]
+  );
+
+  return res.json({
+    appleUserID,
+    profile: result.rows[0] || null
+  });
+});
+
+/* ------------------------------------------------------------------
+   PUT /v1/me/profile
+   v0: settings_json blob (schema_version stays 1 for now)
+------------------------------------------------------------------ */
+app.put("/v1/me/profile", requireUser, async (req, res) => {
+  const { appleUserID } = req.user;
+  const updates = req.body || {};
+
+  await ensureUser(appleUserID);
+
+  await pool.query(
+    `
+    update user_profiles
+    set settings_json = $2,
+        updated_at = now()
+    where apple_user_id = $1
+    `,
+    [appleUserID, updates]
+  );
+
+  return res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------
+   Sentence validation (stub)
+------------------------------------------------------------------ */
+app.post("/v1/validate/sentence", requireUser, (req, res) => {
   const { sentenceID, text } = req.body || {};
 
   if (!sentenceID || !text) {
@@ -27,19 +152,18 @@ app.post("/v1/validate/sentence", (req, res) => {
     });
   }
 
-  // STUB: always return OK for now
   return res.json({
     verdict: "OK",
     reason: ""
   });
 });
 
-
-// Sentence generation (OpenAI, JSON mode)
-// POST /v1/generate/sentences
-app.post("/v1/generate/sentences", async (req, res) => {
+/* ------------------------------------------------------------------
+   Sentence generation (global worker for now)
+------------------------------------------------------------------ */
+app.post("/v1/generate/sentences", requireUser, async (req, res) => {
   try {
-    const { profileKey, tier, count } = req.body || {};
+    const { tier, count } = req.body || {};
 
     if (!count || typeof count !== "number" || count < 1 || count > 30) {
       return res.status(400).json({
@@ -78,49 +202,24 @@ Rules:
 - Avoid unsafe content.
 - Use stable IDs like GEN_A1B2C3D4.
 - naturalnessScore is your self-evaluation (higher = more natural).
-
-Profile key (for logging only): ${profileKey || "unknown"}.
 `.trim();
 
     const r = await openai.responses.create({
-  model: "gpt-5.2",
-  input: prompt,
-  text: {
-    format: { type: "json_object" }
-  }
-});
+      model: "gpt-5.2",
+      input: prompt,
+      text: { format: { type: "json_object" } }
+    });
 
-    const text = r.output_text;
-    const payload = JSON.parse(text);
-
-    // Minimal validation before returning
-    if (
-      !payload ||
-      typeof payload.generatorVersion !== "string" ||
-      !Array.isArray(payload.sentences)
-    ) {
-      throw new Error("Invalid JSON structure from model");
-    }
-
-    for (const s of payload.sentences) {
-      if (
-        typeof s.id !== "string" ||
-        typeof s.ko !== "string" ||
-        typeof s.naturalnessScore !== "number"
-      ) {
-        throw new Error("Invalid sentence item in model output");
-      }
-    }
-
+    const payload = JSON.parse(r.output_text);
     return res.json(payload);
   } catch (err) {
-    return res.status(500).json({
-      error: String(err)
-    });
+    console.error(err);
+    return res.status(500).json({ error: "generation failed" });
   }
 });
 
-
-// IMPORTANT: listen on Railway-provided PORT (fallback for local runs)
+/* ------------------------------------------------------------------
+   Start server (Railway)
+------------------------------------------------------------------ */
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`listening on ${port}`));
