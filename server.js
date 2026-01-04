@@ -1,3 +1,10 @@
+// server.js — HakMun API (v0.2)
+// Best-practice identity flow:
+// - Apple `sub` is the only backend identity key (never shown in UI)
+// - Username is a globally-unique primary handle (CITEXT) stored in user_handles
+// - Aliases resolve to a primary handle
+// - Client uses GET /v1/handles/me to learn the canonical username after sign-in
+
 const express = require("express");
 const OpenAI = require("openai");
 const { createRemoteJWKSet, jwtVerify } = require("jose");
@@ -152,15 +159,55 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   GET /v1/handles/me
+   Returns the authenticated user's canonical primary handle (username).
+
+   Response:
+   { handle, kind, primary_handle, created_at }
+------------------------------------------------------------------ */
+app.get("/v1/handles/me", requireUser, async (req, res) => {
+  const { appleUserID } = req.user;
+
+  await ensureUser(appleUserID);
+
+  try {
+    const { rows } = await pool.query(
+      `
+      select handle, kind, primary_handle, created_at
+      from user_handles
+      where apple_user_id = $1 and kind = 'primary'
+      limit 1
+      `,
+      [appleUserID]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "no username set" });
+    }
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("handles/me failed:", err);
+    return res.status(500).json({ error: "resolve failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    POST /v1/handles/reserve
    Reserves a globally-unique primary username for the authenticated user.
 
    Body:
    { "handle": "버논" }
+
+   Response:
+   { handle, kind, primary_handle }
 ------------------------------------------------------------------ */
 app.post("/v1/handles/reserve", requireUser, async (req, res) => {
   const { appleUserID } = req.user;
-  const handle = normalizeHandle(req.body?.handle);
+
+  // Best practice: canonical input is `handle`.
+  // Tolerate `username` for older clients during transition.
+  const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
 
   if (!handle) {
     return res.status(400).json({ error: "handle is required" });
