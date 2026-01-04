@@ -27,7 +27,6 @@ const pool = new Pool({
 /* ------------------------------------------------------------------
    Apple Sign In verification
 ------------------------------------------------------------------ */
-
 const APPLE_JWKS = createRemoteJWKSet(
   new URL("https://appleid.apple.com/auth/keys")
 );
@@ -89,6 +88,19 @@ async function ensureUser(appleUserID) {
 }
 
 /* ------------------------------------------------------------------
+   Username/Handle helpers
+------------------------------------------------------------------ */
+function normalizeHandle(handle) {
+  return String(handle || "").trim();
+}
+
+function isValidHandle(handle) {
+  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
+  // NOTE: CITEXT enforces case-insensitive uniqueness; we still validate shape here.
+  return /^[\w.\-가-힣]{2,24}$/.test(handle);
+}
+
+/* ------------------------------------------------------------------
    Health check
 ------------------------------------------------------------------ */
 app.get("/", (req, res) => res.send("hakmun-api up"));
@@ -137,6 +149,107 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
   );
 
   return res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/handles/reserve
+   Reserves a globally-unique primary username for the authenticated user.
+
+   Body:
+   { "handle": "버논" }
+------------------------------------------------------------------ */
+app.post("/v1/handles/reserve", requireUser, async (req, res) => {
+  const { appleUserID } = req.user;
+  const handle = normalizeHandle(req.body?.handle);
+
+  if (!handle) {
+    return res.status(400).json({ error: "handle is required" });
+  }
+  if (!isValidHandle(handle)) {
+    return res.status(400).json({
+      error:
+        "Invalid username. Use 2–24 characters: letters, numbers, underscore, dot, hyphen, or Hangul."
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Ensure user exists (idempotent)
+    await client.query(
+      `
+      insert into users (apple_user_id)
+      values ($1)
+      on conflict (apple_user_id) do nothing
+      `,
+      [appleUserID]
+    );
+
+    // Reserve primary handle
+    await client.query(
+      `
+      insert into user_handles (handle, apple_user_id, kind, primary_handle)
+      values ($1, $2, 'primary', $1)
+      `,
+      [handle, appleUserID]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      handle,
+      kind: "primary",
+      primary_handle: handle
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+
+    // Unique violation (CITEXT PK / unique index)
+    if (err && err.code === "23505") {
+      return res.status(409).json({ error: "username already taken" });
+    }
+
+    console.error("reserve handle failed:", err);
+    return res.status(500).json({ error: "reserve failed" });
+  } finally {
+    client.release();
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/handles/resolve?handle=vernon
+   Resolves any handle (username or alias) to its primary_handle.
+
+   Response:
+   { handle, kind, primary_handle }
+------------------------------------------------------------------ */
+app.get("/v1/handles/resolve", requireUser, async (req, res) => {
+  const handle = normalizeHandle(req.query?.handle);
+
+  if (!handle) {
+    return res.status(400).json({ error: "handle is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `
+      select handle, kind, primary_handle
+      from user_handles
+      where handle = $1
+      `,
+      [handle]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "username not found" });
+    }
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("resolve handle failed:", err);
+    return res.status(500).json({ error: "resolve failed" });
+  }
 });
 
 /* ------------------------------------------------------------------
