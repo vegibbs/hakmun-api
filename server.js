@@ -1,15 +1,14 @@
-// server.js — HakMun API (v0.4)
-// Identity architecture (real-app style):
-// - Apple `sub` is NOT your canonical user key.
-// - Canonical key is users.user_id (UUID).
-// - auth_identities maps (provider, subject, audience) -> user_id.
-// - For now, existing tables user_profiles/user_handles are still keyed by apple_user_id.
-//   We keep them working while we migrate them later.
+// server.js — HakMun API (v0.5)
+// Canonical identity architecture (real-app style):
+// - Canonical user key: users.user_id (UUID)
+// - auth_identities maps (provider, subject, audience) -> user_id
+// - user_handles is now keyed by user_id (migration 030)
+// - user_profiles is still keyed by apple_user_id for now (will migrate next)
 //
-// Stability guardrails:
-// - Fail fast if APPLE_CLIENT_ID / DATABASE_URL are missing.
-// - Log APPLE_CLIENT_ID and DATABASE host on boot (no secrets).
-// - Provide /v1/auth/whoami for quick identity sanity checks.
+// Guardrails:
+// - Fail fast if APPLE_CLIENT_ID / DATABASE_URL missing
+// - Log active identity config on boot (no secrets)
+// - /v1/auth/whoami for sanity checks
 
 const express = require("express");
 const OpenAI = require("openai");
@@ -103,11 +102,11 @@ function isValidHandle(handle) {
 /* ------------------------------------------------------------------
    Internal: ensure a user exists and returns canonical user_id.
    - Resolves via auth_identities first.
-   - If missing, creates a new users row + auth_identities row.
-   - Also ensures legacy user_profiles row exists keyed by apple_user_id.
+   - If missing, creates a users row + auth_identities row.
+   - Also ensures legacy user_profiles row exists keyed by apple_user_id (for now).
 ------------------------------------------------------------------ */
 async function ensureCanonicalUser({ appleSubject, audience }) {
-  // 1) Try to resolve via auth_identities
+  // 1) Resolve via auth_identities
   const found = await pool.query(
     `
     select user_id
@@ -131,7 +130,7 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       [appleSubject]
     );
 
-    // Keep last_seen_at fresh if table has it
+    // Touch last_seen_at if present
     await pool.query(
       `
       update users
@@ -144,13 +143,12 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
     return userID;
   }
 
-  // 2) No identity row yet -> create user + identity (transactional)
+  // 2) Create user + identity transactionally
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 2a) If a legacy users row exists by apple_user_id, reuse it (helps if you seeded users earlier)
-    // NOTE: This assumes users.apple_user_id exists (it does in your schema).
+    // Try to reuse a legacy user row keyed by apple_user_id
     const existingUser = await client.query(
       `
       select user_id
@@ -165,7 +163,6 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
     if (existingUser.rows && existingUser.rows.length > 0) {
       userID = existingUser.rows[0].user_id;
     } else {
-      // Insert new canonical user row. (user_id has no default in your schema, so we generate it here.)
       const created = await client.query(
         `
         insert into users (user_id, apple_user_id, last_seen_at)
@@ -177,7 +174,6 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       userID = created.rows[0].user_id;
     }
 
-    // 2b) Ensure auth identity row exists
     await client.query(
       `
       insert into auth_identities (provider, subject, audience, user_id)
@@ -187,7 +183,7 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       [appleSubject, audience, userID]
     );
 
-    // 2c) Ensure legacy profile exists (still apple_user_id keyed for now)
+    // Ensure legacy profile exists (still apple_user_id keyed for now)
     await client.query(
       `
       insert into user_profiles (apple_user_id, schema_version, settings_json)
@@ -209,8 +205,6 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
 
 /* ------------------------------------------------------------------
    Auth middleware (canonical)
-   - Verifies Apple token
-   - Resolves/creates canonical user_id via auth_identities
 ------------------------------------------------------------------ */
 async function requireUser(req, res, next) {
   try {
@@ -227,13 +221,11 @@ async function requireUser(req, res, next) {
     }
 
     const appleSubject = payload.sub;
-
     const userID = await ensureCanonicalUser({
       appleSubject,
       audience: APPLE_CLIENT_ID
     });
 
-    // Expose both: canonical userID + legacy appleUserID (sub)
     req.user = {
       userID,
       appleUserID: appleSubject,
@@ -254,15 +246,10 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
    GET /v1/auth/whoami
-   Authenticated introspection (for stability checks)
 ------------------------------------------------------------------ */
 app.get("/v1/auth/whoami", requireUser, async (req, res) => {
   const { userID, appleUserID, audience } = req.user;
-  return res.json({
-    userID,
-    appleUserID,
-    audience
-  });
+  return res.json({ userID, appleUserID, audience });
 });
 
 /* ------------------------------------------------------------------
@@ -312,21 +299,20 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
 /* ------------------------------------------------------------------
    GET /v1/handles/me
    Returns the authenticated user's canonical primary handle (username).
-
-   NOTE: user_handles is still keyed by apple_user_id for now.
+   (Now keyed by user_id.)
 ------------------------------------------------------------------ */
 app.get("/v1/handles/me", requireUser, async (req, res) => {
-  const { appleUserID } = req.user;
+  const { userID } = req.user;
 
   try {
     const { rows } = await pool.query(
       `
       select handle, kind, primary_handle, created_at
       from user_handles
-      where apple_user_id = $1 and kind = 'primary'
+      where user_id = $1 and kind = 'primary'
       limit 1
       `,
-      [appleUserID]
+      [userID]
     );
 
     if (!rows || rows.length === 0) {
@@ -343,12 +329,10 @@ app.get("/v1/handles/me", requireUser, async (req, res) => {
 /* ------------------------------------------------------------------
    POST /v1/handles/reserve
    Reserves a globally-unique primary username for the authenticated user.
-
-   Body:
-   { "handle": "버논" }
+   (Now writes user_handles.user_id.)
 ------------------------------------------------------------------ */
 app.post("/v1/handles/reserve", requireUser, async (req, res) => {
-  const { appleUserID } = req.user;
+  const { userID } = req.user;
 
   const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
 
@@ -366,13 +350,12 @@ app.post("/v1/handles/reserve", requireUser, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Reserve primary handle (apple_user_id still the FK here)
     await client.query(
       `
-      insert into user_handles (handle, apple_user_id, kind, primary_handle)
-      values ($1, $2, 'primary', $1)
+      insert into user_handles (handle, apple_user_id, kind, primary_handle, user_id)
+      values ($1, null, 'primary', $1, $2)
       `,
-      [handle, appleUserID]
+      [handle, userID]
     );
 
     await client.query("COMMIT");
