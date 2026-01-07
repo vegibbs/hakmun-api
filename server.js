@@ -1,5 +1,9 @@
-// server.js — HakMun API (v0.7)
-// Canonical identity + multi-audience Apple Sign In
+// server.js — HakMun API (v0.7.1)
+// Canonical identity + handles + multi-audience Apple Sign In
+//
+// FIX: Legacy user_profiles insert is now NON-FATAL (never blocks auth).
+// Reason: user_profiles is keyed by apple_user_id (legacy), and can have FK constraints
+// that are not guaranteed to be satisfiable for all identity flows.
 
 const express = require("express");
 const { createRemoteJWKSet, jwtVerify } = require("jose");
@@ -31,9 +35,18 @@ const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
 const DATABASE_URL = requireEnv("DATABASE_URL");
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
+function safeDbHost(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "<invalid DATABASE_URL>";
+  }
+}
+
 console.log("[boot] HakMun API starting");
+console.log("[boot] NODE_ENV =", process.env.NODE_ENV || "<unset>");
 console.log("[boot] APPLE_CLIENT_IDS =", APPLE_CLIENT_IDS.join(", "));
-console.log("[boot] DATABASE_URL host =", new URL(DATABASE_URL).host);
+console.log("[boot] DATABASE_URL host =", safeDbHost(DATABASE_URL));
 console.log("[boot] OPENAI enabled =", Boolean(OPENAI_API_KEY));
 
 /* ------------------------------------------------------------------
@@ -68,36 +81,39 @@ async function verifyAppleToken(identityToken) {
     audience: APPLE_CLIENT_IDS
   });
 
-  const aud = Array.isArray(payload.aud)
-    ? payload.aud[0]
-    : payload.aud;
-
+  const aud = Array.isArray(payload.aud) ? payload.aud[0] : payload.aud;
   if (!aud || !APPLE_CLIENT_IDS.includes(aud)) {
-    throw new Error(`Apple token audience not allowed: ${aud}`);
+    throw new Error(`Apple token audience not allowed: ${String(aud)}`);
   }
-
   if (!payload.sub) {
-    throw new Error("Apple token missing subject");
+    throw new Error("Apple token missing subject (sub)");
   }
 
-  return {
-    appleSubject: payload.sub,
-    audience: aud
-  };
+  return { appleSubject: payload.sub, audience: aud };
 }
 
 /* ------------------------------------------------------------------
-   Identity helpers
+   Legacy helpers (non-fatal)
 ------------------------------------------------------------------ */
-async function ensureLegacyUserProfile(appleUserID) {
-  await pool.query(
-    `
-    insert into user_profiles (apple_user_id, schema_version, settings_json)
-    values ($1, 1, '{}'::jsonb)
-    on conflict (apple_user_id) do nothing
-    `,
-    [appleUserID]
-  );
+async function ensureLegacyUserProfileNonFatal(appleUserID) {
+  // Legacy storage: user_profiles keyed by apple_user_id.
+  // IMPORTANT: This must NEVER block auth. If FK constraints exist, swallow and continue.
+  try {
+    await pool.query(
+      `
+      insert into user_profiles (apple_user_id, schema_version, settings_json)
+      values ($1, 1, '{}'::jsonb)
+      on conflict (apple_user_id) do nothing
+      `,
+      [appleUserID]
+    );
+  } catch (err) {
+    console.warn(
+      "[warn] ensureLegacyUserProfileNonFatal failed (continuing):",
+      err?.code,
+      err?.detail || err?.message
+    );
+  }
 }
 
 async function touchLastSeen(userID) {
@@ -111,39 +127,39 @@ async function touchLastSeen(userID) {
   );
 }
 
+/* ------------------------------------------------------------------
+   Canonical identity resolution
+------------------------------------------------------------------ */
 async function resolveUserIDFromIdentity({ provider, subject, audience }) {
   const { rows } = await pool.query(
     `
     select user_id
     from auth_identities
-    where provider = $1
-      and subject = $2
-      and audience = $3
+    where provider = $1 and subject = $2 and audience = $3
     limit 1
     `,
     [provider, subject, audience]
   );
-  return rows.length ? rows[0].user_id : null;
+  return rows && rows.length ? rows[0].user_id : null;
 }
 
-/* ------------------------------------------------------------------
-   Canonical identity resolution
------------------------------------------------------------------- */
 async function ensureCanonicalUser({ appleSubject, audience }) {
-  // 1) Exact identity match
-  const direct = await resolveUserIDFromIdentity({
+  // 1) Resolve via auth_identities (provider, subject, audience)
+  const userID = await resolveUserIDFromIdentity({
     provider: "apple",
     subject: appleSubject,
     audience
   });
 
-  if (direct) {
-    await ensureLegacyUserProfile(appleSubject);
-    await touchLastSeen(direct);
-    return direct;
+  if (userID) {
+    // Legacy profile is best-effort only
+    await ensureLegacyUserProfileNonFatal(appleSubject);
+    await touchLastSeen(userID);
+    return userID;
   }
 
-  // 2) Link new audience to existing user (by apple_user_id)
+  // 2) Not found -> reuse existing users row by apple_user_id OR create one,
+  //    then bind auth_identities for this audience.
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -158,10 +174,9 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       [appleSubject]
     );
 
-    let userID;
-
-    if (existing.rows.length) {
-      userID = existing.rows[0].user_id;
+    let canonicalUserID;
+    if (existing.rows && existing.rows.length) {
+      canonicalUserID = existing.rows[0].user_id;
     } else {
       const created = await client.query(
         `
@@ -171,7 +186,7 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
         `,
         [appleSubject]
       );
-      userID = created.rows[0].user_id;
+      canonicalUserID = created.rows[0].user_id;
     }
 
     await client.query(
@@ -180,14 +195,33 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       values ('apple', $1, $2, $3)
       on conflict do nothing
       `,
-      [appleSubject, audience, userID]
+      [appleSubject, audience, canonicalUserID]
     );
 
-    await ensureLegacyUserProfile(appleSubject);
-    await touchLastSeen(userID);
+    // Legacy profile is still best-effort. Use the same transaction client.
+    try {
+      await client.query(
+        `
+        insert into user_profiles (apple_user_id, schema_version, settings_json)
+        values ($1, 1, '{}'::jsonb)
+        on conflict (apple_user_id) do nothing
+        `,
+        [appleSubject]
+      );
+    } catch (err) {
+      console.warn(
+        "[warn] (tx) legacy user_profiles insert failed (continuing):",
+        err?.code,
+        err?.detail || err?.message
+      );
+    }
 
     await client.query("COMMIT");
-    return userID;
+
+    // Last-seen outside tx is fine
+    await touchLastSeen(canonicalUserID);
+
+    return canonicalUserID;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -209,10 +243,7 @@ async function requireUser(req, res, next) {
     const token = header.slice("Bearer ".length);
     const { appleSubject, audience } = await verifyAppleToken(token);
 
-    const userID = await ensureCanonicalUser({
-      appleSubject,
-      audience
-    });
+    const userID = await ensureCanonicalUser({ appleSubject, audience });
 
     req.user = {
       userID,
@@ -220,52 +251,117 @@ async function requireUser(req, res, next) {
       audience
     };
 
-    next();
+    return next();
   } catch (err) {
     console.error("Auth error:", err);
-    res.status(401).json({ error: "authentication failed" });
+    return res.status(401).json({ error: "authentication failed" });
   }
 }
 
 /* ------------------------------------------------------------------
    Routes
 ------------------------------------------------------------------ */
-app.get("/", (_, res) => res.send("hakmun-api up"));
+app.get("/", (req, res) => res.send("hakmun-api up"));
 
-app.get("/v1/auth/whoami", requireUser, (req, res) => {
-  res.json(req.user);
+app.get("/v1/auth/whoami", requireUser, async (req, res) => {
+  return res.json(req.user);
 });
+
+/* ------------------------------------------------------------------
+   GET /v1/me (legacy profiles keyed by apple_user_id)
+------------------------------------------------------------------ */
+app.get("/v1/me", requireUser, async (req, res) => {
+  const { appleUserID, userID } = req.user;
+
+  const result = await pool.query(
+    `
+    select apple_user_id, schema_version, settings_json, updated_at
+    from user_profiles
+    where apple_user_id = $1
+    `,
+    [appleUserID]
+  );
+
+  return res.json({
+    userID,
+    appleUserID,
+    profile: result.rows[0] || null
+  });
+});
+
+app.put("/v1/me/profile", requireUser, async (req, res) => {
+  const { appleUserID } = req.user;
+  const updates = req.body || {};
+
+  await pool.query(
+    `
+    update user_profiles
+    set settings_json = $2,
+        updated_at = now()
+    where apple_user_id = $1
+    `,
+    [appleUserID, updates]
+  );
+
+  return res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------
+   Handles
+------------------------------------------------------------------ */
+function normalizeHandle(handle) {
+  return String(handle || "").trim();
+}
+
+function isValidHandle(handle) {
+  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
+  return /^[\w.\-가-힣]{2,24}$/.test(handle);
+}
 
 app.get("/v1/handles/me", requireUser, async (req, res) => {
   const { userID } = req.user;
 
-  const { rows } = await pool.query(
-    `
-    select handle, kind, primary_handle, created_at
-    from user_handles
-    where user_id = $1 and kind = 'primary'
-    limit 1
-    `,
-    [userID]
-  );
+  try {
+    const { rows } = await pool.query(
+      `
+      select handle, kind, primary_handle, created_at
+      from user_handles
+      where user_id = $1 and kind = 'primary'
+      limit 1
+      `,
+      [userID]
+    );
 
-  if (!rows.length) {
-    return res.status(404).json({ error: "no username set" });
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "no username set" });
+    }
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("handles/me failed:", err);
+    return res.status(500).json({ error: "resolve failed" });
   }
-
-  res.json(rows[0]);
 });
 
 app.post("/v1/handles/reserve", requireUser, async (req, res) => {
   const { userID } = req.user;
-  const handle = String(req.body?.handle || "").trim();
+  const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
 
-  if (!/^[\w.\-가-힣]{2,24}$/.test(handle)) {
-    return res.status(400).json({ error: "invalid username" });
+  if (!handle) {
+    return res.status(400).json({ error: "handle is required" });
+  }
+  if (!isValidHandle(handle)) {
+    return res.status(400).json({
+      error:
+        "Invalid username. Use 2–24 characters: letters, numbers, underscore, dot, hyphen, or Hangul."
+    });
   }
 
+  const client = await pool.connect();
   try {
-    await pool.query(
+    await client.query("BEGIN");
+
+    await client.query(
       `
       insert into user_handles (handle, user_id, kind, primary_handle)
       values ($1, $2, 'primary', $1)
@@ -273,19 +369,140 @@ app.post("/v1/handles/reserve", requireUser, async (req, res) => {
       [handle, userID]
     );
 
-    res.json({ handle });
+    await client.query("COMMIT");
+
+    return res.json({
+      handle,
+      kind: "primary",
+      primary_handle: handle
+    });
   } catch (err) {
-    if (err.code === "23505") {
+    await client.query("ROLLBACK");
+
+    if (err && err.code === "23505") {
       return res.status(409).json({ error: "username already taken" });
     }
-    throw err;
+
+    console.error("reserve handle failed:", err);
+    return res.status(500).json({ error: "reserve failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/v1/handles/resolve", requireUser, async (req, res) => {
+  const handle = normalizeHandle(req.query?.handle);
+
+  if (!handle) {
+    return res.status(400).json({ error: "handle is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `
+      select handle, kind, primary_handle
+      from user_handles
+      where handle = $1
+      `,
+      [handle]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "username not found" });
+    }
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("resolve handle failed:", err);
+    return res.status(500).json({ error: "resolve failed" });
   }
 });
 
 /* ------------------------------------------------------------------
-   Start server
+   Sentence validation (stub)
+------------------------------------------------------------------ */
+app.post("/v1/validate/sentence", requireUser, (req, res) => {
+  const { sentenceID, text } = req.body || {};
+
+  if (!sentenceID || !text) {
+    return res.status(400).json({
+      verdict: "NEEDS_REVIEW",
+      reason: "missing sentenceID or text"
+    });
+  }
+
+  return res.json({
+    verdict: "OK",
+    reason: ""
+  });
+});
+
+/* ------------------------------------------------------------------
+   Sentence generation (global worker for now)
+------------------------------------------------------------------ */
+app.post("/v1/generate/sentences", requireUser, async (req, res) => {
+  try {
+    if (!openai) {
+      return res.status(503).json({ error: "OpenAI is not configured" });
+    }
+
+    const { tier, count } = req.body || {};
+
+    if (!count || typeof count !== "number" || count < 1 || count > 30) {
+      return res.status(400).json({
+        error: "count must be a number between 1 and 30"
+      });
+    }
+
+    const safeTier =
+      tier === "intermediate" || tier === "advanced" ? tier : "beginner";
+
+    const prompt = `
+You generate Korean typing practice sentences for a language-learning app.
+
+Return ONLY valid JSON. Do not include explanations or markdown.
+
+The JSON MUST have this shape:
+
+{
+  "generatorVersion": "string",
+  "sentences": [
+    {
+      "id": "string",
+      "ko": "string",
+      "literal": "string | null",
+      "natural": "string | null",
+      "naturalnessScore": number (0 to 1)
+    }
+  ]
+}
+
+Rules:
+- Generate exactly ${count} unique sentences.
+- Tier: ${safeTier}.
+- Sentences must be natural, realistic Korean.
+- Each sentence must be complete and properly punctuated.
+- Avoid unsafe content.
+- Use stable IDs like GEN_A1B2C3D4.
+- naturalnessScore is your self-evaluation (higher = more natural).
+`.trim();
+
+    const r = await openai.responses.create({
+      model: "gpt-5.2",
+      input: prompt,
+      text: { format: { type: "json_object" } }
+    });
+
+    const payload = JSON.parse(r.output_text);
+    return res.json(payload);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "generation failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   Start server (Railway)
 ------------------------------------------------------------------ */
 const port = process.env.PORT || 8080;
-app.listen(port, () =>
-  console.log(`[boot] listening on ${port}`)
-);
+app.listen(port, () => console.log(`listening on ${port}`));
