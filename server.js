@@ -1,20 +1,39 @@
-// server.js — HakMun API (v0.7.1)
-// Canonical identity + handles + multi-audience Apple Sign In
+// server.js — HakMun API (v0.8)
+// Canonical identity + handles + secure private asset storage (signed URLs)
 //
-// FIX: Legacy user_profiles insert is now NON-FATAL (never blocks auth).
-// Reason: user_profiles is keyed by apple_user_id (legacy), and can have FK constraints
-// that are not guaranteed to be satisfiable for all identity flows.
+// Identity:
+// - Canonical user key: users.user_id (UUID)
+// - auth_identities maps (provider, subject, audience) -> user_id
+// - Apple `sub` is auth identity (subject), not a data key.
+//
+// Handles:
+// - user_handles is keyed by user_id
+// - handle globally unique (CITEXT PK)
+// - aliases resolve to primary_handle
+//
+// Legacy:
+// - user_profiles is still keyed by apple_user_id (legacy).
+// - Legacy profile writes are best-effort and MUST NOT break auth.
+//
+// Secure assets:
+// - Store profile photos privately in Railway bucket
+// - Expose read access via signed URLs (time-limited)
 
 const express = require("express");
+const OpenAI = require("openai");
 const { createRemoteJWKSet, jwtVerify } = require("jose");
 const { Pool } = require("pg");
-const OpenAI = require("openai");
+
+// Secure object storage (S3-compatible)
+const multer = require("multer");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
 app.use(express.json());
 
 /* ------------------------------------------------------------------
-   Env helpers
+   Hard config guardrails (fail fast)
 ------------------------------------------------------------------ */
 function requireEnv(name) {
   const v = process.env[name];
@@ -24,20 +43,23 @@ function requireEnv(name) {
   return v;
 }
 
-/* ------------------------------------------------------------------
-   Environment
------------------------------------------------------------------- */
 const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 const DATABASE_URL = requireEnv("DATABASE_URL");
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
+// OPENAI is optional unless you call generation endpoints.
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+/* ------------------------------------------------------------------
+   Safe boot logging (no secrets)
+------------------------------------------------------------------ */
 function safeDbHost(url) {
   try {
-    return new URL(url).host;
+    const u = new URL(url);
+    return u.host;
   } catch {
     return "<invalid DATABASE_URL>";
   }
@@ -47,10 +69,18 @@ console.log("[boot] HakMun API starting");
 console.log("[boot] NODE_ENV =", process.env.NODE_ENV || "<unset>");
 console.log("[boot] APPLE_CLIENT_IDS =", APPLE_CLIENT_IDS.join(", "));
 console.log("[boot] DATABASE_URL host =", safeDbHost(DATABASE_URL));
-console.log("[boot] OPENAI enabled =", Boolean(OPENAI_API_KEY));
+console.log("[boot] OPENAI_API_KEY set =", Boolean(OPENAI_API_KEY));
 
 /* ------------------------------------------------------------------
-   Postgres
+   OpenAI (server-side only)
+------------------------------------------------------------------ */
+const openai =
+  OPENAI_API_KEY && String(OPENAI_API_KEY).trim()
+    ? new OpenAI({ apiKey: OPENAI_API_KEY })
+    : null;
+
+/* ------------------------------------------------------------------
+   Postgres (Railway)
 ------------------------------------------------------------------ */
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -59,14 +89,6 @@ const pool = new Pool({
       ? { rejectUnauthorized: false }
       : false
 });
-
-/* ------------------------------------------------------------------
-   OpenAI (optional)
------------------------------------------------------------------- */
-const openai =
-  OPENAI_API_KEY && OPENAI_API_KEY.trim()
-    ? new OpenAI({ apiKey: OPENAI_API_KEY })
-    : null;
 
 /* ------------------------------------------------------------------
    Apple Sign In verification
@@ -93,11 +115,23 @@ async function verifyAppleToken(identityToken) {
 }
 
 /* ------------------------------------------------------------------
-   Legacy helpers (non-fatal)
+   Helpers
+------------------------------------------------------------------ */
+function normalizeHandle(handle) {
+  return String(handle || "").trim();
+}
+
+function isValidHandle(handle) {
+  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
+  return /^[\w.\-가-힣]{2,24}$/.test(handle);
+}
+
+/* ------------------------------------------------------------------
+   Legacy profile helpers (NON-FATAL)
 ------------------------------------------------------------------ */
 async function ensureLegacyUserProfileNonFatal(appleUserID) {
   // Legacy storage: user_profiles keyed by apple_user_id.
-  // IMPORTANT: This must NEVER block auth. If FK constraints exist, swallow and continue.
+  // IMPORTANT: This must NEVER block auth (FK constraints may exist).
   try {
     await pool.query(
       `
@@ -144,7 +178,7 @@ async function resolveUserIDFromIdentity({ provider, subject, audience }) {
 }
 
 async function ensureCanonicalUser({ appleSubject, audience }) {
-  // 1) Resolve via auth_identities (provider, subject, audience)
+  // 1) Resolve via auth_identities
   const userID = await resolveUserIDFromIdentity({
     provider: "apple",
     subject: appleSubject,
@@ -152,14 +186,12 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
   });
 
   if (userID) {
-    // Legacy profile is best-effort only
     await ensureLegacyUserProfileNonFatal(appleSubject);
     await touchLastSeen(userID);
     return userID;
   }
 
-  // 2) Not found -> reuse existing users row by apple_user_id OR create one,
-  //    then bind auth_identities for this audience.
+  // 2) Not found -> reuse users row by apple_user_id OR create one, then bind identity
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -198,7 +230,7 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       [appleSubject, audience, canonicalUserID]
     );
 
-    // Legacy profile is still best-effort. Use the same transaction client.
+    // Best-effort legacy profile insert (same transaction)
     try {
       await client.query(
         `
@@ -217,10 +249,7 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
     }
 
     await client.query("COMMIT");
-
-    // Last-seen outside tx is fine
     await touchLastSeen(canonicalUserID);
-
     return canonicalUserID;
   } catch (err) {
     await client.query("ROLLBACK");
@@ -259,16 +288,60 @@ async function requireUser(req, res, next) {
 }
 
 /* ------------------------------------------------------------------
-   Routes
+   Secure object storage (Railway bucket, S3-compatible)
+------------------------------------------------------------------ */
+function storageConfigured() {
+  return Boolean(
+    process.env.OBJECT_STORAGE_ENDPOINT &&
+      process.env.OBJECT_STORAGE_BUCKET &&
+      process.env.OBJECT_STORAGE_ACCESS_KEY_ID &&
+      process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY
+  );
+}
+
+function requireStorageOr503(res) {
+  if (!storageConfigured()) {
+    return res.status(503).json({ error: "object storage not configured" });
+  }
+  return null;
+}
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+});
+
+function makeS3Client() {
+  return new S3Client({
+    endpoint: process.env.OBJECT_STORAGE_ENDPOINT, // e.g. https://storage.railway.app
+    region: process.env.OBJECT_STORAGE_REGION || "auto",
+    credentials: {
+      accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID,
+      secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY
+    },
+    forcePathStyle: true
+  });
+}
+
+function bucketName() {
+  return process.env.OBJECT_STORAGE_BUCKET;
+}
+
+/* ------------------------------------------------------------------
+   Health check
 ------------------------------------------------------------------ */
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
+/* ------------------------------------------------------------------
+   GET /v1/auth/whoami
+------------------------------------------------------------------ */
 app.get("/v1/auth/whoami", requireUser, async (req, res) => {
   return res.json(req.user);
 });
 
 /* ------------------------------------------------------------------
-   GET /v1/me (legacy profiles keyed by apple_user_id)
+   GET /v1/me
+   (legacy profile storage still keyed by apple_user_id)
 ------------------------------------------------------------------ */
 app.get("/v1/me", requireUser, async (req, res) => {
   const { appleUserID, userID } = req.user;
@@ -289,6 +362,9 @@ app.get("/v1/me", requireUser, async (req, res) => {
   });
 });
 
+/* ------------------------------------------------------------------
+   PUT /v1/me/profile
+------------------------------------------------------------------ */
 app.put("/v1/me/profile", requireUser, async (req, res) => {
   const { appleUserID } = req.user;
   const updates = req.body || {};
@@ -307,17 +383,108 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Handles
+   PUT /v1/me/profile-photo  (PRIVATE object upload)
+   multipart/form-data field: photo
+   Stores only key in settings_json:
+     profilePhotoKey, profilePhotoUpdatedAt
 ------------------------------------------------------------------ */
-function normalizeHandle(handle) {
-  return String(handle || "").trim();
-}
+app.put(
+  "/v1/me/profile-photo",
+  requireUser,
+  upload.single("photo"),
+  async (req, res) => {
+    const maybe = requireStorageOr503(res);
+    if (maybe) return;
 
-function isValidHandle(handle) {
-  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
-  return /^[\w.\-가-힣]{2,24}$/.test(handle);
-}
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "photo file required" });
+      }
 
+      const { userID, appleUserID } = req.user;
+      const key = `users/${userID}/profile.jpg`;
+
+      const s3 = makeS3Client();
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName(),
+          Key: key,
+          Body: req.file.buffer,
+          ContentType: req.file.mimetype || "image/jpeg",
+          CacheControl: "private, max-age=0",
+          Metadata: { uploadedBy: userID }
+        })
+      );
+
+      // Store key only (NOT URL)
+      await pool.query(
+        `
+        update user_profiles
+        set settings_json =
+          coalesce(settings_json, '{}'::jsonb)
+          || jsonb_build_object(
+            'profilePhotoKey', $2,
+            'profilePhotoUpdatedAt', now()
+          ),
+          updated_at = now()
+        where apple_user_id = $1
+        `,
+        [appleUserID, key]
+      );
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("profile-photo upload failed:", err);
+      return res.status(500).json({ error: "upload failed" });
+    }
+  }
+);
+
+/* ------------------------------------------------------------------
+   GET /v1/me/profile-photo-url  (SIGNED URL)
+   Returns time-limited URL to the private object.
+------------------------------------------------------------------ */
+app.get("/v1/me/profile-photo-url", requireUser, async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
+
+  try {
+    const { appleUserID } = req.user;
+
+    const result = await pool.query(
+      `
+      select settings_json->>'profilePhotoKey' as key
+      from user_profiles
+      where apple_user_id = $1
+      `,
+      [appleUserID]
+    );
+
+    const key = result.rows[0]?.key;
+    if (!key) {
+      return res.status(404).json({ error: "no profile photo" });
+    }
+
+    const s3 = makeS3Client();
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({
+        Bucket: bucketName(),
+        Key: key
+      }),
+      { expiresIn: 60 * 15 } // 15 minutes
+    );
+
+    return res.json({ url, expiresIn: 900 });
+  } catch (err) {
+    console.error("profile-photo-url failed:", err);
+    return res.status(500).json({ error: "failed to sign url" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/handles/me
+------------------------------------------------------------------ */
 app.get("/v1/handles/me", requireUser, async (req, res) => {
   const { userID } = req.user;
 
@@ -343,8 +510,12 @@ app.get("/v1/handles/me", requireUser, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   POST /v1/handles/reserve
+------------------------------------------------------------------ */
 app.post("/v1/handles/reserve", requireUser, async (req, res) => {
   const { userID } = req.user;
+
   const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
 
   if (!handle) {
@@ -390,6 +561,9 @@ app.post("/v1/handles/reserve", requireUser, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   GET /v1/handles/resolve?handle=vernon
+------------------------------------------------------------------ */
 app.get("/v1/handles/resolve", requireUser, async (req, res) => {
   const handle = normalizeHandle(req.query?.handle);
 
