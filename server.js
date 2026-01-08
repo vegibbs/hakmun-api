@@ -26,7 +26,7 @@ const { Pool } = require("pg");
 
 // Secure object storage (S3-compatible)
 const multer = require("multer");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
@@ -406,15 +406,11 @@ app.put(
 
       const s3 = makeS3Client();
       await s3.send(
-        new PutObjectCommand({
-          Bucket: bucketName(),
-          Key: key,
-          Body: req.file.buffer,
-          ContentType: req.file.mimetype || "image/jpeg",
-          CacheControl: "private, max-age=0",
-          Metadata: { uploadedBy: userID }
-        })
-      );
+  new DeleteObjectCommand({
+    Bucket: bucketName(),
+    Key: key
+  })
+);
 
       // Store key only (NOT URL)
       await pool.query(
@@ -470,7 +466,7 @@ app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
     const s3 = makeS3Client();
     try {
       await s3.send(
-        new (require("@aws-sdk/client-s3").DeleteObjectCommand)({
+        new DeleteObjectCommand({
           Bucket: bucketName(),
           Key: key
         })
