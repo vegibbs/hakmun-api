@@ -441,6 +441,66 @@ app.put(
 );
 
 /* ------------------------------------------------------------------
+   DELETE /v1/me/profile-photo  (PRIVATE object delete + DB clear)
+------------------------------------------------------------------ */
+app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
+
+  try {
+    const { appleUserID, userID } = req.user;
+
+    // 1) Fetch current key from profile
+    const r = await pool.query(
+      `
+      select settings_json->>'profilePhotoKey' as key
+      from user_profiles
+      where apple_user_id = $1
+      `,
+      [appleUserID]
+    );
+
+    const key = r.rows[0]?.key;
+    if (!key) {
+      // Nothing to delete (already removed)
+      return res.json({ ok: true });
+    }
+
+    // 2) Delete from bucket (ignore if missing)
+    const s3 = makeS3Client();
+    try {
+      await s3.send(
+        new (require("@aws-sdk/client-s3").DeleteObjectCommand)({
+          Bucket: bucketName(),
+          Key: key
+        })
+      );
+    } catch (err) {
+      // If object delete fails, still clear DB so UI is consistent;
+      // log for investigation.
+      console.error("profile-photo delete object failed:", err);
+    }
+
+    // 3) Clear DB fields
+    await pool.query(
+      `
+      update user_profiles
+      set settings_json =
+        (coalesce(settings_json, '{}'::jsonb) - 'profilePhotoKey' - 'profilePhotoUpdatedAt'),
+          updated_at = now()
+      where apple_user_id = $1
+      `,
+      [appleUserID]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("profile-photo delete failed:", err);
+    return res.status(500).json({ error: "delete failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url  (SIGNED URL)
    Returns time-limited URL to the private object.
 ------------------------------------------------------------------ */
