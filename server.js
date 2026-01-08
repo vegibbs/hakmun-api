@@ -423,7 +423,7 @@ app.put(
         set settings_json =
           coalesce(settings_json, '{}'::jsonb)
           || jsonb_build_object(
-            'profilePhotoKey', $2,
+            'profilePhotoKey', $2::text,
             'profilePhotoUpdatedAt', now()
           ),
           updated_at = now()
