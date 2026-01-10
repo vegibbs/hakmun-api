@@ -1,4 +1,4 @@
-// server.js — HakMun API (v0.8)
+// server.js — HakMun API (v0.9)
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
 // Identity:
@@ -21,7 +21,7 @@
 
 const express = require("express");
 const OpenAI = require("openai");
-const { createRemoteJWKSet, jwtVerify } = require("jose");
+const { createRemoteJWKSet, jwtVerify, SignJWT } = require("jose");
 const { Pool } = require("pg");
 
 // Secure object storage (S3-compatible)
@@ -55,6 +55,16 @@ const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
 
 const DATABASE_URL = requireEnv("DATABASE_URL");
 
+const SESSION_JWT_SECRET = requireEnv("SESSION_JWT_SECRET");
+
+// Session token lifetimes (seconds)
+const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
+const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
+
+// Session JWT claims
+const SESSION_ISSUER = "hakmun-api";
+const SESSION_AUDIENCE = "hakmun-client";
+
 // OPENAI is optional unless you call generation endpoints.
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -74,6 +84,7 @@ console.log("[boot] HakMun API starting");
 console.log("[boot] NODE_ENV =", process.env.NODE_ENV || "<unset>");
 console.log("[boot] APPLE_CLIENT_IDS =", APPLE_CLIENT_IDS.join(", "));
 console.log("[boot] DATABASE_URL host =", safeDbHost(DATABASE_URL));
+console.log("[boot] SESSION_JWT_SECRET set =", Boolean(SESSION_JWT_SECRET));
 console.log("[boot] OPENAI_API_KEY set =", Boolean(OPENAI_API_KEY));
 
 /* ------------------------------------------------------------------
@@ -129,6 +140,17 @@ function normalizeHandle(handle) {
 function isValidHandle(handle) {
   // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
   return /^[\w.\-가-힣]{2,24}$/.test(handle);
+}
+
+function safeMimeType(mime) {
+  const m = String(mime || "").toLowerCase().trim();
+  if (!m) return "image/jpeg";
+  if (m === "image/jpeg" || m === "image/jpg") return "image/jpeg";
+  if (m === "image/png") return "image/png";
+  if (m === "image/webp") return "image/webp";
+  if (m === "image/heic" || m === "image/heif") return "image/heic";
+  // Default to jpeg to avoid weird content-types.
+  return "image/jpeg";
 }
 
 /* ------------------------------------------------------------------
@@ -288,7 +310,117 @@ async function getUserState(userID) {
 }
 
 /* ------------------------------------------------------------------
-   Auth middleware
+   HakMun session tokens (JWT)
+   - Apple identityToken is verified ONLY during exchange.
+   - Steady-state requests verify HakMun session JWTs.
+   - Session tokens do NOT depend on Apple claims.
+------------------------------------------------------------------ */
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function extractBearerToken(req) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer ")) return null;
+  return header.slice("Bearer ".length);
+}
+
+function requireJsonField(req, res, fieldName) {
+  const v = req.body?.[fieldName];
+  if (!v || String(v).trim() === "") {
+    res.status(400).json({ error: `${fieldName} is required` });
+    return null;
+  }
+  return String(v);
+}
+
+async function issueSessionTokens({ userID }) {
+  const iat = nowSeconds();
+
+  const accessToken = await new SignJWT({
+    typ: "access"
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(SESSION_ISSUER)
+    .setAudience(SESSION_AUDIENCE)
+    .setSubject(String(userID))
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + SESSION_ACCESS_TTL_SEC)
+    .sign(Buffer.from(SESSION_JWT_SECRET));
+
+  const refreshToken = await new SignJWT({
+    typ: "refresh"
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(SESSION_ISSUER)
+    .setAudience(SESSION_AUDIENCE)
+    .setSubject(String(userID))
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + SESSION_REFRESH_TTL_SEC)
+    .sign(Buffer.from(SESSION_JWT_SECRET));
+
+  return {
+    accessToken,
+    expiresIn: SESSION_ACCESS_TTL_SEC,
+    refreshToken,
+    refreshExpiresIn: SESSION_REFRESH_TTL_SEC
+  };
+}
+
+async function verifySessionJWT(token) {
+  // Session JWTs are signed (HS256). No JWKS / Apple verification here.
+  const { payload } = await jwtVerify(token, Buffer.from(SESSION_JWT_SECRET), {
+    issuer: SESSION_ISSUER,
+    audience: SESSION_AUDIENCE
+  });
+
+  const userID = payload.sub;
+  if (!userID) throw new Error("session token missing sub");
+
+  const typ = payload.typ;
+  if (typ !== "access" && typ !== "refresh") {
+    throw new Error(`invalid session token typ: ${String(typ)}`);
+  }
+
+  return { userID, typ };
+}
+
+async function requireSession(req, res, next) {
+  try {
+    const token = extractBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ error: "missing session token" });
+    }
+
+    const decoded = await verifySessionJWT(token);
+    if (decoded.typ !== "access") {
+      return res.status(401).json({ error: "access token required" });
+    }
+
+    const state = await getUserState(decoded.userID);
+    const isActive = Boolean(state.is_active);
+    if (!isActive) {
+      return res.status(403).json({ error: "account disabled" });
+    }
+
+    req.user = {
+      userID: decoded.userID,
+
+      role: state.role,
+      isAdmin: Boolean(state.is_admin),
+      isRootAdmin: Boolean(state.is_root_admin),
+      isActive
+    };
+
+    return next();
+  } catch (err) {
+    console.error("Session auth error:", err);
+    return res.status(401).json({ error: "invalid session" });
+  }
+}
+
+/* ------------------------------------------------------------------
+   Auth middleware (LEGACY: Apple identityToken per request)
 ------------------------------------------------------------------ */
 async function requireUser(req, res, next) {
   try {
@@ -369,9 +501,82 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
-   GET /v1/auth/whoami
+   GET /v1/auth/whoami  (LEGACY)
 ------------------------------------------------------------------ */
 app.get("/v1/auth/whoami", requireUser, async (req, res) => {
+  return res.json(req.user);
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/auth/apple
+   Exchange Apple identityToken for HakMun session tokens.
+------------------------------------------------------------------ */
+app.post("/v1/auth/apple", async (req, res) => {
+  try {
+    const identityToken = requireJsonField(req, res, "identityToken");
+    if (!identityToken) return;
+
+    const { appleSubject, audience } = await verifyAppleToken(identityToken);
+    const userID = await ensureCanonicalUser({ appleSubject, audience });
+
+    const state = await getUserState(userID);
+    if (!Boolean(state.is_active)) {
+      return res.status(403).json({ error: "account disabled" });
+    }
+
+    const tokens = await issueSessionTokens({ userID });
+
+    return res.json({
+      ...tokens,
+      user: {
+        userID,
+        appleUserID: appleSubject,
+        audience,
+        role: state.role,
+        isAdmin: Boolean(state.is_admin),
+        isRootAdmin: Boolean(state.is_root_admin),
+        isActive: Boolean(state.is_active)
+      }
+    });
+  } catch (err) {
+    console.error("/v1/auth/apple failed:", err);
+    return res.status(401).json({ error: "authentication failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/session/refresh
+   Exchange refresh token for a new access token (and rotated refresh).
+------------------------------------------------------------------ */
+app.post("/v1/session/refresh", async (req, res) => {
+  try {
+    const refreshToken = requireJsonField(req, res, "refreshToken");
+    if (!refreshToken) return;
+
+    const decoded = await verifySessionJWT(refreshToken);
+    if (decoded.typ !== "refresh") {
+      return res.status(401).json({ error: "refresh token required" });
+    }
+
+    const state = await getUserState(decoded.userID);
+    if (!Boolean(state.is_active)) {
+      return res.status(403).json({ error: "account disabled" });
+    }
+
+    // Rotate refresh token to reduce replay window.
+    const tokens = await issueSessionTokens({ userID: decoded.userID });
+    return res.json(tokens);
+  } catch (err) {
+    console.error("/v1/session/refresh failed:", err);
+    return res.status(401).json({ error: "refresh failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/session/whoami
+   Steady-state whoami (requires HakMun session access token).
+------------------------------------------------------------------ */
+app.get("/v1/session/whoami", requireSession, async (req, res) => {
   return res.json(req.user);
 });
 
@@ -438,14 +643,33 @@ app.put(
       }
 
       const { userID, appleUserID } = req.user;
-      const key = `users/${userID}/profile.jpg`;
+
+      // Keep a stable key so callers don't need to chase a new path.
+      const key = `users/${userID}/profile`;
+
+      // Choose extension based on content-type where possible.
+      const contentType = safeMimeType(req.file.mimetype);
+      const ext =
+        contentType === "image/png"
+          ? "png"
+          : contentType === "image/webp"
+          ? "webp"
+          : contentType === "image/heic"
+          ? "heic"
+          : "jpg";
+
+      const objectKey = `${key}.${ext}`;
 
       const s3 = makeS3Client();
 
+      // Upload/overwrite object. No separate delete needed.
       await s3.send(
-        new DeleteObjectCommand({
+        new PutObjectCommand({
           Bucket: bucketName(),
-          Key: key
+          Key: objectKey,
+          Body: req.file.buffer,
+          ContentType: contentType,
+          CacheControl: "no-store"
         })
       );
 
@@ -462,7 +686,7 @@ app.put(
           updated_at = now()
         where apple_user_id = $1
         `,
-        [appleUserID, key]
+        [appleUserID, objectKey]
       );
 
       return res.json({ ok: true });
