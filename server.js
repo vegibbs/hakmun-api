@@ -26,7 +26,12 @@ const { Pool } = require("pg");
 
 // Secure object storage (S3-compatible)
 const multer = require("multer");
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
@@ -260,6 +265,29 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
 }
 
 /* ------------------------------------------------------------------
+   User state (role/admin flags) — read-only for now
+------------------------------------------------------------------ */
+async function getUserState(userID) {
+  const { rows } = await pool.query(
+    `
+    select role, is_admin, is_root_admin, is_active
+    from users
+    where user_id = $1
+    limit 1
+    `,
+    [userID]
+  );
+
+  // Be defensive: should always exist
+  return rows?.[0] || {
+    role: "student",
+    is_admin: false,
+    is_root_admin: false,
+    is_active: true
+  };
+}
+
+/* ------------------------------------------------------------------
    Auth middleware
 ------------------------------------------------------------------ */
 async function requireUser(req, res, next) {
@@ -274,10 +302,18 @@ async function requireUser(req, res, next) {
 
     const userID = await ensureCanonicalUser({ appleSubject, audience });
 
+    // Read user state flags (no behavior change yet; just visibility)
+    const state = await getUserState(userID);
+
     req.user = {
       userID,
       appleUserID: appleSubject,
-      audience
+      audience,
+
+      role: state.role,
+      isAdmin: Boolean(state.is_admin),
+      isRootAdmin: Boolean(state.is_root_admin),
+      isActive: Boolean(state.is_active)
     };
 
     return next();
@@ -405,12 +441,13 @@ app.put(
       const key = `users/${userID}/profile.jpg`;
 
       const s3 = makeS3Client();
+
       await s3.send(
-  new DeleteObjectCommand({
-    Bucket: bucketName(),
-    Key: key
-  })
-);
+        new DeleteObjectCommand({
+          Bucket: bucketName(),
+          Key: key
+        })
+      );
 
       // Store key only (NOT URL)
       await pool.query(
@@ -444,7 +481,7 @@ app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
   if (maybe) return;
 
   try {
-    const { appleUserID, userID } = req.user;
+    const { appleUserID } = req.user;
 
     // 1) Fetch current key from profile
     const r = await pool.query(
