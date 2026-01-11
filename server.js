@@ -954,10 +954,53 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   EPIC M1 — Canonical profile photo metadata (users table)
+   - Runtime authority is users.profile_photo_object_key (keyed by users.user_id)
+   - Legacy user_profiles.settings_json profilePhotoKey is migration-only
+------------------------------------------------------------------ */
+async function getCanonicalProfilePhotoKey(userID) {
+  const { rows } = await pool.query(
+    `
+    select profile_photo_object_key as key
+    from users
+    where user_id = $1
+    limit 1
+    `,
+    [userID]
+  );
+  return rows?.[0]?.key || null;
+}
+
+async function setCanonicalProfilePhotoKey(userID, objectKey) {
+  await pool.query(
+    `
+    update users
+    set profile_photo_object_key = $2,
+        profile_photo_updated_at = now()
+    where user_id = $1
+    `,
+    [userID, objectKey]
+  );
+}
+
+async function clearCanonicalProfilePhotoKey(userID) {
+  await pool.query(
+    `
+    update users
+    set profile_photo_object_key = null,
+        profile_photo_updated_at = now()
+    where user_id = $1
+    `,
+    [userID]
+  );
+}
+
+/* ------------------------------------------------------------------
    PUT /v1/me/profile-photo  (PRIVATE object upload)
    multipart/form-data field: photo
-   Stores only key in settings_json:
-     profilePhotoKey, profilePhotoUpdatedAt
+   Canonical storage:
+     users.profile_photo_object_key
+     users.profile_photo_updated_at
 ------------------------------------------------------------------ */
 app.put(
   "/v1/me/profile-photo",
@@ -972,10 +1015,10 @@ app.put(
         return res.status(400).json({ error: "photo file required" });
       }
 
-      const { userID, appleUserID } = req.user;
+      const { userID } = req.user;
 
-      // Keep a stable key so callers don't need to chase a new path.
-      const key = `users/${userID}/profile`;
+      // Stable base key (user-scoped). Overwrites are ok.
+      const keyBase = `users/${userID}/profile`;
 
       // Choose extension based on content-type where possible.
       const contentType = safeMimeType(req.file.mimetype);
@@ -988,7 +1031,7 @@ app.put(
           ? "heic"
           : "jpg";
 
-      const objectKey = `${key}.${ext}`;
+      const objectKey = `${keyBase}.${ext}`;
 
       const s3 = makeS3Client();
 
@@ -1003,21 +1046,8 @@ app.put(
         })
       );
 
-      // Store key only (NOT URL)
-      await pool.query(
-        `
-        update user_profiles
-        set settings_json =
-          coalesce(settings_json, '{}'::jsonb)
-          || jsonb_build_object(
-            'profilePhotoKey', $2::text,
-            'profilePhotoUpdatedAt', now()
-          ),
-          updated_at = now()
-        where apple_user_id = $1
-        `,
-        [appleUserID, objectKey]
-      );
+      // EPIC M1: store key ONLY in canonical users table (NO legacy writes)
+      await setCanonicalProfilePhotoKey(userID, objectKey);
 
       return res.json({ ok: true });
     } catch (err) {
@@ -1029,25 +1059,19 @@ app.put(
 
 /* ------------------------------------------------------------------
    DELETE /v1/me/profile-photo  (PRIVATE object delete + DB clear)
+   Canonical storage:
+     users.profile_photo_object_key
+     users.profile_photo_updated_at
 ------------------------------------------------------------------ */
 app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
   try {
-    const { appleUserID } = req.user;
+    const { userID } = req.user;
 
-    // 1) Fetch current key from profile
-    const r = await pool.query(
-      `
-      select settings_json->>'profilePhotoKey' as key
-      from user_profiles
-      where apple_user_id = $1
-      `,
-      [appleUserID]
-    );
-
-    const key = r.rows[0]?.key;
+    // 1) Fetch current canonical key
+    const key = await getCanonicalProfilePhotoKey(userID);
     if (!key) {
       // Nothing to delete (already removed)
       return res.json({ ok: true });
@@ -1068,17 +1092,8 @@ app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
       console.error("profile-photo delete object failed:", err);
     }
 
-    // 3) Clear DB fields
-    await pool.query(
-      `
-      update user_profiles
-      set settings_json =
-        (coalesce(settings_json, '{}'::jsonb) - 'profilePhotoKey' - 'profilePhotoUpdatedAt'),
-          updated_at = now()
-      where apple_user_id = $1
-      `,
-      [appleUserID]
-    );
+    // 3) Clear canonical fields (NO legacy writes)
+    await clearCanonicalProfilePhotoKey(userID);
 
     return res.json({ ok: true });
   } catch (err) {
@@ -1090,24 +1105,18 @@ app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
 /* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url  (SIGNED URL)
    Returns time-limited URL to the private object.
+   Canonical storage:
+     users.profile_photo_object_key
+     users.profile_photo_updated_at
 ------------------------------------------------------------------ */
 app.get("/v1/me/profile-photo-url", requireUser, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
   try {
-    const { appleUserID } = req.user;
+    const { userID } = req.user;
 
-    const result = await pool.query(
-      `
-      select settings_json->>'profilePhotoKey' as key
-      from user_profiles
-      where apple_user_id = $1
-      `,
-      [appleUserID]
-    );
-
-    const key = result.rows[0]?.key;
+    const key = await getCanonicalProfilePhotoKey(userID);
     if (!key) {
       return res.status(404).json({ error: "no profile photo" });
     }
