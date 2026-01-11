@@ -899,49 +899,92 @@ async function clearCanonicalProfilePhotoKey(userID) {
 
 /* ------------------------------------------------------------------
    PUT /v1/me/profile-photo (upload)
+   - Stage logs + fail-fast timeouts to isolate hangs (S3 vs DB)
 ------------------------------------------------------------------ */
-app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (req, res) => {
-  const maybe = requireStorageOr503(res);
-  if (maybe) return;
+app.put(
+  "/v1/me/profile-photo",
+  requireSession,
+  upload.single("photo"),
+  async (req, res) => {
+    const maybe = requireStorageOr503(res);
+    if (maybe) return;
 
-  try {
-    if (!req.file) return res.status(400).json({ error: "photo file required" });
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "photo file required" });
+      }
 
-    const { userID } = req.user;
+      const { userID } = req.user;
 
-    const contentType = safeMimeType(req.file.mimetype);
-    const ext =
-      contentType === "image/png"
-        ? "png"
-        : contentType === "image/webp"
-        ? "webp"
-        : contentType === "image/heic"
-        ? "heic"
-        : "jpg";
+      const contentType = safeMimeType(req.file.mimetype);
+      const ext =
+        contentType === "image/png"
+          ? "png"
+          : contentType === "image/webp"
+          ? "webp"
+          : contentType === "image/heic"
+          ? "heic"
+          : "jpg";
 
-    const objectKey = `users/${userID}/profile.${ext}`;
+      const objectKey = `users/${userID}/profile.${ext}`;
 
-    console.log("[photo-upload] rid=" + req._rid + " userID=" + userID + " objectKey=" + objectKey + " bytes=" + req.file.size);
+      console.log(
+        "[photo-upload][start] rid=" +
+          req._rid +
+          " userID=" +
+          userID +
+          " objectKey=" +
+          objectKey +
+          " bytes=" +
+          String(req.file.size) +
+          " ct=" +
+          contentType
+      );
 
-    const s3 = makeS3Client();
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucketName(),
-        Key: objectKey,
-        Body: req.file.buffer,
-        ContentType: contentType,
-        CacheControl: "no-store"
-      })
-    );
+      const s3 = makeS3Client();
 
-    await setCanonicalProfilePhotoKey(userID, objectKey);
+      // Stage 1: S3 upload (fail-fast)
+      console.log("[photo-upload][s3] rid=" + req._rid + " begin");
+      await withTimeout(
+        s3.send(
+          new PutObjectCommand({
+            Bucket: bucketName(),
+            Key: objectKey,
+            Body: req.file.buffer,
+            ContentType: contentType,
+            CacheControl: "no-store"
+          })
+        ),
+        15000,
+        "s3-put"
+      );
+      console.log("[photo-upload][s3] rid=" + req._rid + " ok");
 
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("profile-photo upload failed:", err?.message || err);
-    return res.status(500).json({ error: "upload failed" });
+      // Stage 2: DB update (fail-fast)
+      console.log("[photo-upload][db] rid=" + req._rid + " begin");
+      await withTimeout(
+        setCanonicalProfilePhotoKey(userID, objectKey),
+        8000,
+        "db-set-photo-key"
+      );
+      console.log("[photo-upload][db] rid=" + req._rid + " ok");
+
+      return res.json({ ok: true });
+    } catch (err) {
+      const msg = String(err?.message || err);
+      console.error("[photo-upload][fail] rid=" + req._rid + " err=" + msg);
+
+      if (msg.startsWith("timeout:s3-put")) {
+        return res.status(503).json({ error: "object storage timeout" });
+      }
+      if (msg.startsWith("timeout:db-set-photo-key")) {
+        return res.status(503).json({ error: "db timeout setting photo key" });
+      }
+
+      return res.status(500).json({ error: "upload failed" });
+    }
   }
-});
+);
 
 /* ------------------------------------------------------------------
    DELETE /v1/me/profile-photo (delete)
