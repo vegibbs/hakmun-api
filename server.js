@@ -843,29 +843,58 @@ async function getCanonicalProfilePhotoKey(userID) {
 }
 
 async function setCanonicalProfilePhotoKey(userID, objectKey) {
-  console.log("[photo-key][set] userID=" + userID + " key=" + objectKey);
-  await pool.query(
+  const r = await pool.query(
     `
     update users
     set profile_photo_object_key = $2,
         profile_photo_updated_at = now()
     where user_id = $1
+    returning profile_photo_object_key, profile_photo_updated_at
     `,
     [userID, objectKey]
   );
+
+  const row = r.rows?.[0] || null;
+  console.log(
+    "[photo-key][set] userID=" +
+      userID +
+      " key=" +
+      objectKey +
+      " row=" +
+      JSON.stringify(row) +
+      " rowCount=" +
+      String(r.rowCount ?? 0)
+  );
+
+  if (!r.rowCount) {
+    throw new Error("profile photo DB update affected 0 rows");
+  }
 }
 
 async function clearCanonicalProfilePhotoKey(userID) {
-  console.log("[photo-key][clear] userID=" + userID);
-  await pool.query(
+  const r = await pool.query(
     `
     update users
     set profile_photo_object_key = null,
         profile_photo_updated_at = now()
     where user_id = $1
+    returning profile_photo_object_key, profile_photo_updated_at
     `,
     [userID]
   );
+
+  console.log(
+    "[photo-key][clear] userID=" +
+      userID +
+      " row=" +
+      JSON.stringify(r.rows?.[0] || null) +
+      " rowCount=" +
+      String(r.rowCount ?? 0)
+  );
+
+  if (!r.rowCount) {
+    throw new Error("profile photo DB clear affected 0 rows");
+  }
 }
 
 /* ------------------------------------------------------------------
