@@ -670,12 +670,18 @@ async function requireUser(req, res, next) {
     }
 
     const token = header.slice("Bearer ".length);
-    const { appleSubject, audience } = await verifyAppleToken(token);
+    const { appleSubject, audience } = await verifyAppleToken(identityToken);
+    console.log("[/v1/auth/apple] verified appleSubject", appleSubject);
 
-    const userID = await ensureCanonicalUser({ appleSubject, audience });
+    const userID = await withTimeout(
+      ensureCanonicalUser({ appleSubject, audience }),
+      6000,
+      "ensureCanonicalUser"
+    );
+    console.log("[/v1/auth/apple] ensured canonical userID", userID);
 
-    // Read user state flags (now includes EPIC A0 self-heal)
-    const state = await getUserState(userID);
+    const state = await withTimeout(getUserState(userID), 6000, "getUserState");
+    console.log("[/v1/auth/apple] loaded user state");
 
     req.user = {
       userID,
@@ -842,12 +848,18 @@ app.post("/v1/auth/apple", async (req, res) => {
         isActive: Boolean(state.is_active)
       }
     });
-  } catch (err) {
+    } catch (err) {
     const msg = String(err?.message || err);
     console.error("/v1/auth/apple failed:", msg);
 
     if (msg.startsWith("timeout:apple-jwtVerify")) {
       return res.status(503).json({ error: "apple verification timeout" });
+    }
+    if (msg.startsWith("timeout:ensureCanonicalUser")) {
+      return res.status(503).json({ error: "db timeout: ensureCanonicalUser" });
+    }
+    if (msg.startsWith("timeout:getUserState")) {
+      return res.status(503).json({ error: "db timeout: getUserState" });
     }
 
     return res.status(401).json({ error: "authentication failed" });
