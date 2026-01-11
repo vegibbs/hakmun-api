@@ -1,27 +1,29 @@
 // server.js — HakMun API (v0.11) — FULL REWRITE (DROP-IN REPLACEMENT)
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
-// HARD CONTRACTS ENFORCED:
-// - Apple identityToken verified ONLY during exchange (/v1/auth/apple) and legacy requireUser.
-// - Steady-state requests use HakMun session JWTs (HS256).
-// - Canonical identity key = users.user_id (UUID).
-// - Canonical profile photo metadata lives ONLY on users.profile_photo_object_key.
-// - Buckets are PRIVATE; server returns short-lived signed URLs.
-// - EPIC A0 admin-safety invariants are enforced server-side.
+// PURPOSE (M1.3):
+// - Stop “black box” behavior by making both sides observable.
+// - Auth must be deterministic (fail-fast, no hangs).
+// - Session refresh endpoint MUST exist.
+// - Profile photo must be canonical (users.profile_photo_object_key).
 //
-// DEBUG GOAL (ONE SHOT):
-// This version adds deterministic request logging + stage logging + timeouts for:
-// - /v1/auth/apple (START + stage logs + fail-fast timeouts)
-// - Apple jwtVerify (fail-fast timeout + timing log)
-// - DB calls for auth flow (fail-fast statement_timeout + lock_timeout + stage logs)
-// - /v1/me/profile-photo-url (debug header + canonical key read)
+// DEBUG INCLUDED (ONE SHOT):
+// - Per-request request-id + method/path/status timing.
+// - Boot DB fingerprint.
+// - /v1/auth/apple stage logs + timeouts.
+// - /v1/me/profile-photo-url: probe DB row on-request + helper result.
+// - Photo key writes: log set/clear operations.
+//
+// SECURITY:
+// - No secrets logged.
+// - No auth headers logged.
+// - Signed URLs returned only to authenticated user.
 
 const express = require("express");
 const OpenAI = require("openai");
 const { createRemoteJWKSet, jwtVerify, SignJWT } = require("jose");
 const { Pool } = require("pg");
 
-// Secure object storage (S3-compatible)
 const multer = require("multer");
 const {
   S3Client,
@@ -87,7 +89,6 @@ const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
 const DATABASE_URL = requireEnv("DATABASE_URL");
 const SESSION_JWT_SECRET = requireEnv("SESSION_JWT_SECRET");
 
-// EPIC A0: Root admin must be pinned by user_id in production.
 const NODE_ENV = process.env.NODE_ENV || "<unset>";
 const ROOT_ADMIN_USER_IDS =
   NODE_ENV === "production"
@@ -107,7 +108,6 @@ const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
 const SESSION_ISSUER = "hakmun-api";
 const SESSION_AUDIENCE = "hakmun-client";
 
-// OpenAI is optional unless you call generation endpoints.
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 /* ------------------------------------------------------------------
@@ -152,21 +152,24 @@ const pool = new Pool({
   max: 10
 });
 
-// DB fingerprint: proves exactly which DB/schema the API is using.
-pool.query(`
+pool.on("error", (err) => {
+  console.error("[pg] pool error:", err?.message || err);
+});
+
+// DB fingerprint (removes ambiguity)
+pool
+  .query(
+    `
   select
     current_database() as db,
     current_schema() as schema,
     inet_server_addr() as addr,
     inet_server_port() as port,
     version() as version
-`)
-  .then(r => console.log("[boot] db_fingerprint =", r.rows?.[0]))
-  .catch(e => console.error("[boot] db_fingerprint failed:", e?.message || e));
-
-pool.on("error", (err) => {
-  console.error("[pg] pool error:", err?.message || err);
-});
+`
+  )
+  .then((r) => console.log("[boot] db_fingerprint =", r.rows?.[0] || "<none>"))
+  .catch((e) => console.error("[boot] db_fingerprint failed:", e?.message || e));
 
 /* ------------------------------------------------------------------
    Deterministic timeouts (fail-fast)
@@ -219,6 +222,7 @@ function normalizeHandle(handle) {
 }
 
 function isValidHandle(handle) {
+  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
   return /^[\w.\-가-힣]{2,24}$/.test(handle);
 }
 
@@ -281,7 +285,11 @@ async function promoteToRootAdminNonFatal(userID, reason) {
 
     console.log(`[admin-safety] promoted root admin user_id=${userID} reason=${reason}`);
   } catch (err) {
-    console.error("[admin-safety] failed to promote root admin:", err?.code, err?.detail || err?.message);
+    console.error(
+      "[admin-safety] failed to promote root admin:",
+      err?.code,
+      err?.detail || err?.message
+    );
   }
 }
 
@@ -312,7 +320,7 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
       return;
     }
 
-    console.error(`[admin-safety] ZERO active root admins detected (trigger=${trigger}). Initiating self-heal.`);
+    console.error(`[admin-safety] ZERO active root admins detected (trigger=${trigger}).`);
 
     if (ROOT_ADMIN_USER_IDS.length) {
       await ensurePinnedRootAdminsNonFatal();
@@ -327,48 +335,15 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
 
       const c2 = after.rows?.[0]?.c ?? 0;
       if (c2 > 0) return;
-
-      console.error("[admin-safety] pinned self-heal did not restore a root admin (pinned IDs may not exist).");
-    }
-
-    if (NODE_ENV !== "production") {
-      let candidate = null;
-
-      try {
-        const r1 = await pool.query(
-          `
-          select user_id
-          from users
-          where is_active = true
-          order by created_at asc nulls last, user_id asc
-          limit 1
-          `
-        );
-        candidate = r1.rows?.[0]?.user_id || null;
-      } catch {
-        const r2 = await pool.query(
-          `
-          select user_id
-          from users
-          where is_active = true
-          order by user_id asc
-          limit 1
-          `
-        );
-        candidate = r2.rows?.[0]?.user_id || null;
-      }
-
-      if (candidate) {
-        await promoteToRootAdminNonFatal(candidate, "dev-fallback-zero-root");
-        return;
-      }
-
-      console.error("[admin-safety] dev fallback failed: no active users to promote.");
     }
 
     console.error("[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs.");
   } catch (err) {
-    console.error("[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:", err?.code, err?.detail || err?.message);
+    console.error(
+      "[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:",
+      err?.code,
+      err?.detail || err?.message
+    );
   }
 }
 
@@ -386,7 +361,11 @@ async function ensureLegacyUserProfileNonFatal(appleUserID) {
       [appleUserID]
     );
   } catch (err) {
-    console.warn("[warn] ensureLegacyUserProfileNonFatal failed (continuing):", err?.code, err?.detail || err?.message);
+    console.warn(
+      "[warn] ensureLegacyUserProfileNonFatal failed (continuing):",
+      err?.code,
+      err?.detail || err?.message
+    );
   }
 }
 
@@ -402,10 +381,10 @@ async function touchLastSeen(userID) {
 }
 
 /* ------------------------------------------------------------------
-   Canonical identity resolution
+   Canonical identity resolution (fast paths + tx slow path)
 ------------------------------------------------------------------ */
 async function ensureCanonicalUser({ appleSubject, audience }, rid) {
-  // FAST PATH 1: auth_identities (no tx)
+  // FAST PATH 1: auth_identities
   try {
     const r = await withTimeout(
       pool.query(
@@ -431,7 +410,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
     console.error(`[auth] rid=${rid} fast auth_identities lookup failed:`, e?.message || e);
   }
 
-  // FAST PATH 2: users.apple_user_id (no tx)
+  // FAST PATH 2: users.apple_user_id
   try {
     const r = await withTimeout(
       pool.query(
@@ -449,7 +428,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
 
     const userID = r?.rows?.[0]?.user_id || null;
     if (userID) {
-      // Bind identity best-effort
+      // bind identity best-effort
       pool
         .query(
           `
@@ -478,7 +457,6 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
     await client.query(`set lock_timeout = 2000;`);
     await client.query("BEGIN");
 
-    // Re-check inside tx (race safety)
     const rAuth = await client.query(
       `
       select user_id
@@ -525,7 +503,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
         [appleSubject, audience, canonicalUserID]
       );
 
-      // Best-effort legacy row
+      // best-effort legacy
       try {
         await client.query(
           `
@@ -536,7 +514,11 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
           [appleSubject]
         );
       } catch (err) {
-        console.warn("[warn] (tx) legacy user_profiles insert failed (continuing):", err?.code, err?.detail || err?.message);
+        console.warn(
+          "[warn] (tx) legacy user_profiles insert failed (continuing):",
+          err?.code,
+          err?.detail || err?.message
+        );
       }
     }
 
@@ -734,8 +716,6 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
    POST /v1/auth/apple
-   Exchange Apple identityToken for HakMun session tokens.
-   DEBUG INCLUDED: START + stage logs + fail-fast timeouts.
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
   console.log(`[/v1/auth/apple] START rid=${req._rid}`);
@@ -800,8 +780,6 @@ app.post("/v1/auth/apple", async (req, res) => {
 
 /* ------------------------------------------------------------------
    POST /v1/session/refresh
-   Exchange refresh token for a new access token (and rotated refresh).
-   Deterministic: always returns 200 JSON or 401/403.
 ------------------------------------------------------------------ */
 app.post("/v1/session/refresh", async (req, res) => {
   try {
@@ -818,7 +796,6 @@ app.post("/v1/session/refresh", async (req, res) => {
       return res.status(403).json({ error: "account disabled" });
     }
 
-    // Rotate refresh token to reduce replay window.
     const tokens = await issueSessionTokens({ userID: decoded.userID });
     return res.json(tokens);
   } catch (err) {
@@ -850,7 +827,7 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   EPIC M1 — Canonical profile photo metadata (users table)
+   Canonical profile photo metadata (users table) + logging
 ------------------------------------------------------------------ */
 async function getCanonicalProfilePhotoKey(userID) {
   const { rows } = await pool.query(
@@ -866,6 +843,7 @@ async function getCanonicalProfilePhotoKey(userID) {
 }
 
 async function setCanonicalProfilePhotoKey(userID, objectKey) {
+  console.log("[photo-key][set] userID=" + userID + " key=" + objectKey);
   await pool.query(
     `
     update users
@@ -878,6 +856,7 @@ async function setCanonicalProfilePhotoKey(userID, objectKey) {
 }
 
 async function clearCanonicalProfilePhotoKey(userID) {
+  console.log("[photo-key][clear] userID=" + userID);
   await pool.query(
     `
     update users
@@ -900,7 +879,6 @@ app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (r
     if (!req.file) return res.status(400).json({ error: "photo file required" });
 
     const { userID } = req.user;
-    const keyBase = `users/${userID}/profile`;
 
     const contentType = safeMimeType(req.file.mimetype);
     const ext =
@@ -912,7 +890,9 @@ app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (r
         ? "heic"
         : "jpg";
 
-    const objectKey = `${keyBase}.${ext}`;
+    const objectKey = `users/${userID}/profile.${ext}`;
+
+    console.log("[photo-upload] rid=" + req._rid + " userID=" + userID + " objectKey=" + objectKey + " bytes=" + req.file.size);
 
     const s3 = makeS3Client();
     await s3.send(
@@ -926,6 +906,7 @@ app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (r
     );
 
     await setCanonicalProfilePhotoKey(userID, objectKey);
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("profile-photo upload failed:", err?.message || err);
@@ -946,6 +927,8 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
     const key = await getCanonicalProfilePhotoKey(userID);
     if (!key) return res.json({ ok: true });
 
+    console.log("[photo-delete] rid=" + req._rid + " userID=" + userID + " key=" + key);
+
     const s3 = makeS3Client();
     try {
       await s3.send(new DeleteObjectCommand({ Bucket: bucketName(), Key: key }));
@@ -954,6 +937,7 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
     }
 
     await clearCanonicalProfilePhotoKey(userID);
+
     return res.json({ ok: true });
   } catch (err) {
     console.error("profile-photo delete failed:", err?.message || err);
@@ -963,6 +947,8 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
 
 /* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url (signed url)
+   - Reads canonical key from users table
+   - Probes DB row on-request
 ------------------------------------------------------------------ */
 app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
@@ -972,12 +958,19 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
 
   try {
     const { userID } = req.user;
-    const key = await getCanonicalProfilePhotoKey(userID);
 
-    console.log(`[photo-url] rid=${req._rid} userID=${userID} key=${key || "<null>"}`);
+    // On-request DB probe: what does Postgres say RIGHT NOW?
+    const probe = await pool.query(
+      "select profile_photo_object_key, profile_photo_updated_at from users where user_id = $1 limit 1",
+      [userID]
+    );
+    console.log("[photo-url][probe] rid=" + req._rid + " row=" + JSON.stringify(probe.rows?.[0] || null));
+
+    const key = await getCanonicalProfilePhotoKey(userID);
+    console.log("[photo-url] rid=" + req._rid + " userID=" + userID + " key=" + (key || "<null>"));
 
     if (!key) {
-      console.warn(`[photo-url] rid=${req._rid} no key -> 404`);
+      console.error("[photo-url] rid=" + req._rid + " no key -> 404");
       return res.status(404).json({ error: "no profile photo" });
     }
 
@@ -996,7 +989,42 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Boot-time EPIC A0 validation + Start server (Railway)
+   GET /v1/handles/me
+------------------------------------------------------------------ */
+app.get("/v1/handles/me", requireSession, async (req, res) => {
+  const { userID } = req.user;
+
+  try {
+    const { rows } = await pool.query(
+      `
+      select handle
+      from user_handles
+      where user_id = $1 and kind = 'primary'
+      limit 1
+      `,
+      [userID]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: "no username set" });
+    }
+
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error("handles/me failed:", err?.message || err);
+    return res.status(500).json({ error: "resolve failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   Sentence generation (optional)
+------------------------------------------------------------------ */
+app.post("/v1/generate/sentences", (req, res) => {
+  return res.status(501).json({ error: "not enabled in this build" });
+});
+
+/* ------------------------------------------------------------------
+   Boot-time A0 validation + Start server
 ------------------------------------------------------------------ */
 (async () => {
   await ensureAtLeastOneRootAdminNonFatal("boot");
