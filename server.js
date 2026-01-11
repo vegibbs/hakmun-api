@@ -151,6 +151,18 @@ const pool = new Pool({
   max: 10
 });
 
+// DB fingerprint: proves exactly which DB/schema the API is using.
+pool.query(`
+  select
+    current_database() as db,
+    current_schema() as schema,
+    inet_server_addr() as addr,
+    inet_server_port() as port,
+    version() as version
+`)
+  .then(r => console.log("[boot] db_fingerprint =", r.rows?.[0]))
+  .catch(e => console.error("[boot] db_fingerprint failed:", e?.message || e));
+
 pool.on("error", (err) => {
   console.error("[pg] pool error:", err?.message || err);
 });
