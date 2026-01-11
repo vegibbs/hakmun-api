@@ -1102,7 +1102,7 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
+//* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url  (SIGNED URL)
    Returns time-limited URL to the private object.
    Canonical storage:
@@ -1116,8 +1116,35 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   try {
     const { userID } = req.user;
 
-    const key = await getCanonicalProfilePhotoKey(userID);
-    if (!key) {
+    // DEBUG (EPIC M1.3): prove which DB we are connected to and what we read.
+    // REMOVE after fix.
+    try {
+      const dbg = await pool.query(`select current_database() as db`);
+      console.log(
+        `[profile-photo-url][debug] db=${dbg?.rows?.[0]?.db || "<unknown>"} userID=${userID}`
+      );
+    } catch (e) {
+      console.log(`[profile-photo-url][debug] db=<query-failed> userID=${userID}`);
+    }
+
+    // Read canonical key directly (no helper ambiguity)
+    const { rows } = await pool.query(
+      `
+      select profile_photo_object_key
+      from users
+      where user_id = $1
+      limit 1
+      `,
+      [userID]
+    );
+
+    const key = rows?.[0]?.profile_photo_object_key || null;
+
+    console.log(
+      `[profile-photo-url][debug] users.rowCount=${rows?.length || 0} key=${key || "<null>"}`
+    );
+
+    if (!key || String(key).trim() === "") {
       return res.status(404).json({ error: "no profile photo" });
     }
 
