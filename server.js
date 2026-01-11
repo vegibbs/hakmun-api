@@ -660,13 +660,20 @@ app.post("/v1/session/refresh", async (req, res) => {
 ------------------------------------------------------------------ */
 app.get("/v1/session/whoami", requireSession, async (req, res) => {
   try {
-    const username = await getPrimaryHandleForUser(req.user.userID);
-    const profileComplete = Boolean(username);
+    const primaryHandle = await getPrimaryHandleForUser(req.user.userID);
+    const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
+    // Canonical keys:
+    // - profileComplete
+    // - primaryHandle
+    //
+    // Back-compat alias:
+    // - username (deprecated; mirrors primaryHandle)
     return res.json({
       ...req.user,
       profileComplete,
-      username
+      primaryHandle,
+      username: primaryHandle
     });
   } catch (err) {
     console.error("/v1/session/whoami failed:", err);
@@ -681,14 +688,15 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
 ------------------------------------------------------------------ */
 app.get("/v1/profile", requireSession, async (req, res) => {
   try {
-    const username = await getPrimaryHandleForUser(req.user.userID);
-    const profileComplete = Boolean(username);
+    const primaryHandle = await getPrimaryHandleForUser(req.user.userID);
+    const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
     return res.json({
       user: req.user,
       profile: {
-        username,
-        profileComplete
+        primaryHandle,
+        profileComplete,
+        username: primaryHandle // deprecated alias
       }
     });
   } catch (err) {
@@ -1095,7 +1103,7 @@ Rules:
 - Each sentence must be complete and properly punctuated.
 - Avoid unsafe content.
 - Use stable IDs like GEN_A1B2C3D4.
-- naturalnessScore is your self-evaluation (higher = more natural).
+- naturalnessScore is your self-evaluation (higher = more natural)
 `.trim();
 
     const r = await openai.responses.create({
