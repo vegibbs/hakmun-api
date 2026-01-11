@@ -193,8 +193,32 @@ function isPinnedRootAdmin(userID) {
   return ROOT_ADMIN_USER_IDS.includes(String(userID));
 }
 
+// Idempotent promotion:
+// - Only updates if flags are not already correct
+// - Only logs when it actually changed something
 async function promoteToRootAdminNonFatal(userID, reason) {
   try {
+    // 1) Read current flags
+    const { rows } = await pool.query(
+      `
+      select is_admin, is_root_admin
+      from users
+      where user_id = $1
+      limit 1
+      `,
+      [userID]
+    );
+
+    const current = rows?.[0];
+    if (!current) return;
+
+    const needsAdmin = !Boolean(current.is_admin);
+    const needsRoot = !Boolean(current.is_root_admin);
+
+    // 2) If already correct, do nothing (prevents log spam)
+    if (!needsAdmin && !needsRoot) return;
+
+    // 3) Fix flags
     await pool.query(
       `
       update users
@@ -204,6 +228,7 @@ async function promoteToRootAdminNonFatal(userID, reason) {
       `,
       [userID]
     );
+
     console.log(
       `[admin-safety] promoted root admin user_id=${userID} reason=${reason}`
     );
@@ -219,7 +244,7 @@ async function promoteToRootAdminNonFatal(userID, reason) {
 async function ensurePinnedRootAdminsNonFatal() {
   if (!ROOT_ADMIN_USER_IDS.length) return;
 
-  // Ensure every pinned root admin is at least admin+root_admin.
+  // Ensure every pinned root admin is at least admin+root_admin (idempotent).
   for (const uid of ROOT_ADMIN_USER_IDS) {
     await promoteToRootAdminNonFatal(uid, "pinned-self-heal");
   }
