@@ -136,6 +136,18 @@ const pool = new Pool({
 });
 
 /* ------------------------------------------------------------------
+   Deterministic timeouts (fail-fast)
+------------------------------------------------------------------ */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`timeout:${label}:${ms}ms`)), ms)
+    )
+  ]);
+}
+
+/* ------------------------------------------------------------------
    Apple Sign In verification
 ------------------------------------------------------------------ */
 const APPLE_JWKS = createRemoteJWKSet(
@@ -143,10 +155,19 @@ const APPLE_JWKS = createRemoteJWKSet(
 );
 
 async function verifyAppleToken(identityToken) {
-  const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
-    issuer: "https://appleid.apple.com",
-    audience: APPLE_CLIENT_IDS
-  });
+  const t0 = Date.now();
+
+  const { payload } = await withTimeout(
+    jwtVerify(identityToken, APPLE_JWKS, {
+      issuer: "https://appleid.apple.com",
+      audience: APPLE_CLIENT_IDS
+    }),
+    6000,
+    "apple-jwtVerify"
+  );
+
+  const ms = Date.now() - t0;
+  console.log(`[apple] jwtVerify ok in ${ms}ms`);
 
   const aud = Array.isArray(payload.aud) ? payload.aud[0] : payload.aud;
   if (!aud || !APPLE_CLIENT_IDS.includes(aud)) {
@@ -822,7 +843,13 @@ app.post("/v1/auth/apple", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("/v1/auth/apple failed:", err);
+    const msg = String(err?.message || err);
+    console.error("/v1/auth/apple failed:", msg);
+
+    if (msg.startsWith("timeout:apple-jwtVerify")) {
+      return res.status(503).json({ error: "apple verification timeout" });
+    }
+
     return res.status(401).json({ error: "authentication failed" });
   }
 });
