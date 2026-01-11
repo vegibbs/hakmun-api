@@ -1,4 +1,4 @@
-// server.js — HakMun API (v0.9)
+// server.js — HakMun API (v0.10)
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
 // Identity:
@@ -310,6 +310,24 @@ async function getUserState(userID) {
 }
 
 /* ------------------------------------------------------------------
+   Canonical profile facts (v2)
+   - NO local profile.
+   - Username/handle is server-authoritative.
+------------------------------------------------------------------ */
+async function getPrimaryHandleForUser(userID) {
+  const { rows } = await pool.query(
+    `
+    select handle
+    from user_handles
+    where user_id = $1 and kind = 'primary'
+    limit 1
+    `,
+    [userID]
+  );
+  return rows?.[0]?.handle || null;
+}
+
+/* ------------------------------------------------------------------
    HakMun session tokens (JWT)
    - Apple identityToken is verified ONLY during exchange.
    - Steady-state requests verify HakMun session JWTs.
@@ -405,7 +423,6 @@ async function requireSession(req, res, next) {
 
     req.user = {
       userID: decoded.userID,
-
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
@@ -451,6 +468,70 @@ async function requireUser(req, res, next) {
     return next();
   } catch (err) {
     console.error("Auth error:", err);
+    return res.status(401).json({ error: "authentication failed" });
+  }
+}
+
+/* ------------------------------------------------------------------
+   Auth middleware (HYBRID)
+   Accept either:
+   - HakMun session access token (preferred steady-state)
+   - Apple identityToken (legacy/back-compat only)
+------------------------------------------------------------------ */
+async function requireSessionOrApple(req, res, next) {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "missing authorization token" });
+    }
+
+    const token = header.slice("Bearer ".length);
+
+    // 1) Try HakMun session first
+    try {
+      const decoded = await verifySessionJWT(token);
+      if (decoded.typ !== "access") {
+        return res.status(401).json({ error: "access token required" });
+      }
+
+      const state = await getUserState(decoded.userID);
+      const isActive = Boolean(state.is_active);
+      if (!isActive) {
+        return res.status(403).json({ error: "account disabled" });
+      }
+
+      req.user = {
+        userID: decoded.userID,
+        role: state.role,
+        isAdmin: Boolean(state.is_admin),
+        isRootAdmin: Boolean(state.is_root_admin),
+        isActive
+      };
+
+      return next();
+    } catch {
+      // fall through to Apple
+    }
+
+    // 2) Fall back to Apple identity token (legacy only)
+    const { appleSubject, audience } = await verifyAppleToken(token);
+    const userID = await ensureCanonicalUser({ appleSubject, audience });
+    const state = await getUserState(userID);
+
+    req.user = {
+      userID,
+      appleUserID: appleSubject,
+      audience,
+
+      role: state.role,
+      isAdmin: Boolean(state.is_admin),
+      isRootAdmin: Boolean(state.is_root_admin),
+      isActive: Boolean(state.is_active)
+    };
+
+    return next();
+  } catch (err) {
+    console.error("Hybrid auth error:", err);
     return res.status(401).json({ error: "authentication failed" });
   }
 }
@@ -575,9 +656,45 @@ app.post("/v1/session/refresh", async (req, res) => {
 /* ------------------------------------------------------------------
    GET /v1/session/whoami
    Steady-state whoami (requires HakMun session access token).
+   Includes canonical profile facts to support client gating.
 ------------------------------------------------------------------ */
 app.get("/v1/session/whoami", requireSession, async (req, res) => {
-  return res.json(req.user);
+  try {
+    const username = await getPrimaryHandleForUser(req.user.userID);
+    const profileComplete = Boolean(username);
+
+    return res.json({
+      ...req.user,
+      profileComplete,
+      username
+    });
+  } catch (err) {
+    console.error("/v1/session/whoami failed:", err);
+    return res.status(500).json({ error: "whoami failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/profile  (v2, canonical)
+   Requires HakMun session access token.
+   Server-authoritative profile facts only (no local profile).
+------------------------------------------------------------------ */
+app.get("/v1/profile", requireSession, async (req, res) => {
+  try {
+    const username = await getPrimaryHandleForUser(req.user.userID);
+    const profileComplete = Boolean(username);
+
+    return res.json({
+      user: req.user,
+      profile: {
+        username,
+        profileComplete
+      }
+    });
+  } catch (err) {
+    console.error("/v1/profile failed:", err);
+    return res.status(500).json({ error: "profile failed" });
+  }
 });
 
 /* ------------------------------------------------------------------
@@ -801,8 +918,9 @@ app.get("/v1/me/profile-photo-url", requireUser, async (req, res) => {
 
 /* ------------------------------------------------------------------
    GET /v1/handles/me
+   NOTE: supports HakMun session (steady-state) and Apple (legacy).
 ------------------------------------------------------------------ */
-app.get("/v1/handles/me", requireUser, async (req, res) => {
+app.get("/v1/handles/me", requireSessionOrApple, async (req, res) => {
   const { userID } = req.user;
 
   try {
@@ -829,8 +947,9 @@ app.get("/v1/handles/me", requireUser, async (req, res) => {
 
 /* ------------------------------------------------------------------
    POST /v1/handles/reserve
+   NOTE: supports HakMun session (steady-state) and Apple (legacy).
 ------------------------------------------------------------------ */
-app.post("/v1/handles/reserve", requireUser, async (req, res) => {
+app.post("/v1/handles/reserve", requireSessionOrApple, async (req, res) => {
   const { userID } = req.user;
 
   const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
@@ -880,8 +999,9 @@ app.post("/v1/handles/reserve", requireUser, async (req, res) => {
 
 /* ------------------------------------------------------------------
    GET /v1/handles/resolve?handle=vernon
+   NOTE: supports HakMun session (steady-state) and Apple (legacy).
 ------------------------------------------------------------------ */
-app.get("/v1/handles/resolve", requireUser, async (req, res) => {
+app.get("/v1/handles/resolve", requireSessionOrApple, async (req, res) => {
   const handle = normalizeHandle(req.query?.handle);
 
   if (!handle) {
