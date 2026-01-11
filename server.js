@@ -932,7 +932,10 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
     const { userID } = req.user;
     const key = await getCanonicalProfilePhotoKey(userID);
 
+    console.log(`[photo-url] rid=${req._rid} userID=${userID} key=${key || "<null>"}`);
+
     if (!key) {
+      console.warn(`[photo-url] rid=${req._rid} no key -> 404`);
       return res.status(404).json({ error: "no profile photo" });
     }
 
