@@ -13,8 +13,8 @@
 // This version adds deterministic request logging + stage logging + timeouts for:
 // - /v1/auth/apple (START + stage logs + fail-fast timeouts)
 // - Apple jwtVerify (fail-fast timeout + timing log)
-// - DB calls for auth flow (fail-fast statement_timeout + stage logs)
-// - /v1/me/profile-photo-url (optional debug header + canonical key read)
+// - DB calls for auth flow (fail-fast statement_timeout + lock_timeout + stage logs)
+// - /v1/me/profile-photo-url (debug header + canonical key read)
 
 const express = require("express");
 const OpenAI = require("openai");
@@ -52,7 +52,6 @@ app.use((req, res, next) => {
   const t0 = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - t0;
-    // Keep it short; do not log auth headers or bodies.
     console.log(`[http] rid=${rid} ${req.method} ${req.path} -> ${res.statusCode} ${ms}ms`);
   });
 
@@ -143,7 +142,6 @@ const openai =
 
 /* ------------------------------------------------------------------
    Postgres (Railway)
-   - Add connection timeouts to prevent silent hangs.
 ------------------------------------------------------------------ */
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -167,28 +165,6 @@ function withTimeout(promise, ms, label) {
       setTimeout(() => reject(new Error(`timeout:${label}:${ms}ms`)), ms)
     )
   ]);
-}
-
-/* ------------------------------------------------------------------
-   DB helper with per-call statement_timeout (prevents hung queries)
-   NOTE: We use a short-lived client for auth-critical paths.
------------------------------------------------------------------- */
-async function dbQueryTimeout(text, params, timeoutMs, label, rid) {
-  const client = await pool.connect();
-  try {
-    // statement_timeout is in ms; applies to subsequent statements on this connection
-    await client.query(`set statement_timeout = ${Math.max(1000, timeoutMs)};`);
-    const t0 = Date.now();
-    const result = await client.query(text, params);
-    const ms = Date.now() - t0;
-    if (label) console.log(`[db] rid=${rid} ${label} ok ${ms}ms rows=${result?.rowCount ?? "?"}`);
-    return result;
-  } catch (err) {
-    if (label) console.error(`[db] rid=${rid} ${label} failed:`, err?.message || err);
-    throw err;
-  } finally {
-    client.release();
-  }
 }
 
 /* ------------------------------------------------------------------
@@ -230,7 +206,6 @@ function normalizeHandle(handle) {
 }
 
 function isValidHandle(handle) {
-  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
   return /^[\w.\-가-힣]{2,24}$/.test(handle);
 }
 
@@ -416,93 +391,151 @@ async function touchLastSeen(userID) {
 /* ------------------------------------------------------------------
    Canonical identity resolution
 ------------------------------------------------------------------ */
-async function resolveUserIDFromIdentity({ provider, subject, audience }) {
-  const { rows } = await pool.query(
-    `
-    select user_id
-    from auth_identities
-    where provider = $1 and subject = $2 and audience = $3
-    limit 1
-    `,
-    [provider, subject, audience]
-  );
-  return rows && rows.length ? rows[0].user_id : null;
-}
-
 async function ensureCanonicalUser({ appleSubject, audience }, rid) {
-  const userID = await resolveUserIDFromIdentity({
-    provider: "apple",
-    subject: appleSubject,
-    audience
-  });
+  // FAST PATH 1: auth_identities (no tx)
+  try {
+    const r = await withTimeout(
+      pool.query(
+        `
+        select user_id
+        from auth_identities
+        where provider = $1 and subject = $2 and audience = $3
+        limit 1
+        `,
+        ["apple", appleSubject, audience]
+      ),
+      3000,
+      "auth_identities-lookup"
+    );
 
-  if (userID) {
-    await ensureLegacyUserProfileNonFatal(appleSubject);
-    await touchLastSeen(userID);
-    return userID;
+    const userID = r?.rows?.[0]?.user_id || null;
+    if (userID) {
+      ensureLegacyUserProfileNonFatal(appleSubject).catch(() => {});
+      touchLastSeen(userID).catch(() => {});
+      return userID;
+    }
+  } catch (e) {
+    console.error(`[auth] rid=${rid} fast auth_identities lookup failed:`, e?.message || e);
   }
 
+  // FAST PATH 2: users.apple_user_id (no tx)
+  try {
+    const r = await withTimeout(
+      pool.query(
+        `
+        select user_id
+        from users
+        where apple_user_id = $1
+        limit 1
+        `,
+        [appleSubject]
+      ),
+      3000,
+      "users-lookup"
+    );
+
+    const userID = r?.rows?.[0]?.user_id || null;
+    if (userID) {
+      // Bind identity best-effort
+      pool
+        .query(
+          `
+          insert into auth_identities (provider, subject, audience, user_id)
+          values ('apple', $1, $2, $3)
+          on conflict do nothing
+          `,
+          [appleSubject, audience, userID]
+        )
+        .catch((err) =>
+          console.warn(`[warn] rid=${rid} auth_identities bind failed:`, err?.code, err?.detail || err?.message)
+        );
+
+      ensureLegacyUserProfileNonFatal(appleSubject).catch(() => {});
+      touchLastSeen(userID).catch(() => {});
+      return userID;
+    }
+  } catch (e) {
+    console.error(`[auth] rid=${rid} fast users lookup failed:`, e?.message || e);
+  }
+
+  // SLOW PATH: tx create/bind (fail-fast on locks)
   const client = await pool.connect();
   try {
-    // Fail-fast if a lock blocks us: statement_timeout prevents infinite wait.
     await client.query(`set statement_timeout = 6000;`);
+    await client.query(`set lock_timeout = 2000;`);
     await client.query("BEGIN");
 
-    const existing = await client.query(
+    // Re-check inside tx (race safety)
+    const rAuth = await client.query(
       `
       select user_id
-      from users
-      where apple_user_id = $1
+      from auth_identities
+      where provider = 'apple' and subject = $1 and audience = $2
       limit 1
       `,
-      [appleSubject]
+      [appleSubject, audience]
     );
 
-    let canonicalUserID;
-    if (existing.rows && existing.rows.length) {
-      canonicalUserID = existing.rows[0].user_id;
-    } else {
-      const created = await client.query(
+    let canonicalUserID = rAuth.rows?.[0]?.user_id || null;
+
+    if (!canonicalUserID) {
+      const rUser = await client.query(
         `
-        insert into users (user_id, apple_user_id, last_seen_at)
-        values (gen_random_uuid(), $1, now())
-        returning user_id
+        select user_id
+        from users
+        where apple_user_id = $1
+        limit 1
         `,
         [appleSubject]
       );
-      canonicalUserID = created.rows[0].user_id;
-    }
 
-    await client.query(
-      `
-      insert into auth_identities (provider, subject, audience, user_id)
-      values ('apple', $1, $2, $3)
-      on conflict do nothing
-      `,
-      [appleSubject, audience, canonicalUserID]
-    );
+      canonicalUserID = rUser.rows?.[0]?.user_id || null;
 
-    try {
+      if (!canonicalUserID) {
+        const created = await client.query(
+          `
+          insert into users (user_id, apple_user_id, last_seen_at)
+          values (gen_random_uuid(), $1, now())
+          returning user_id
+          `,
+          [appleSubject]
+        );
+        canonicalUserID = created.rows[0].user_id;
+      }
+
       await client.query(
         `
-        insert into user_profiles (apple_user_id, schema_version, settings_json)
-        values ($1, 1, '{}'::jsonb)
-        on conflict (apple_user_id) do nothing
+        insert into auth_identities (provider, subject, audience, user_id)
+        values ('apple', $1, $2, $3)
+        on conflict do nothing
         `,
-        [appleSubject]
+        [appleSubject, audience, canonicalUserID]
       );
-    } catch (err) {
-      console.warn("[warn] (tx) legacy user_profiles insert failed (continuing):", err?.code, err?.detail || err?.message);
+
+      // Best-effort legacy row
+      try {
+        await client.query(
+          `
+          insert into user_profiles (apple_user_id, schema_version, settings_json)
+          values ($1, 1, '{}'::jsonb)
+          on conflict (apple_user_id) do nothing
+          `,
+          [appleSubject]
+        );
+      } catch (err) {
+        console.warn("[warn] (tx) legacy user_profiles insert failed (continuing):", err?.code, err?.detail || err?.message);
+      }
     }
 
     await client.query("COMMIT");
-    await touchLastSeen(canonicalUserID);
+
+    touchLastSeen(canonicalUserID).catch(() => {});
     return canonicalUserID;
   } catch (err) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    console.error(`[auth] rid=${rid} ensureCanonicalUser FAILED:`, err?.message || err);
+    console.error(`[auth] rid=${rid} ensureCanonicalUser TX FAILED:`, err?.message || err);
     throw err;
   } finally {
     client.release();
@@ -510,7 +543,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
 }
 
 /* ------------------------------------------------------------------
-   User state (role/admin flags) — server authoritative + admin safety self-heal
+   User state (role/admin flags)
 ------------------------------------------------------------------ */
 async function getUserState(userID) {
   await ensureAtLeastOneRootAdminNonFatal("getUserState");
@@ -538,7 +571,7 @@ async function getUserState(userID) {
 }
 
 /* ------------------------------------------------------------------
-   Canonical profile facts (v2)
+   Canonical profile facts
 ------------------------------------------------------------------ */
 async function getPrimaryHandleForUser(userID) {
   const { rows } = await pool.query(
@@ -642,97 +675,7 @@ async function requireSession(req, res, next) {
 }
 
 /* ------------------------------------------------------------------
-   Legacy Auth middleware (Apple identityToken per request)
------------------------------------------------------------------- */
-async function requireUser(req, res, next) {
-  try {
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "missing authorization token" });
-    }
-
-    const token = header.slice("Bearer ".length);
-    const { appleSubject, audience } = await verifyAppleToken(token);
-    const userID = await ensureCanonicalUser({ appleSubject, audience }, req._rid);
-
-    const state = await getUserState(userID);
-
-    req.user = {
-      userID,
-      appleUserID: appleSubject,
-      audience,
-      role: state.role,
-      isAdmin: Boolean(state.is_admin),
-      isRootAdmin: Boolean(state.is_root_admin),
-      isActive: Boolean(state.is_active)
-    };
-
-    return next();
-  } catch (err) {
-    console.error("Auth error:", err?.message || err);
-    return res.status(401).json({ error: "authentication failed" });
-  }
-}
-
-/* ------------------------------------------------------------------
-   Hybrid middleware
------------------------------------------------------------------- */
-async function requireSessionOrApple(req, res, next) {
-  try {
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "missing authorization token" });
-    }
-
-    const token = header.slice("Bearer ".length);
-
-    // 1) Try HakMun session first
-    try {
-      const decoded = await verifySessionJWT(token);
-      if (decoded.typ !== "access") {
-        return res.status(401).json({ error: "access token required" });
-      }
-
-      const state = await getUserState(decoded.userID);
-      const isActive = Boolean(state.is_active);
-      if (!isActive) return res.status(403).json({ error: "account disabled" });
-
-      req.user = {
-        userID: decoded.userID,
-        role: state.role,
-        isAdmin: Boolean(state.is_admin),
-        isRootAdmin: Boolean(state.is_root_admin),
-        isActive
-      };
-
-      return next();
-    } catch {
-      // fall through to Apple
-    }
-
-    const { appleSubject, audience } = await verifyAppleToken(token);
-    const userID = await ensureCanonicalUser({ appleSubject, audience }, req._rid);
-    const state = await getUserState(userID);
-
-    req.user = {
-      userID,
-      appleUserID: appleSubject,
-      audience,
-      role: state.role,
-      isAdmin: Boolean(state.is_admin),
-      isRootAdmin: Boolean(state.is_root_admin),
-      isActive: Boolean(state.is_active)
-    };
-
-    return next();
-  } catch (err) {
-    console.error("Hybrid auth error:", err?.message || err);
-    return res.status(401).json({ error: "authentication failed" });
-  }
-}
-
-/* ------------------------------------------------------------------
-   Secure object storage (Railway bucket, S3-compatible)
+   Secure object storage (S3-compatible)
 ------------------------------------------------------------------ */
 function storageConfigured() {
   return Boolean(
@@ -777,20 +720,9 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
-   GET /v1/auth/whoami (LEGACY)
------------------------------------------------------------------- */
-app.get("/v1/auth/whoami", requireUser, async (req, res) => {
-  return res.json(req.user);
-});
-
-/* ------------------------------------------------------------------
    POST /v1/auth/apple
    Exchange Apple identityToken for HakMun session tokens.
-   DEBUG INCLUDED:
-   - START log
-   - stage logs
-   - timeouts for verify + canonical user + user state
-   - response header to prove deploy version
+   DEBUG INCLUDED: START + stage logs + fail-fast timeouts.
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
   console.log(`[/v1/auth/apple] START rid=${req._rid}`);
@@ -803,7 +735,6 @@ app.post("/v1/auth/apple", async (req, res) => {
     const { appleSubject, audience } = await verifyAppleToken(identityToken);
     console.log(`[/v1/auth/apple] verified rid=${req._rid} appleSubject=${appleSubject}`);
 
-    // Fail-fast DB work (prevents iOS timeouts)
     const userID = await withTimeout(
       ensureCanonicalUser({ appleSubject, audience }, req._rid),
       6000,
@@ -855,32 +786,6 @@ app.post("/v1/auth/apple", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   POST /v1/session/refresh
------------------------------------------------------------------- */
-app.post("/v1/session/refresh", async (req, res) => {
-  try {
-    const refreshToken = requireJsonField(req, res, "refreshToken");
-    if (!refreshToken) return;
-
-    const decoded = await verifySessionJWT(refreshToken);
-    if (decoded.typ !== "refresh") {
-      return res.status(401).json({ error: "refresh token required" });
-    }
-
-    const state = await getUserState(decoded.userID);
-    if (!Boolean(state.is_active)) {
-      return res.status(403).json({ error: "account disabled" });
-    }
-
-    const tokens = await issueSessionTokens({ userID: decoded.userID });
-    return res.json(tokens);
-  } catch (err) {
-    console.error("/v1/session/refresh failed:", err?.message || err);
-    return res.status(401).json({ error: "refresh failed" });
-  }
-});
-
-/* ------------------------------------------------------------------
    GET /v1/session/whoami
 ------------------------------------------------------------------ */
 app.get("/v1/session/whoami", requireSession, async (req, res) => {
@@ -900,70 +805,6 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
     console.error("/v1/session/whoami failed:", err?.message || err);
     return res.status(500).json({ error: "whoami failed" });
   }
-});
-
-/* ------------------------------------------------------------------
-   GET /v1/profile (v2, canonical)
------------------------------------------------------------------- */
-app.get("/v1/profile", requireSession, async (req, res) => {
-  try {
-    const primaryHandle = await getPrimaryHandleForUser(req.user.userID);
-    const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
-
-    return res.json({
-      user: req.user,
-      profile: {
-        primaryHandle,
-        profileComplete,
-        username: primaryHandle
-      }
-    });
-  } catch (err) {
-    console.error("/v1/profile failed:", err?.message || err);
-    return res.status(500).json({ error: "profile failed" });
-  }
-});
-
-/* ------------------------------------------------------------------
-   GET /v1/me (legacy)
------------------------------------------------------------------- */
-app.get("/v1/me", requireUser, async (req, res) => {
-  const { appleUserID, userID } = req.user;
-
-  const result = await pool.query(
-    `
-    select apple_user_id, schema_version, settings_json, updated_at
-    from user_profiles
-    where apple_user_id = $1
-    `,
-    [appleUserID]
-  );
-
-  return res.json({
-    userID,
-    appleUserID,
-    profile: result.rows[0] || null
-  });
-});
-
-/* ------------------------------------------------------------------
-   PUT /v1/me/profile (legacy)
------------------------------------------------------------------- */
-app.put("/v1/me/profile", requireUser, async (req, res) => {
-  const { appleUserID } = req.user;
-  const updates = req.body || {};
-
-  await pool.query(
-    `
-    update user_profiles
-    set settings_json = $2,
-        updated_at = now()
-    where apple_user_id = $1
-    `,
-    [appleUserID, updates]
-  );
-
-  return res.json({ ok: true });
 });
 
 /* ------------------------------------------------------------------
@@ -1080,8 +921,6 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
 
 /* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url (signed url)
-   DEBUG INCLUDED:
-   - response header to prove which path served it
 ------------------------------------------------------------------ */
 app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
@@ -1108,163 +947,6 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   } catch (err) {
     console.error("profile-photo-url failed:", err?.message || err);
     return res.status(500).json({ error: "failed to sign url" });
-  }
-});
-
-/* ------------------------------------------------------------------
-   GET /v1/handles/me
------------------------------------------------------------------- */
-app.get("/v1/handles/me", requireSessionOrApple, async (req, res) => {
-  const { userID } = req.user;
-
-  try {
-    const { rows } = await pool.query(
-      `
-      select handle, kind, primary_handle, created_at
-      from user_handles
-      where user_id = $1 and kind = 'primary'
-      limit 1
-      `,
-      [userID]
-    );
-
-    if (!rows || rows.length === 0) return res.status(404).json({ error: "no username set" });
-    return res.json(rows[0]);
-  } catch (err) {
-    console.error("handles/me failed:", err?.message || err);
-    return res.status(500).json({ error: "resolve failed" });
-  }
-});
-
-/* ------------------------------------------------------------------
-   POST /v1/handles/reserve
------------------------------------------------------------------- */
-app.post("/v1/handles/reserve", requireSessionOrApple, async (req, res) => {
-  const { userID } = req.user;
-  const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
-
-  if (!handle) return res.status(400).json({ error: "handle is required" });
-  if (!isValidHandle(handle)) {
-    return res.status(400).json({
-      error: "Invalid username. Use 2–24 characters: letters, numbers, underscore, dot, hyphen, or Hangul."
-    });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    await client.query(
-      `
-      insert into user_handles (handle, user_id, kind, primary_handle)
-      values ($1, $2, 'primary', $1)
-      `,
-      [handle, userID]
-    );
-
-    await client.query("COMMIT");
-    return res.json({ handle, kind: "primary", primary_handle: handle });
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
-    if (err && err.code === "23505") return res.status(409).json({ error: "username already taken" });
-    console.error("reserve handle failed:", err?.message || err);
-    return res.status(500).json({ error: "reserve failed" });
-  } finally {
-    client.release();
-  }
-});
-
-/* ------------------------------------------------------------------
-   GET /v1/handles/resolve?handle=...
------------------------------------------------------------------- */
-app.get("/v1/handles/resolve", requireSessionOrApple, async (req, res) => {
-  const handle = normalizeHandle(req.query?.handle);
-  if (!handle) return res.status(400).json({ error: "handle is required" });
-
-  try {
-    const { rows } = await pool.query(
-      `
-      select handle, kind, primary_handle
-      from user_handles
-      where handle = $1
-      `,
-      [handle]
-    );
-
-    if (!rows || rows.length === 0) return res.status(404).json({ error: "username not found" });
-    return res.json(rows[0]);
-  } catch (err) {
-    console.error("resolve handle failed:", err?.message || err);
-    return res.status(500).json({ error: "resolve failed" });
-  }
-});
-
-/* ------------------------------------------------------------------
-   Sentence validation (stub)
------------------------------------------------------------------- */
-app.post("/v1/validate/sentence", requireUser, (req, res) => {
-  const { sentenceID, text } = req.body || {};
-  if (!sentenceID || !text) {
-    return res.status(400).json({ verdict: "NEEDS_REVIEW", reason: "missing sentenceID or text" });
-  }
-  return res.json({ verdict: "OK", reason: "" });
-});
-
-/* ------------------------------------------------------------------
-   Sentence generation (global worker for now)
------------------------------------------------------------------- */
-app.post("/v1/generate/sentences", requireUser, async (req, res) => {
-  try {
-    if (!openai) return res.status(503).json({ error: "OpenAI is not configured" });
-
-    const { tier, count } = req.body || {};
-    if (!count || typeof count !== "number" || count < 1 || count > 30) {
-      return res.status(400).json({ error: "count must be a number between 1 and 30" });
-    }
-
-    const safeTier = tier === "intermediate" || tier === "advanced" ? tier : "beginner";
-
-    const prompt = `
-You generate Korean typing practice sentences for a language-learning app.
-Return ONLY valid JSON. Do not include explanations or markdown.
-
-The JSON MUST have this shape:
-{
-  "generatorVersion": "string",
-  "sentences": [
-    {
-      "id": "string",
-      "ko": "string",
-      "literal": "string | null",
-      "natural": "string | null",
-      "naturalnessScore": number (0 to 1)
-    }
-  ]
-}
-
-Rules:
-- Generate exactly ${count} unique sentences.
-- Tier: ${safeTier}.
-- Sentences must be natural, realistic Korean.
-- Each sentence must be complete and properly punctuated.
-- Avoid unsafe content.
-- Use stable IDs like GEN_A1B2C3D4.
-- naturalnessScore is your self-evaluation (higher = more natural)
-`.trim();
-
-    const r = await openai.responses.create({
-      model: "gpt-5.2",
-      input: prompt,
-      text: { format: { type: "json_object" } }
-    });
-
-    const payload = JSON.parse(r.output_text);
-    return res.json(payload);
-  } catch (err) {
-    console.error(err?.message || err);
-    return res.status(500).json({ error: "generation failed" });
   }
 });
 
