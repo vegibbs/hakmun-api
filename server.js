@@ -1,29 +1,20 @@
-// server.js — HakMun API (v0.11)
+// server.js — HakMun API (v0.11) — FULL REWRITE (DROP-IN REPLACEMENT)
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
-// Identity:
-// - Canonical user key: users.user_id (UUID)
-// - auth_identities maps (provider, subject, audience) -> user_id
-// - Apple `sub` is auth identity (subject), not a data key.
+// HARD CONTRACTS ENFORCED:
+// - Apple identityToken verified ONLY during exchange (/v1/auth/apple) and legacy requireUser.
+// - Steady-state requests use HakMun session JWTs (HS256).
+// - Canonical identity key = users.user_id (UUID).
+// - Canonical profile photo metadata lives ONLY on users.profile_photo_object_key.
+// - Buckets are PRIVATE; server returns short-lived signed URLs.
+// - EPIC A0 admin-safety invariants are enforced server-side.
 //
-// Handles:
-// - user_handles is keyed by user_id
-// - handle globally unique (CITEXT PK)
-// - aliases resolve to primary_handle
-//
-// Legacy:
-// - user_profiles is still keyed by apple_user_id (legacy).
-// - Legacy profile writes are best-effort and MUST NOT break auth.
-//
-// Secure assets:
-// - Store profile photos privately in Railway bucket
-// - Expose read access via signed URLs (time-limited)
-//
-// EPIC A0 — ADMIN SAFETY INVARIANTS (MANDATORY):
-// - At least one ROOT ADMIN MUST always exist.
-// - Root admin identity is pinned by users.user_id.
-// - Server MUST self-heal admin flags on session validation / whoami.
-// - It MUST be impossible to lose all admin access under any circumstance.
+// DEBUG GOAL (ONE SHOT):
+// This version adds deterministic request logging + stage logging + timeouts for:
+// - /v1/auth/apple (START + stage logs + fail-fast timeouts)
+// - Apple jwtVerify (fail-fast timeout + timing log)
+// - DB calls for auth flow (fail-fast statement_timeout + stage logs)
+// - /v1/me/profile-photo-url (optional debug header + canonical key read)
 
 const express = require("express");
 const OpenAI = require("openai");
@@ -40,8 +31,33 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+/* ------------------------------------------------------------------
+   App + JSON
+------------------------------------------------------------------ */
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+/* ------------------------------------------------------------------
+   Request ID + safe request logging (NO secrets)
+------------------------------------------------------------------ */
+function makeReqID() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+app.use((req, res, next) => {
+  const rid = makeReqID();
+  req._rid = rid;
+  res.setHeader("X-HakMun-Request-Id", rid);
+
+  const t0 = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - t0;
+    // Keep it short; do not log auth headers or bodies.
+    console.log(`[http] rid=${rid} ${req.method} ${req.path} -> ${res.statusCode} ${ms}ms`);
+  });
+
+  next();
+});
 
 /* ------------------------------------------------------------------
    Hard config guardrails (fail fast)
@@ -69,7 +85,6 @@ const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
   .filter(Boolean);
 
 const DATABASE_URL = requireEnv("DATABASE_URL");
-
 const SESSION_JWT_SECRET = requireEnv("SESSION_JWT_SECRET");
 
 // EPIC A0: Root admin must be pinned by user_id in production.
@@ -79,7 +94,6 @@ const ROOT_ADMIN_USER_IDS =
     ? parseCsvEnv("ROOT_ADMIN_USER_IDS").length
       ? parseCsvEnv("ROOT_ADMIN_USER_IDS")
       : (() => {
-          // Fail-fast: do not allow production to boot without a pinned root admin set.
           requireEnv("ROOT_ADMIN_USER_IDS");
           return parseCsvEnv("ROOT_ADMIN_USER_IDS");
         })()
@@ -93,7 +107,7 @@ const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
 const SESSION_ISSUER = "hakmun-api";
 const SESSION_AUDIENCE = "hakmun-client";
 
-// OPENAI is optional unless you call generation endpoints.
+// OpenAI is optional unless you call generation endpoints.
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 /* ------------------------------------------------------------------
@@ -129,10 +143,18 @@ const openai =
 
 /* ------------------------------------------------------------------
    Postgres (Railway)
+   - Add connection timeouts to prevent silent hangs.
 ------------------------------------------------------------------ */
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+  ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 8000,
+  idleTimeoutMillis: 30_000,
+  max: 10
+});
+
+pool.on("error", (err) => {
+  console.error("[pg] pool error:", err?.message || err);
 });
 
 /* ------------------------------------------------------------------
@@ -148,11 +170,31 @@ function withTimeout(promise, ms, label) {
 }
 
 /* ------------------------------------------------------------------
-   Apple Sign In verification
+   DB helper with per-call statement_timeout (prevents hung queries)
+   NOTE: We use a short-lived client for auth-critical paths.
 ------------------------------------------------------------------ */
-const APPLE_JWKS = createRemoteJWKSet(
-  new URL("https://appleid.apple.com/auth/keys")
-);
+async function dbQueryTimeout(text, params, timeoutMs, label, rid) {
+  const client = await pool.connect();
+  try {
+    // statement_timeout is in ms; applies to subsequent statements on this connection
+    await client.query(`set statement_timeout = ${Math.max(1000, timeoutMs)};`);
+    const t0 = Date.now();
+    const result = await client.query(text, params);
+    const ms = Date.now() - t0;
+    if (label) console.log(`[db] rid=${rid} ${label} ok ${ms}ms rows=${result?.rowCount ?? "?"}`);
+    return result;
+  } catch (err) {
+    if (label) console.error(`[db] rid=${rid} ${label} failed:`, err?.message || err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/* ------------------------------------------------------------------
+   Apple Sign In verification (fail-fast)
+------------------------------------------------------------------ */
+const APPLE_JWKS = createRemoteJWKSet(new URL("https://appleid.apple.com/auth/keys"));
 
 async function verifyAppleToken(identityToken) {
   const t0 = Date.now();
@@ -199,27 +241,29 @@ function safeMimeType(mime) {
   if (m === "image/png") return "image/png";
   if (m === "image/webp") return "image/webp";
   if (m === "image/heic" || m === "image/heif") return "image/heic";
-  // Default to jpeg to avoid weird content-types.
   return "image/jpeg";
+}
+
+function requireJsonField(req, res, fieldName) {
+  const v = req.body?.[fieldName];
+  if (!v || String(v).trim() === "") {
+    res.status(400).json({ error: `${fieldName} is required` });
+    return null;
+  }
+  return String(v);
 }
 
 /* ------------------------------------------------------------------
    EPIC A0 — Admin Safety Invariants
 ------------------------------------------------------------------ */
-
-// Small in-memory guard to avoid excessive global checks under load.
 let _adminSafetyNextCheckAtMs = 0;
 
 function isPinnedRootAdmin(userID) {
   return ROOT_ADMIN_USER_IDS.includes(String(userID));
 }
 
-// Idempotent promotion:
-// - Only updates if flags are not already correct
-// - Only logs when it actually changed something
 async function promoteToRootAdminNonFatal(userID, reason) {
   try {
-    // 1) Read current flags
     const { rows } = await pool.query(
       `
       select is_admin, is_root_admin
@@ -235,11 +279,8 @@ async function promoteToRootAdminNonFatal(userID, reason) {
 
     const needsAdmin = !Boolean(current.is_admin);
     const needsRoot = !Boolean(current.is_root_admin);
-
-    // 2) If already correct, do nothing (prevents log spam)
     if (!needsAdmin && !needsRoot) return;
 
-    // 3) Fix flags
     await pool.query(
       `
       update users
@@ -250,29 +291,20 @@ async function promoteToRootAdminNonFatal(userID, reason) {
       [userID]
     );
 
-    console.log(
-      `[admin-safety] promoted root admin user_id=${userID} reason=${reason}`
-    );
+    console.log(`[admin-safety] promoted root admin user_id=${userID} reason=${reason}`);
   } catch (err) {
-    console.error(
-      "[admin-safety] failed to promote root admin:",
-      err?.code,
-      err?.detail || err?.message
-    );
+    console.error("[admin-safety] failed to promote root admin:", err?.code, err?.detail || err?.message);
   }
 }
 
 async function ensurePinnedRootAdminsNonFatal() {
   if (!ROOT_ADMIN_USER_IDS.length) return;
-
-  // Ensure every pinned root admin is at least admin+root_admin (idempotent).
   for (const uid of ROOT_ADMIN_USER_IDS) {
     await promoteToRootAdminNonFatal(uid, "pinned-self-heal");
   }
 }
 
 async function ensureAtLeastOneRootAdminNonFatal(trigger) {
-  // Throttle global scan to at most once per 30 seconds.
   const now = Date.now();
   if (now < _adminSafetyNextCheckAtMs) return;
   _adminSafetyNextCheckAtMs = now + 30_000;
@@ -288,16 +320,12 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
 
     const c = rows?.[0]?.c ?? 0;
     if (c > 0) {
-      // Still ensure pinned root admins are never accidentally demoted.
       await ensurePinnedRootAdminsNonFatal();
       return;
     }
 
-    console.error(
-      `[admin-safety] ZERO active root admins detected (trigger=${trigger}). Initiating self-heal.`
-    );
+    console.error(`[admin-safety] ZERO active root admins detected (trigger=${trigger}). Initiating self-heal.`);
 
-    // Primary self-heal path: pinned list.
     if (ROOT_ADMIN_USER_IDS.length) {
       await ensurePinnedRootAdminsNonFatal();
 
@@ -308,17 +336,14 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
         where is_root_admin = true and is_active = true
         `
       );
+
       const c2 = after.rows?.[0]?.c ?? 0;
       if (c2 > 0) return;
 
-      console.error(
-        "[admin-safety] pinned self-heal did not restore a root admin (pinned IDs may not exist in users table)."
-      );
+      console.error("[admin-safety] pinned self-heal did not restore a root admin (pinned IDs may not exist).");
     }
 
-    // NON-PRODUCTION fallback only: deterministically promote a user to avoid total lockout.
     if (NODE_ENV !== "production") {
-      // Prefer earliest created_at if available; fall back to user_id ordering.
       let candidate = null;
 
       try {
@@ -350,21 +375,12 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
         return;
       }
 
-      console.error(
-        "[admin-safety] dev fallback failed: no active users to promote."
-      );
+      console.error("[admin-safety] dev fallback failed: no active users to promote.");
     }
 
-    // Production must never reach here because ROOT_ADMIN_USER_IDS is required.
-    console.error(
-      "[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs."
-    );
+    console.error("[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs.");
   } catch (err) {
-    console.error(
-      "[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:",
-      err?.code,
-      err?.detail || err?.message
-    );
+    console.error("[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:", err?.code, err?.detail || err?.message);
   }
 }
 
@@ -372,8 +388,6 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
    Legacy profile helpers (NON-FATAL)
 ------------------------------------------------------------------ */
 async function ensureLegacyUserProfileNonFatal(appleUserID) {
-  // Legacy storage: user_profiles keyed by apple_user_id.
-  // IMPORTANT: This must NEVER block auth (FK constraints may exist).
   try {
     await pool.query(
       `
@@ -384,11 +398,7 @@ async function ensureLegacyUserProfileNonFatal(appleUserID) {
       [appleUserID]
     );
   } catch (err) {
-    console.warn(
-      "[warn] ensureLegacyUserProfileNonFatal failed (continuing):",
-      err?.code,
-      err?.detail || err?.message
-    );
+    console.warn("[warn] ensureLegacyUserProfileNonFatal failed (continuing):", err?.code, err?.detail || err?.message);
   }
 }
 
@@ -419,8 +429,7 @@ async function resolveUserIDFromIdentity({ provider, subject, audience }) {
   return rows && rows.length ? rows[0].user_id : null;
 }
 
-async function ensureCanonicalUser({ appleSubject, audience }) {
-  // 1) Resolve via auth_identities
+async function ensureCanonicalUser({ appleSubject, audience }, rid) {
   const userID = await resolveUserIDFromIdentity({
     provider: "apple",
     subject: appleSubject,
@@ -433,9 +442,10 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
     return userID;
   }
 
-  // 2) Not found -> reuse users row by apple_user_id OR create one, then bind identity
   const client = await pool.connect();
   try {
+    // Fail-fast if a lock blocks us: statement_timeout prevents infinite wait.
+    await client.query(`set statement_timeout = 6000;`);
     await client.query("BEGIN");
 
     const existing = await client.query(
@@ -472,7 +482,6 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
       [appleSubject, audience, canonicalUserID]
     );
 
-    // Best-effort legacy profile insert (same transaction)
     try {
       await client.query(
         `
@@ -483,18 +492,17 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
         [appleSubject]
       );
     } catch (err) {
-      console.warn(
-        "[warn] (tx) legacy user_profiles insert failed (continuing):",
-        err?.code,
-        err?.detail || err?.message
-      );
+      console.warn("[warn] (tx) legacy user_profiles insert failed (continuing):", err?.code, err?.detail || err?.message);
     }
 
     await client.query("COMMIT");
     await touchLastSeen(canonicalUserID);
     return canonicalUserID;
   } catch (err) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error(`[auth] rid=${rid} ensureCanonicalUser FAILED:`, err?.message || err);
     throw err;
   } finally {
     client.release();
@@ -505,10 +513,8 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
    User state (role/admin flags) — server authoritative + admin safety self-heal
 ------------------------------------------------------------------ */
 async function getUserState(userID) {
-  // EPIC A0: global self-heal guardrails (throttled).
   await ensureAtLeastOneRootAdminNonFatal("getUserState");
 
-  // EPIC A0: pinned root admin must always remain admin/root_admin.
   if (isPinnedRootAdmin(userID)) {
     await promoteToRootAdminNonFatal(userID, "pinned-read-path");
   }
@@ -523,7 +529,6 @@ async function getUserState(userID) {
     [userID]
   );
 
-  // Be defensive: should always exist
   return rows?.[0] || {
     role: "student",
     is_admin: false,
@@ -534,8 +539,6 @@ async function getUserState(userID) {
 
 /* ------------------------------------------------------------------
    Canonical profile facts (v2)
-   - NO local profile.
-   - Username/handle is server-authoritative.
 ------------------------------------------------------------------ */
 async function getPrimaryHandleForUser(userID) {
   const { rows } = await pool.query(
@@ -552,9 +555,6 @@ async function getPrimaryHandleForUser(userID) {
 
 /* ------------------------------------------------------------------
    HakMun session tokens (JWT)
-   - Apple identityToken is verified ONLY during exchange.
-   - Steady-state requests verify HakMun session JWTs.
-   - Session tokens do NOT depend on Apple claims.
 ------------------------------------------------------------------ */
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -566,21 +566,10 @@ function extractBearerToken(req) {
   return header.slice("Bearer ".length);
 }
 
-function requireJsonField(req, res, fieldName) {
-  const v = req.body?.[fieldName];
-  if (!v || String(v).trim() === "") {
-    res.status(400).json({ error: `${fieldName} is required` });
-    return null;
-  }
-  return String(v);
-}
-
 async function issueSessionTokens({ userID }) {
   const iat = nowSeconds();
 
-  const accessToken = await new SignJWT({
-    typ: "access"
-  })
+  const accessToken = await new SignJWT({ typ: "access" })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuer(SESSION_ISSUER)
     .setAudience(SESSION_AUDIENCE)
@@ -589,9 +578,7 @@ async function issueSessionTokens({ userID }) {
     .setExpirationTime(iat + SESSION_ACCESS_TTL_SEC)
     .sign(Buffer.from(SESSION_JWT_SECRET));
 
-  const refreshToken = await new SignJWT({
-    typ: "refresh"
-  })
+  const refreshToken = await new SignJWT({ typ: "refresh" })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuer(SESSION_ISSUER)
     .setAudience(SESSION_AUDIENCE)
@@ -609,7 +596,6 @@ async function issueSessionTokens({ userID }) {
 }
 
 async function verifySessionJWT(token) {
-  // Session JWTs are signed (HS256). No JWKS / Apple verification here.
   const { payload } = await jwtVerify(token, Buffer.from(SESSION_JWT_SECRET), {
     issuer: SESSION_ISSUER,
     audience: SESSION_AUDIENCE
@@ -629,9 +615,7 @@ async function verifySessionJWT(token) {
 async function requireSession(req, res, next) {
   try {
     const token = extractBearerToken(req);
-    if (!token) {
-      return res.status(401).json({ error: "missing session token" });
-    }
+    if (!token) return res.status(401).json({ error: "missing session token" });
 
     const decoded = await verifySessionJWT(token);
     if (decoded.typ !== "access") {
@@ -640,9 +624,7 @@ async function requireSession(req, res, next) {
 
     const state = await getUserState(decoded.userID);
     const isActive = Boolean(state.is_active);
-    if (!isActive) {
-      return res.status(403).json({ error: "account disabled" });
-    }
+    if (!isActive) return res.status(403).json({ error: "account disabled" });
 
     req.user = {
       userID: decoded.userID,
@@ -654,13 +636,13 @@ async function requireSession(req, res, next) {
 
     return next();
   } catch (err) {
-    console.error("Session auth error:", err);
+    console.error("Session auth error:", err?.message || err);
     return res.status(401).json({ error: "invalid session" });
   }
 }
 
 /* ------------------------------------------------------------------
-   Auth middleware (LEGACY: Apple identityToken per request)
+   Legacy Auth middleware (Apple identityToken per request)
 ------------------------------------------------------------------ */
 async function requireUser(req, res, next) {
   try {
@@ -670,24 +652,15 @@ async function requireUser(req, res, next) {
     }
 
     const token = header.slice("Bearer ".length);
-    const { appleSubject, audience } = await verifyAppleToken(identityToken);
-    console.log("[/v1/auth/apple] verified appleSubject", appleSubject);
+    const { appleSubject, audience } = await verifyAppleToken(token);
+    const userID = await ensureCanonicalUser({ appleSubject, audience }, req._rid);
 
-    const userID = await withTimeout(
-      ensureCanonicalUser({ appleSubject, audience }),
-      6000,
-      "ensureCanonicalUser"
-    );
-    console.log("[/v1/auth/apple] ensured canonical userID", userID);
-
-    const state = await withTimeout(getUserState(userID), 6000, "getUserState");
-    console.log("[/v1/auth/apple] loaded user state");
+    const state = await getUserState(userID);
 
     req.user = {
       userID,
       appleUserID: appleSubject,
       audience,
-
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
@@ -696,16 +669,13 @@ async function requireUser(req, res, next) {
 
     return next();
   } catch (err) {
-    console.error("Auth error:", err);
+    console.error("Auth error:", err?.message || err);
     return res.status(401).json({ error: "authentication failed" });
   }
 }
 
 /* ------------------------------------------------------------------
-   Auth middleware (HYBRID)
-   Accept either:
-   - HakMun session access token (preferred steady-state)
-   - Apple identityToken (legacy/back-compat only)
+   Hybrid middleware
 ------------------------------------------------------------------ */
 async function requireSessionOrApple(req, res, next) {
   try {
@@ -725,9 +695,7 @@ async function requireSessionOrApple(req, res, next) {
 
       const state = await getUserState(decoded.userID);
       const isActive = Boolean(state.is_active);
-      if (!isActive) {
-        return res.status(403).json({ error: "account disabled" });
-      }
+      if (!isActive) return res.status(403).json({ error: "account disabled" });
 
       req.user = {
         userID: decoded.userID,
@@ -742,16 +710,14 @@ async function requireSessionOrApple(req, res, next) {
       // fall through to Apple
     }
 
-    // 2) Fall back to Apple identity token (legacy only)
     const { appleSubject, audience } = await verifyAppleToken(token);
-    const userID = await ensureCanonicalUser({ appleSubject, audience });
+    const userID = await ensureCanonicalUser({ appleSubject, audience }, req._rid);
     const state = await getUserState(userID);
 
     req.user = {
       userID,
       appleUserID: appleSubject,
       audience,
-
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
@@ -760,7 +726,7 @@ async function requireSessionOrApple(req, res, next) {
 
     return next();
   } catch (err) {
-    console.error("Hybrid auth error:", err);
+    console.error("Hybrid auth error:", err?.message || err);
     return res.status(401).json({ error: "authentication failed" });
   }
 }
@@ -791,7 +757,7 @@ const upload = multer({
 
 function makeS3Client() {
   return new S3Client({
-    endpoint: process.env.OBJECT_STORAGE_ENDPOINT, // e.g. https://storage.railway.app
+    endpoint: process.env.OBJECT_STORAGE_ENDPOINT,
     region: process.env.OBJECT_STORAGE_REGION || "auto",
     credentials: {
       accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID,
@@ -811,7 +777,7 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
-   GET /v1/auth/whoami  (LEGACY)
+   GET /v1/auth/whoami (LEGACY)
 ------------------------------------------------------------------ */
 app.get("/v1/auth/whoami", requireUser, async (req, res) => {
   return res.json(req.user);
@@ -820,21 +786,40 @@ app.get("/v1/auth/whoami", requireUser, async (req, res) => {
 /* ------------------------------------------------------------------
    POST /v1/auth/apple
    Exchange Apple identityToken for HakMun session tokens.
+   DEBUG INCLUDED:
+   - START log
+   - stage logs
+   - timeouts for verify + canonical user + user state
+   - response header to prove deploy version
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
+  console.log(`[/v1/auth/apple] START rid=${req._rid}`);
+  res.set("X-HakMun-AuthApple", "v0.11-debug");
+
   try {
     const identityToken = requireJsonField(req, res, "identityToken");
     if (!identityToken) return;
 
     const { appleSubject, audience } = await verifyAppleToken(identityToken);
-    const userID = await ensureCanonicalUser({ appleSubject, audience });
+    console.log(`[/v1/auth/apple] verified rid=${req._rid} appleSubject=${appleSubject}`);
 
-    const state = await getUserState(userID);
+    // Fail-fast DB work (prevents iOS timeouts)
+    const userID = await withTimeout(
+      ensureCanonicalUser({ appleSubject, audience }, req._rid),
+      6000,
+      "ensureCanonicalUser"
+    );
+    console.log(`[/v1/auth/apple] canonical rid=${req._rid} userID=${userID}`);
+
+    const state = await withTimeout(getUserState(userID), 6000, "getUserState");
+    console.log(`[/v1/auth/apple] state rid=${req._rid} active=${Boolean(state.is_active)}`);
+
     if (!Boolean(state.is_active)) {
       return res.status(403).json({ error: "account disabled" });
     }
 
-    const tokens = await issueSessionTokens({ userID });
+    const tokens = await withTimeout(issueSessionTokens({ userID }), 3000, "issueSessionTokens");
+    console.log(`[/v1/auth/apple] issued tokens rid=${req._rid}`);
 
     return res.json({
       ...tokens,
@@ -848,9 +833,9 @@ app.post("/v1/auth/apple", async (req, res) => {
         isActive: Boolean(state.is_active)
       }
     });
-    } catch (err) {
+  } catch (err) {
     const msg = String(err?.message || err);
-    console.error("/v1/auth/apple failed:", msg);
+    console.error(`/v1/auth/apple failed rid=${req._rid}:`, msg);
 
     if (msg.startsWith("timeout:apple-jwtVerify")) {
       return res.status(503).json({ error: "apple verification timeout" });
@@ -861,6 +846,9 @@ app.post("/v1/auth/apple", async (req, res) => {
     if (msg.startsWith("timeout:getUserState")) {
       return res.status(503).json({ error: "db timeout: getUserState" });
     }
+    if (msg.startsWith("timeout:issueSessionTokens")) {
+      return res.status(503).json({ error: "timeout: token issuance" });
+    }
 
     return res.status(401).json({ error: "authentication failed" });
   }
@@ -868,7 +856,6 @@ app.post("/v1/auth/apple", async (req, res) => {
 
 /* ------------------------------------------------------------------
    POST /v1/session/refresh
-   Exchange refresh token for a new access token (and rotated refresh).
 ------------------------------------------------------------------ */
 app.post("/v1/session/refresh", async (req, res) => {
   try {
@@ -885,34 +872,24 @@ app.post("/v1/session/refresh", async (req, res) => {
       return res.status(403).json({ error: "account disabled" });
     }
 
-    // Rotate refresh token to reduce replay window.
     const tokens = await issueSessionTokens({ userID: decoded.userID });
     return res.json(tokens);
   } catch (err) {
-    console.error("/v1/session/refresh failed:", err);
+    console.error("/v1/session/refresh failed:", err?.message || err);
     return res.status(401).json({ error: "refresh failed" });
   }
 });
 
 /* ------------------------------------------------------------------
    GET /v1/session/whoami
-   Steady-state whoami (requires HakMun session access token).
-   Includes canonical profile facts to support client gating.
 ------------------------------------------------------------------ */
 app.get("/v1/session/whoami", requireSession, async (req, res) => {
   try {
-    // EPIC A0: self-heal on whoami explicitly (even though requireSession already hit getUserState)
     await ensureAtLeastOneRootAdminNonFatal("whoami");
 
     const primaryHandle = await getPrimaryHandleForUser(req.user.userID);
     const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
-    // Canonical keys:
-    // - profileComplete
-    // - primaryHandle
-    //
-    // Back-compat alias:
-    // - username (deprecated; mirrors primaryHandle)
     return res.json({
       ...req.user,
       profileComplete,
@@ -920,15 +897,13 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
       username: primaryHandle
     });
   } catch (err) {
-    console.error("/v1/session/whoami failed:", err);
+    console.error("/v1/session/whoami failed:", err?.message || err);
     return res.status(500).json({ error: "whoami failed" });
   }
 });
 
 /* ------------------------------------------------------------------
-   GET /v1/profile  (v2, canonical)
-   Requires HakMun session access token.
-   Server-authoritative profile facts only (no local profile).
+   GET /v1/profile (v2, canonical)
 ------------------------------------------------------------------ */
 app.get("/v1/profile", requireSession, async (req, res) => {
   try {
@@ -940,18 +915,17 @@ app.get("/v1/profile", requireSession, async (req, res) => {
       profile: {
         primaryHandle,
         profileComplete,
-        username: primaryHandle // deprecated alias
+        username: primaryHandle
       }
     });
   } catch (err) {
-    console.error("/v1/profile failed:", err);
+    console.error("/v1/profile failed:", err?.message || err);
     return res.status(500).json({ error: "profile failed" });
   }
 });
 
 /* ------------------------------------------------------------------
-   GET /v1/me
-   (legacy profile storage still keyed by apple_user_id)
+   GET /v1/me (legacy)
 ------------------------------------------------------------------ */
 app.get("/v1/me", requireUser, async (req, res) => {
   const { appleUserID, userID } = req.user;
@@ -973,7 +947,7 @@ app.get("/v1/me", requireUser, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   PUT /v1/me/profile
+   PUT /v1/me/profile (legacy)
 ------------------------------------------------------------------ */
 app.put("/v1/me/profile", requireUser, async (req, res) => {
   const { appleUserID } = req.user;
@@ -994,8 +968,6 @@ app.put("/v1/me/profile", requireUser, async (req, res) => {
 
 /* ------------------------------------------------------------------
    EPIC M1 — Canonical profile photo metadata (users table)
-   - Runtime authority is users.profile_photo_object_key (keyed by users.user_id)
-   - Legacy user_profiles.settings_json profilePhotoKey is migration-only
 ------------------------------------------------------------------ */
 async function getCanonicalProfilePhotoKey(userID) {
   const { rows } = await pool.query(
@@ -1035,72 +1007,51 @@ async function clearCanonicalProfilePhotoKey(userID) {
 }
 
 /* ------------------------------------------------------------------
-   PUT /v1/me/profile-photo  (PRIVATE object upload)
-   multipart/form-data field: photo
-   Canonical storage:
-     users.profile_photo_object_key
-     users.profile_photo_updated_at
+   PUT /v1/me/profile-photo (upload)
 ------------------------------------------------------------------ */
-app.put(
-  "/v1/me/profile-photo",
-  requireSession,
-  upload.single("photo"),
-  async (req, res) => {
-    const maybe = requireStorageOr503(res);
-    if (maybe) return;
+app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
 
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "photo file required" });
-      }
+  try {
+    if (!req.file) return res.status(400).json({ error: "photo file required" });
 
-      const { userID } = req.user;
+    const { userID } = req.user;
+    const keyBase = `users/${userID}/profile`;
 
-      // Stable base key (user-scoped). Overwrites are ok.
-      const keyBase = `users/${userID}/profile`;
+    const contentType = safeMimeType(req.file.mimetype);
+    const ext =
+      contentType === "image/png"
+        ? "png"
+        : contentType === "image/webp"
+        ? "webp"
+        : contentType === "image/heic"
+        ? "heic"
+        : "jpg";
 
-      // Choose extension based on content-type where possible.
-      const contentType = safeMimeType(req.file.mimetype);
-      const ext =
-        contentType === "image/png"
-          ? "png"
-          : contentType === "image/webp"
-          ? "webp"
-          : contentType === "image/heic"
-          ? "heic"
-          : "jpg";
+    const objectKey = `${keyBase}.${ext}`;
 
-      const objectKey = `${keyBase}.${ext}`;
+    const s3 = makeS3Client();
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucketName(),
+        Key: objectKey,
+        Body: req.file.buffer,
+        ContentType: contentType,
+        CacheControl: "no-store"
+      })
+    );
 
-      const s3 = makeS3Client();
-
-      // Upload/overwrite object. No separate delete needed.
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: bucketName(),
-          Key: objectKey,
-          Body: req.file.buffer,
-          ContentType: contentType,
-          CacheControl: "no-store"
-        })
-      );
-
-      // EPIC M1: store key ONLY in canonical users table (NO legacy writes)
-      await setCanonicalProfilePhotoKey(userID, objectKey);
-
-      return res.json({ ok: true });
-    } catch (err) {
-      console.error("profile-photo upload failed:", err);
-      return res.status(500).json({ error: "upload failed" });
-    }
+    await setCanonicalProfilePhotoKey(userID, objectKey);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("profile-photo upload failed:", err?.message || err);
+    return res.status(500).json({ error: "upload failed" });
   }
-);
+});
 
 /* ------------------------------------------------------------------
-   DELETE /v1/me/profile-photo  (PRIVATE object delete + DB clear)
-   Canonical storage:
-     users.profile_photo_object_key
-     users.profile_photo_updated_at
+   DELETE /v1/me/profile-photo (delete)
 ------------------------------------------------------------------ */
 app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
@@ -1109,53 +1060,39 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
   try {
     const { userID } = req.user;
 
-    // 1) Fetch current canonical key
     const key = await getCanonicalProfilePhotoKey(userID);
-    if (!key) {
-      // Nothing to delete (already removed)
-      return res.json({ ok: true });
-    }
+    if (!key) return res.json({ ok: true });
 
-    // 2) Delete from bucket (ignore if missing)
     const s3 = makeS3Client();
     try {
-      await s3.send(
-        new DeleteObjectCommand({
-          Bucket: bucketName(),
-          Key: key
-        })
-      );
+      await s3.send(new DeleteObjectCommand({ Bucket: bucketName(), Key: key }));
     } catch (err) {
-      // If object delete fails, still clear DB so UI is consistent;
-      // log for investigation.
-      console.error("profile-photo delete object failed:", err);
+      console.error("profile-photo delete object failed:", err?.message || err);
     }
 
-    // 3) Clear canonical fields (NO legacy writes)
     await clearCanonicalProfilePhotoKey(userID);
-
     return res.json({ ok: true });
   } catch (err) {
-    console.error("profile-photo delete failed:", err);
+    console.error("profile-photo delete failed:", err?.message || err);
     return res.status(500).json({ error: "delete failed" });
   }
 });
 
 /* ------------------------------------------------------------------
-   GET /v1/me/profile-photo-url  (SIGNED URL)
-   Returns time-limited URL to the private object.
-   Canonical storage:
-     users.profile_photo_object_key
-     users.profile_photo_updated_at
+   GET /v1/me/profile-photo-url (signed url)
+   DEBUG INCLUDED:
+   - response header to prove which path served it
 ------------------------------------------------------------------ */
 app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
+  res.set("X-HakMun-PhotoURL", "v0.11-canonical");
+
   try {
     const { userID } = req.user;
-
     const key = await getCanonicalProfilePhotoKey(userID);
+
     if (!key) {
       return res.status(404).json({ error: "no profile photo" });
     }
@@ -1163,23 +1100,19 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
     const s3 = makeS3Client();
     const url = await getSignedUrl(
       s3,
-      new GetObjectCommand({
-        Bucket: bucketName(),
-        Key: key
-      }),
-      { expiresIn: 60 * 15 } // 15 minutes
+      new GetObjectCommand({ Bucket: bucketName(), Key: key }),
+      { expiresIn: 60 * 15 }
     );
 
     return res.json({ url, expiresIn: 900 });
   } catch (err) {
-    console.error("profile-photo-url failed:", err);
+    console.error("profile-photo-url failed:", err?.message || err);
     return res.status(500).json({ error: "failed to sign url" });
   }
 });
 
 /* ------------------------------------------------------------------
    GET /v1/handles/me
-   NOTE: supports HakMun session (steady-state) and Apple (legacy).
 ------------------------------------------------------------------ */
 app.get("/v1/handles/me", requireSessionOrApple, async (req, res) => {
   const { userID } = req.user;
@@ -1195,33 +1128,25 @@ app.get("/v1/handles/me", requireSessionOrApple, async (req, res) => {
       [userID]
     );
 
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({ error: "no username set" });
-    }
-
+    if (!rows || rows.length === 0) return res.status(404).json({ error: "no username set" });
     return res.json(rows[0]);
   } catch (err) {
-    console.error("handles/me failed:", err);
+    console.error("handles/me failed:", err?.message || err);
     return res.status(500).json({ error: "resolve failed" });
   }
 });
 
 /* ------------------------------------------------------------------
    POST /v1/handles/reserve
-   NOTE: supports HakMun session (steady-state) and Apple (legacy).
 ------------------------------------------------------------------ */
 app.post("/v1/handles/reserve", requireSessionOrApple, async (req, res) => {
   const { userID } = req.user;
-
   const handle = normalizeHandle(req.body?.handle ?? req.body?.username);
 
-  if (!handle) {
-    return res.status(400).json({ error: "handle is required" });
-  }
+  if (!handle) return res.status(400).json({ error: "handle is required" });
   if (!isValidHandle(handle)) {
     return res.status(400).json({
-      error:
-        "Invalid username. Use 2–24 characters: letters, numbers, underscore, dot, hyphen, or Hangul."
+      error: "Invalid username. Use 2–24 characters: letters, numbers, underscore, dot, hyphen, or Hangul."
     });
   }
 
@@ -1238,20 +1163,13 @@ app.post("/v1/handles/reserve", requireSessionOrApple, async (req, res) => {
     );
 
     await client.query("COMMIT");
-
-    return res.json({
-      handle,
-      kind: "primary",
-      primary_handle: handle
-    });
+    return res.json({ handle, kind: "primary", primary_handle: handle });
   } catch (err) {
-    await client.query("ROLLBACK");
-
-    if (err && err.code === "23505") {
-      return res.status(409).json({ error: "username already taken" });
-    }
-
-    console.error("reserve handle failed:", err);
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    if (err && err.code === "23505") return res.status(409).json({ error: "username already taken" });
+    console.error("reserve handle failed:", err?.message || err);
     return res.status(500).json({ error: "reserve failed" });
   } finally {
     client.release();
@@ -1259,15 +1177,11 @@ app.post("/v1/handles/reserve", requireSessionOrApple, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   GET /v1/handles/resolve?handle=vernon
-   NOTE: supports HakMun session (steady-state) and Apple (legacy).
+   GET /v1/handles/resolve?handle=...
 ------------------------------------------------------------------ */
 app.get("/v1/handles/resolve", requireSessionOrApple, async (req, res) => {
   const handle = normalizeHandle(req.query?.handle);
-
-  if (!handle) {
-    return res.status(400).json({ error: "handle is required" });
-  }
+  if (!handle) return res.status(400).json({ error: "handle is required" });
 
   try {
     const { rows } = await pool.query(
@@ -1279,13 +1193,10 @@ app.get("/v1/handles/resolve", requireSessionOrApple, async (req, res) => {
       [handle]
     );
 
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({ error: "username not found" });
-    }
-
+    if (!rows || rows.length === 0) return res.status(404).json({ error: "username not found" });
     return res.json(rows[0]);
   } catch (err) {
-    console.error("resolve handle failed:", err);
+    console.error("resolve handle failed:", err?.message || err);
     return res.status(500).json({ error: "resolve failed" });
   }
 });
@@ -1295,18 +1206,10 @@ app.get("/v1/handles/resolve", requireSessionOrApple, async (req, res) => {
 ------------------------------------------------------------------ */
 app.post("/v1/validate/sentence", requireUser, (req, res) => {
   const { sentenceID, text } = req.body || {};
-
   if (!sentenceID || !text) {
-    return res.status(400).json({
-      verdict: "NEEDS_REVIEW",
-      reason: "missing sentenceID or text"
-    });
+    return res.status(400).json({ verdict: "NEEDS_REVIEW", reason: "missing sentenceID or text" });
   }
-
-  return res.json({
-    verdict: "OK",
-    reason: ""
-  });
+  return res.json({ verdict: "OK", reason: "" });
 });
 
 /* ------------------------------------------------------------------
@@ -1314,28 +1217,20 @@ app.post("/v1/validate/sentence", requireUser, (req, res) => {
 ------------------------------------------------------------------ */
 app.post("/v1/generate/sentences", requireUser, async (req, res) => {
   try {
-    if (!openai) {
-      return res.status(503).json({ error: "OpenAI is not configured" });
-    }
+    if (!openai) return res.status(503).json({ error: "OpenAI is not configured" });
 
     const { tier, count } = req.body || {};
-
     if (!count || typeof count !== "number" || count < 1 || count > 30) {
-      return res.status(400).json({
-        error: "count must be a number between 1 and 30"
-      });
+      return res.status(400).json({ error: "count must be a number between 1 and 30" });
     }
 
-    const safeTier =
-      tier === "intermediate" || tier === "advanced" ? tier : "beginner";
+    const safeTier = tier === "intermediate" || tier === "advanced" ? tier : "beginner";
 
     const prompt = `
 You generate Korean typing practice sentences for a language-learning app.
-
 Return ONLY valid JSON. Do not include explanations or markdown.
 
 The JSON MUST have this shape:
-
 {
   "generatorVersion": "string",
   "sentences": [
@@ -1368,7 +1263,7 @@ Rules:
     const payload = JSON.parse(r.output_text);
     return res.json(payload);
   } catch (err) {
-    console.error(err);
+    console.error(err?.message || err);
     return res.status(500).json({ error: "generation failed" });
   }
 });
@@ -1377,9 +1272,7 @@ Rules:
    Boot-time EPIC A0 validation + Start server (Railway)
 ------------------------------------------------------------------ */
 (async () => {
-  // EPIC A0: enforce invariants as early as possible.
   await ensureAtLeastOneRootAdminNonFatal("boot");
-
   const port = process.env.PORT || 8080;
   app.listen(port, () => console.log(`listening on ${port}`));
 })();
