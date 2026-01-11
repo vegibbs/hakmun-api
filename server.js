@@ -1,4 +1,4 @@
-// server.js — HakMun API (v0.10)
+// server.js — HakMun API (v0.11)
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
 // Identity:
@@ -18,6 +18,12 @@
 // Secure assets:
 // - Store profile photos privately in Railway bucket
 // - Expose read access via signed URLs (time-limited)
+//
+// EPIC A0 — ADMIN SAFETY INVARIANTS (MANDATORY):
+// - At least one ROOT ADMIN MUST always exist.
+// - Root admin identity is pinned by users.user_id.
+// - Server MUST self-heal admin flags on session validation / whoami.
+// - It MUST be impossible to lose all admin access under any circumstance.
 
 const express = require("express");
 const OpenAI = require("openai");
@@ -48,6 +54,15 @@ function requireEnv(name) {
   return v;
 }
 
+function parseCsvEnv(name) {
+  const raw = process.env[name];
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
   .split(",")
   .map((s) => s.trim())
@@ -56,6 +71,19 @@ const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
 const DATABASE_URL = requireEnv("DATABASE_URL");
 
 const SESSION_JWT_SECRET = requireEnv("SESSION_JWT_SECRET");
+
+// EPIC A0: Root admin must be pinned by user_id in production.
+const NODE_ENV = process.env.NODE_ENV || "<unset>";
+const ROOT_ADMIN_USER_IDS =
+  NODE_ENV === "production"
+    ? parseCsvEnv("ROOT_ADMIN_USER_IDS").length
+      ? parseCsvEnv("ROOT_ADMIN_USER_IDS")
+      : (() => {
+          // Fail-fast: do not allow production to boot without a pinned root admin set.
+          requireEnv("ROOT_ADMIN_USER_IDS");
+          return parseCsvEnv("ROOT_ADMIN_USER_IDS");
+        })()
+    : parseCsvEnv("ROOT_ADMIN_USER_IDS");
 
 // Session token lifetimes (seconds)
 const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
@@ -81,11 +109,15 @@ function safeDbHost(url) {
 }
 
 console.log("[boot] HakMun API starting");
-console.log("[boot] NODE_ENV =", process.env.NODE_ENV || "<unset>");
+console.log("[boot] NODE_ENV =", NODE_ENV);
 console.log("[boot] APPLE_CLIENT_IDS =", APPLE_CLIENT_IDS.join(", "));
 console.log("[boot] DATABASE_URL host =", safeDbHost(DATABASE_URL));
 console.log("[boot] SESSION_JWT_SECRET set =", Boolean(SESSION_JWT_SECRET));
 console.log("[boot] OPENAI_API_KEY set =", Boolean(OPENAI_API_KEY));
+console.log(
+  "[boot] ROOT_ADMIN_USER_IDS set =",
+  ROOT_ADMIN_USER_IDS.length ? `${ROOT_ADMIN_USER_IDS.length} pinned` : "none"
+);
 
 /* ------------------------------------------------------------------
    OpenAI (server-side only)
@@ -100,10 +132,7 @@ const openai =
 ------------------------------------------------------------------ */
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : false
+  ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false
 });
 
 /* ------------------------------------------------------------------
@@ -151,6 +180,146 @@ function safeMimeType(mime) {
   if (m === "image/heic" || m === "image/heif") return "image/heic";
   // Default to jpeg to avoid weird content-types.
   return "image/jpeg";
+}
+
+/* ------------------------------------------------------------------
+   EPIC A0 — Admin Safety Invariants
+------------------------------------------------------------------ */
+
+// Small in-memory guard to avoid excessive global checks under load.
+let _adminSafetyNextCheckAtMs = 0;
+
+function isPinnedRootAdmin(userID) {
+  return ROOT_ADMIN_USER_IDS.includes(String(userID));
+}
+
+async function promoteToRootAdminNonFatal(userID, reason) {
+  try {
+    await pool.query(
+      `
+      update users
+      set is_root_admin = true,
+          is_admin = true
+      where user_id = $1
+      `,
+      [userID]
+    );
+    console.log(
+      `[admin-safety] promoted root admin user_id=${userID} reason=${reason}`
+    );
+  } catch (err) {
+    console.error(
+      "[admin-safety] failed to promote root admin:",
+      err?.code,
+      err?.detail || err?.message
+    );
+  }
+}
+
+async function ensurePinnedRootAdminsNonFatal() {
+  if (!ROOT_ADMIN_USER_IDS.length) return;
+
+  // Ensure every pinned root admin is at least admin+root_admin.
+  for (const uid of ROOT_ADMIN_USER_IDS) {
+    await promoteToRootAdminNonFatal(uid, "pinned-self-heal");
+  }
+}
+
+async function ensureAtLeastOneRootAdminNonFatal(trigger) {
+  // Throttle global scan to at most once per 30 seconds.
+  const now = Date.now();
+  if (now < _adminSafetyNextCheckAtMs) return;
+  _adminSafetyNextCheckAtMs = now + 30_000;
+
+  try {
+    const { rows } = await pool.query(
+      `
+      select count(*)::int as c
+      from users
+      where is_root_admin = true and is_active = true
+      `
+    );
+
+    const c = rows?.[0]?.c ?? 0;
+    if (c > 0) {
+      // Still ensure pinned root admins are never accidentally demoted.
+      await ensurePinnedRootAdminsNonFatal();
+      return;
+    }
+
+    console.error(
+      `[admin-safety] ZERO active root admins detected (trigger=${trigger}). Initiating self-heal.`
+    );
+
+    // Primary self-heal path: pinned list.
+    if (ROOT_ADMIN_USER_IDS.length) {
+      await ensurePinnedRootAdminsNonFatal();
+
+      const after = await pool.query(
+        `
+        select count(*)::int as c
+        from users
+        where is_root_admin = true and is_active = true
+        `
+      );
+      const c2 = after.rows?.[0]?.c ?? 0;
+      if (c2 > 0) return;
+
+      console.error(
+        "[admin-safety] pinned self-heal did not restore a root admin (pinned IDs may not exist in users table)."
+      );
+    }
+
+    // NON-PRODUCTION fallback only: deterministically promote a user to avoid total lockout.
+    if (NODE_ENV !== "production") {
+      // Prefer earliest created_at if available; fall back to user_id ordering.
+      let candidate = null;
+
+      try {
+        const r1 = await pool.query(
+          `
+          select user_id
+          from users
+          where is_active = true
+          order by created_at asc nulls last, user_id asc
+          limit 1
+          `
+        );
+        candidate = r1.rows?.[0]?.user_id || null;
+      } catch {
+        const r2 = await pool.query(
+          `
+          select user_id
+          from users
+          where is_active = true
+          order by user_id asc
+          limit 1
+          `
+        );
+        candidate = r2.rows?.[0]?.user_id || null;
+      }
+
+      if (candidate) {
+        await promoteToRootAdminNonFatal(candidate, "dev-fallback-zero-root");
+        return;
+      }
+
+      console.error(
+        "[admin-safety] dev fallback failed: no active users to promote."
+      );
+    }
+
+    // Production must never reach here because ROOT_ADMIN_USER_IDS is required.
+    console.error(
+      "[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs."
+    );
+  } catch (err) {
+    console.error(
+      "[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:",
+      err?.code,
+      err?.detail || err?.message
+    );
+  }
 }
 
 /* ------------------------------------------------------------------
@@ -287,9 +456,17 @@ async function ensureCanonicalUser({ appleSubject, audience }) {
 }
 
 /* ------------------------------------------------------------------
-   User state (role/admin flags) — read-only for now
+   User state (role/admin flags) — server authoritative + admin safety self-heal
 ------------------------------------------------------------------ */
 async function getUserState(userID) {
+  // EPIC A0: global self-heal guardrails (throttled).
+  await ensureAtLeastOneRootAdminNonFatal("getUserState");
+
+  // EPIC A0: pinned root admin must always remain admin/root_admin.
+  if (isPinnedRootAdmin(userID)) {
+    await promoteToRootAdminNonFatal(userID, "pinned-read-path");
+  }
+
   const { rows } = await pool.query(
     `
     select role, is_admin, is_root_admin, is_active
@@ -451,7 +628,7 @@ async function requireUser(req, res, next) {
 
     const userID = await ensureCanonicalUser({ appleSubject, audience });
 
-    // Read user state flags (no behavior change yet; just visibility)
+    // Read user state flags (now includes EPIC A0 self-heal)
     const state = await getUserState(userID);
 
     req.user = {
@@ -660,6 +837,9 @@ app.post("/v1/session/refresh", async (req, res) => {
 ------------------------------------------------------------------ */
 app.get("/v1/session/whoami", requireSession, async (req, res) => {
   try {
+    // EPIC A0: self-heal on whoami explicitly (even though requireSession already hit getUserState)
+    await ensureAtLeastOneRootAdminNonFatal("whoami");
+
     const primaryHandle = await getPrimaryHandleForUser(req.user.userID);
     const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
@@ -1121,7 +1301,12 @@ Rules:
 });
 
 /* ------------------------------------------------------------------
-   Start server (Railway)
+   Boot-time EPIC A0 validation + Start server (Railway)
 ------------------------------------------------------------------ */
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`listening on ${port}`));
+(async () => {
+  // EPIC A0: enforce invariants as early as possible.
+  await ensureAtLeastOneRootAdminNonFatal("boot");
+
+  const port = process.env.PORT || 8080;
+  app.listen(port, () => console.log(`listening on ${port}`));
+})();
