@@ -1004,7 +1004,7 @@ async function clearCanonicalProfilePhotoKey(userID) {
 ------------------------------------------------------------------ */
 app.put(
   "/v1/me/profile-photo",
-  requireUser,
+  requireSession,
   upload.single("photo"),
   async (req, res) => {
     const maybe = requireStorageOr503(res);
@@ -1063,7 +1063,7 @@ app.put(
      users.profile_photo_object_key
      users.profile_photo_updated_at
 ------------------------------------------------------------------ */
-app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
+app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
@@ -1109,7 +1109,7 @@ app.delete("/v1/me/profile-photo", requireUser, async (req, res) => {
      users.profile_photo_object_key
      users.profile_photo_updated_at
 ------------------------------------------------------------------ */
-app.get("/v1/me/profile-photo-url", requireUser, async (req, res) => {
+app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
