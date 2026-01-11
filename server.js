@@ -35,6 +35,7 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
    App + JSON
 ------------------------------------------------------------------ */
 const app = express();
+app.set("etag", false); // Determinism: never 304 on API routes.
 app.use(express.json({ limit: "1mb" }));
 
 /* ------------------------------------------------------------------
@@ -794,6 +795,35 @@ app.post("/v1/auth/apple", async (req, res) => {
     }
 
     return res.status(401).json({ error: "authentication failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/session/refresh
+   Exchange refresh token for a new access token (and rotated refresh).
+   Deterministic: always returns 200 JSON or 401/403.
+------------------------------------------------------------------ */
+app.post("/v1/session/refresh", async (req, res) => {
+  try {
+    const refreshToken = requireJsonField(req, res, "refreshToken");
+    if (!refreshToken) return;
+
+    const decoded = await verifySessionJWT(refreshToken);
+    if (decoded.typ !== "refresh") {
+      return res.status(401).json({ error: "refresh token required" });
+    }
+
+    const state = await getUserState(decoded.userID);
+    if (!Boolean(state.is_active)) {
+      return res.status(403).json({ error: "account disabled" });
+    }
+
+    // Rotate refresh token to reduce replay window.
+    const tokens = await issueSessionTokens({ userID: decoded.userID });
+    return res.json(tokens);
+  } catch (err) {
+    console.error("/v1/session/refresh failed:", err?.message || err);
+    return res.status(401).json({ error: "refresh failed" });
   }
 });
 
