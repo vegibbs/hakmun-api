@@ -822,27 +822,18 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
 /* ------------------------------------------------------------------
    EPIC M1 — Canonical profile photo metadata (users table)
 ------------------------------------------------------------------ */
-async function async function getCanonicalProfilePhotoKey(userID) {
+async function getCanonicalProfilePhotoKey(userID) {
   const { rows } = await pool.query(
     `
-    select
-      profile_photo_object_key,
-      profile_photo_updated_at
+    select profile_photo_object_key as key
     from users
     where user_id = $1
     limit 1
     `,
     [userID]
   );
-
-  const r = rows?.[0] || null;
-  console.log(
-    `[photo-key] userID=${userID} row=${r ? JSON.stringify(r) : "<null-row>"}`
-  );
-
-  const key = r?.profile_photo_object_key || null;
-  return key && String(key).trim() ? String(key) : null;
-}}
+  return rows?.[0]?.key || null;
+}
 
 async function setCanonicalProfilePhotoKey(userID, objectKey) {
   await pool.query(
