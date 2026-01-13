@@ -7,12 +7,11 @@
 // - Session refresh endpoint MUST exist.
 // - Profile photo must be canonical (users.profile_photo_object_key).
 //
-// DEBUG INCLUDED (ONE SHOT):
-// - Per-request request-id + method/path/status timing.
-// - Boot DB fingerprint.
-// - /v1/auth/apple stage logs + timeouts.
-// - /v1/me/profile-photo-url: probe DB row on-request + helper result.
-// - Photo key writes: log set/clear operations.
+// OBS1 (Durable Logs + Alerts):
+// - Keep stdout logs for Railway.
+// - ALSO ship structured logs to Better Stack via HTTP ingestion.
+// - MUST NOT log secrets.
+// - Include request correlation (rid, method, path, status, duration).
 //
 // SECURITY:
 // - No secrets logged.
@@ -32,6 +31,157 @@ const {
   DeleteObjectCommand
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+/* ------------------------------------------------------------------
+   OBS1.1 — Better Stack log shipping (minimal, low-risk)
+------------------------------------------------------------------ */
+
+function safeJsonStringify(obj) {
+  try {
+    return JSON.stringify(obj);
+  } catch (e) {
+    try {
+      const seen = new WeakSet();
+      return JSON.stringify(obj, (k, v) => {
+        if (typeof v === "object" && v !== null) {
+          if (seen.has(v)) return "[Circular]";
+          seen.add(v);
+        }
+        return v;
+      });
+    } catch {
+      return JSON.stringify({ msg: "json_stringify_failed" });
+    }
+  }
+}
+
+function redactValue(v) {
+  if (v == null) return v;
+  const s = String(v);
+  if (!s) return s;
+  // Basic token-ish redaction heuristic.
+  if (s.length >= 24) return s.slice(0, 6) + "…redacted";
+  return "…redacted";
+}
+
+function redactHeaders(headers) {
+  const out = {};
+  if (!headers) return out;
+  for (const [kRaw, v] of Object.entries(headers)) {
+    const k = String(kRaw).toLowerCase();
+    if (
+      k === "authorization" ||
+      k === "cookie" ||
+      k === "set-cookie" ||
+      k === "x-api-key" ||
+      k === "x-auth-token"
+    ) {
+      out[k] = redactValue(v);
+    } else {
+      // Keep common safe headers; avoid dumping huge/unique values.
+      if (k === "user-agent" || k === "content-type" || k === "accept" || k === "host") {
+        out[k] = String(v);
+      }
+    }
+  }
+  return out;
+}
+
+function getBetterStackConfig() {
+  const url = process.env.BETTERSTACK_INGEST_URL;
+  const token = process.env.BETTERSTACK_TOKEN;
+  if (!url || !token) return null;
+  return { url: String(url).trim(), token: String(token).trim() };
+}
+
+const BETTERSTACK = getBetterStackConfig();
+
+// Non-blocking shipper with bounded queue (drop if overwhelmed).
+const _bsQueue = [];
+let _bsFlushing = false;
+const BS_MAX_QUEUE = 500;
+
+async function shipToBetterStack(events) {
+  if (!BETTERSTACK) return;
+  if (!events || !events.length) return;
+
+  // Better Stack HTTP ingestion expects:
+  // - POST to source ingest URL
+  // - Authorization: Bearer $SOURCE_TOKEN
+  // - Content-Type: application/json (single event or array)
+  // Docs: https://betterstack.com/docs/logs/ingesting-data/http/logs/   [oai_citation:0‡Better Stack](https://betterstack.com/docs/logs/ingesting-data/http/logs/?utm_source=chatgpt.com)
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 2000);
+
+    await fetch(BETTERSTACK.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${BETTERSTACK.token}`
+      },
+      body: safeJsonStringify(events.length === 1 ? events[0] : events),
+      signal: controller.signal
+    }).catch(() => {});
+
+    clearTimeout(t);
+  } catch {
+    // Never block app flow for telemetry.
+  }
+}
+
+function enqueueShip(evt) {
+  if (!BETTERSTACK) return;
+  if (_bsQueue.length >= BS_MAX_QUEUE) {
+    // Drop newest when overloaded (keep app stable).
+    return;
+  }
+  _bsQueue.push(evt);
+  if (_bsFlushing) return;
+  _bsFlushing = true;
+
+  setImmediate(async () => {
+    try {
+      const batch = _bsQueue.splice(0, 50);
+      await shipToBetterStack(batch);
+    } finally {
+      _bsFlushing = false;
+      if (_bsQueue.length) enqueueShip({ level: "info", msg: "[telemetry] flush-continue" });
+    }
+  });
+}
+
+function makeLogger() {
+  const base = {
+    service: "hakmun-api",
+    env: process.env.NODE_ENV || "<unset>"
+  };
+
+  function log(level, msg, fields) {
+    const evt = {
+      ts: new Date().toISOString(),
+      level,
+      msg,
+      ...base,
+      ...(fields && typeof fields === "object" ? fields : {})
+    };
+
+    // Always log to stdout as JSON for Railway.
+    // (No secrets should be present in msg/fields.)
+    process.stdout.write(safeJsonStringify(evt) + "\n");
+
+    // Also ship to Better Stack (non-blocking).
+    enqueueShip(evt);
+  }
+
+  return {
+    info: (msg, fields) => log("info", msg, fields),
+    warn: (msg, fields) => log("warn", msg, fields),
+    error: (msg, fields) => log("error", msg, fields)
+  };
+}
+
+const logger = makeLogger();
 
 /* ------------------------------------------------------------------
    App + JSON
@@ -55,7 +205,15 @@ app.use((req, res, next) => {
   const t0 = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - t0;
-    console.log(`[http] rid=${rid} ${req.method} ${req.path} -> ${res.statusCode} ${ms}ms`);
+
+    // Structured HTTP event (for Better Stack + durable search/alerts).
+    logger.info("[http]", {
+      rid,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration_ms: ms
+    });
   });
 
   next();
@@ -122,16 +280,16 @@ function safeDbHost(url) {
   }
 }
 
-console.log("[boot] HakMun API starting");
-console.log("[boot] NODE_ENV =", NODE_ENV);
-console.log("[boot] APPLE_CLIENT_IDS =", APPLE_CLIENT_IDS.join(", "));
-console.log("[boot] DATABASE_URL host =", safeDbHost(DATABASE_URL));
-console.log("[boot] SESSION_JWT_SECRET set =", Boolean(SESSION_JWT_SECRET));
-console.log("[boot] OPENAI_API_KEY set =", Boolean(OPENAI_API_KEY));
-console.log(
-  "[boot] ROOT_ADMIN_USER_IDS set =",
-  ROOT_ADMIN_USER_IDS.length ? `${ROOT_ADMIN_USER_IDS.length} pinned` : "none"
-);
+logger.info("[boot] HakMun API starting");
+logger.info("[boot] NODE_ENV", { NODE_ENV });
+logger.info("[boot] APPLE_CLIENT_IDS", { apple_client_ids: APPLE_CLIENT_IDS.join(", ") });
+logger.info("[boot] DATABASE_URL host", { db_host: safeDbHost(DATABASE_URL) });
+logger.info("[boot] SESSION_JWT_SECRET set", { session_jwt_secret_set: Boolean(SESSION_JWT_SECRET) });
+logger.info("[boot] OPENAI_API_KEY set", { openai_api_key_set: Boolean(OPENAI_API_KEY) });
+logger.info("[boot] ROOT_ADMIN_USER_IDS set", {
+  root_admin_ids: ROOT_ADMIN_USER_IDS.length ? `${ROOT_ADMIN_USER_IDS.length} pinned` : "none"
+});
+logger.info("[boot] betterstack shipping enabled", { enabled: Boolean(BETTERSTACK) });
 
 /* ------------------------------------------------------------------
    OpenAI (server-side only)
@@ -153,7 +311,7 @@ const pool = new Pool({
 });
 
 pool.on("error", (err) => {
-  console.error("[pg] pool error:", err?.message || err);
+  logger.error("[pg] pool error", { err: err?.message || String(err) });
 });
 
 // DB fingerprint (removes ambiguity)
@@ -168,8 +326,8 @@ pool
     version() as version
 `
   )
-  .then((r) => console.log("[boot] db_fingerprint =", r.rows?.[0] || "<none>"))
-  .catch((e) => console.error("[boot] db_fingerprint failed:", e?.message || e));
+  .then((r) => logger.info("[boot] db_fingerprint", { db_fingerprint: r.rows?.[0] || "<none>" }))
+  .catch((e) => logger.error("[boot] db_fingerprint failed", { err: e?.message || String(e) }));
 
 /* ------------------------------------------------------------------
    Deterministic timeouts (fail-fast)
@@ -201,7 +359,7 @@ async function verifyAppleToken(identityToken) {
   );
 
   const ms = Date.now() - t0;
-  console.log(`[apple] jwtVerify ok in ${ms}ms`);
+  logger.info("[apple] jwtVerify ok", { ms });
 
   const aud = Array.isArray(payload.aud) ? payload.aud[0] : payload.aud;
   if (!aud || !APPLE_CLIENT_IDS.includes(aud)) {
@@ -283,13 +441,12 @@ async function promoteToRootAdminNonFatal(userID, reason) {
       [userID]
     );
 
-    console.log(`[admin-safety] promoted root admin user_id=${userID} reason=${reason}`);
+    logger.info("[admin-safety] promoted root admin", { userID, reason });
   } catch (err) {
-    console.error(
-      "[admin-safety] failed to promote root admin:",
-      err?.code,
-      err?.detail || err?.message
-    );
+    logger.error("[admin-safety] failed to promote root admin", {
+      code: err?.code,
+      err: err?.detail || err?.message || String(err)
+    });
   }
 }
 
@@ -320,7 +477,7 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
       return;
     }
 
-    console.error(`[admin-safety] ZERO active root admins detected (trigger=${trigger}).`);
+    logger.error("[admin-safety] ZERO active root admins detected", { trigger });
 
     if (ROOT_ADMIN_USER_IDS.length) {
       await ensurePinnedRootAdminsNonFatal();
@@ -337,13 +494,12 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
       if (c2 > 0) return;
     }
 
-    console.error("[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs.");
+    logger.error("[admin-safety] CRITICAL: cannot restore root admin in production without pinned IDs");
   } catch (err) {
-    console.error(
-      "[admin-safety] ensureAtLeastOneRootAdminNonFatal failed:",
-      err?.code,
-      err?.detail || err?.message
-    );
+    logger.error("[admin-safety] ensureAtLeastOneRootAdminNonFatal failed", {
+      code: err?.code,
+      err: err?.detail || err?.message || String(err)
+    });
   }
 }
 
@@ -361,11 +517,10 @@ async function ensureLegacyUserProfileNonFatal(appleUserID) {
       [appleUserID]
     );
   } catch (err) {
-    console.warn(
-      "[warn] ensureLegacyUserProfileNonFatal failed (continuing):",
-      err?.code,
-      err?.detail || err?.message
-    );
+    logger.warn("[warn] ensureLegacyUserProfileNonFatal failed (continuing)", {
+      code: err?.code,
+      err: err?.detail || err?.message || String(err)
+    });
   }
 }
 
@@ -407,7 +562,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
       return userID;
     }
   } catch (e) {
-    console.error(`[auth] rid=${rid} fast auth_identities lookup failed:`, e?.message || e);
+    logger.error("[auth] fast auth_identities lookup failed", { rid, err: e?.message || String(e) });
   }
 
   // FAST PATH 2: users.apple_user_id
@@ -439,7 +594,11 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
           [appleSubject, audience, userID]
         )
         .catch((err) =>
-          console.warn(`[warn] rid=${rid} auth_identities bind failed:`, err?.code, err?.detail || err?.message)
+          logger.warn("[warn] auth_identities bind failed", {
+            rid,
+            code: err?.code,
+            err: err?.detail || err?.message || String(err)
+          })
         );
 
       ensureLegacyUserProfileNonFatal(appleSubject).catch(() => {});
@@ -447,7 +606,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
       return userID;
     }
   } catch (e) {
-    console.error(`[auth] rid=${rid} fast users lookup failed:`, e?.message || e);
+    logger.error("[auth] fast users lookup failed", { rid, err: e?.message || String(e) });
   }
 
   // SLOW PATH: tx create/bind (fail-fast on locks)
@@ -514,11 +673,10 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
           [appleSubject]
         );
       } catch (err) {
-        console.warn(
-          "[warn] (tx) legacy user_profiles insert failed (continuing):",
-          err?.code,
-          err?.detail || err?.message
-        );
+        logger.warn("[warn] (tx) legacy user_profiles insert failed (continuing)", {
+          code: err?.code,
+          err: err?.detail || err?.message || String(err)
+        });
       }
     }
 
@@ -530,7 +688,7 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    console.error(`[auth] rid=${rid} ensureCanonicalUser TX FAILED:`, err?.message || err);
+    logger.error("[auth] ensureCanonicalUser TX FAILED", { rid, err: err?.message || String(err) });
     throw err;
   } finally {
     client.release();
@@ -664,7 +822,7 @@ async function requireSession(req, res, next) {
 
     return next();
   } catch (err) {
-    console.error("Session auth error:", err?.message || err);
+    logger.error("[session] Session auth error", { err: err?.message || String(err) });
     return res.status(401).json({ error: "invalid session" });
   }
 }
@@ -718,7 +876,7 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
    POST /v1/auth/apple
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
-  console.log(`[/v1/auth/apple] START rid=${req._rid}`);
+  logger.info("[/v1/auth/apple] START", { rid: req._rid });
   res.set("X-HakMun-AuthApple", "v0.11-debug");
 
   try {
@@ -726,24 +884,24 @@ app.post("/v1/auth/apple", async (req, res) => {
     if (!identityToken) return;
 
     const { appleSubject, audience } = await verifyAppleToken(identityToken);
-    console.log(`[/v1/auth/apple] verified rid=${req._rid} appleSubject=${appleSubject}`);
+    logger.info("[/v1/auth/apple] verified", { rid: req._rid, appleSubject, audience });
 
     const userID = await withTimeout(
       ensureCanonicalUser({ appleSubject, audience }, req._rid),
       6000,
       "ensureCanonicalUser"
     );
-    console.log(`[/v1/auth/apple] canonical rid=${req._rid} userID=${userID}`);
+    logger.info("[/v1/auth/apple] canonical", { rid: req._rid, userID });
 
     const state = await withTimeout(getUserState(userID), 6000, "getUserState");
-    console.log(`[/v1/auth/apple] state rid=${req._rid} active=${Boolean(state.is_active)}`);
+    logger.info("[/v1/auth/apple] state", { rid: req._rid, active: Boolean(state.is_active) });
 
     if (!Boolean(state.is_active)) {
       return res.status(403).json({ error: "account disabled" });
     }
 
     const tokens = await withTimeout(issueSessionTokens({ userID }), 3000, "issueSessionTokens");
-    console.log(`[/v1/auth/apple] issued tokens rid=${req._rid}`);
+    logger.info("[/v1/auth/apple] issued tokens", { rid: req._rid });
 
     return res.json({
       ...tokens,
@@ -759,7 +917,7 @@ app.post("/v1/auth/apple", async (req, res) => {
     });
   } catch (err) {
     const msg = String(err?.message || err);
-    console.error(`/v1/auth/apple failed rid=${req._rid}:`, msg);
+    logger.error("/v1/auth/apple failed", { rid: req._rid, err: msg });
 
     if (msg.startsWith("timeout:apple-jwtVerify")) {
       return res.status(503).json({ error: "apple verification timeout" });
@@ -799,7 +957,11 @@ app.post("/v1/session/refresh", async (req, res) => {
     const tokens = await issueSessionTokens({ userID: decoded.userID });
     return res.json(tokens);
   } catch (err) {
-    console.error("/v1/session/refresh failed:", err?.message || err);
+    // Keep exact alert match strings from the epic.
+    logger.warn("/v1/session/refresh failed", {
+      rid: req._rid,
+      err: err?.message || String(err)
+    });
     return res.status(401).json({ error: "refresh failed" });
   }
 });
@@ -821,7 +983,7 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
       username: primaryHandle
     });
   } catch (err) {
-    console.error("/v1/session/whoami failed:", err?.message || err);
+    logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "whoami failed" });
   }
 });
@@ -855,16 +1017,7 @@ async function setCanonicalProfilePhotoKey(userID, objectKey) {
   );
 
   const row = r.rows?.[0] || null;
-  console.log(
-    "[photo-key][set] userID=" +
-      userID +
-      " key=" +
-      objectKey +
-      " row=" +
-      JSON.stringify(row) +
-      " rowCount=" +
-      String(r.rowCount ?? 0)
-  );
+  logger.info("[photo-key][set]", { userID, key: objectKey, row, rowCount: String(r.rowCount ?? 0) });
 
   if (!r.rowCount) {
     throw new Error("profile photo DB update affected 0 rows");
@@ -883,14 +1036,7 @@ async function clearCanonicalProfilePhotoKey(userID) {
     [userID]
   );
 
-  console.log(
-    "[photo-key][clear] userID=" +
-      userID +
-      " row=" +
-      JSON.stringify(r.rows?.[0] || null) +
-      " rowCount=" +
-      String(r.rowCount ?? 0)
-  );
+  logger.info("[photo-key][clear]", { userID, row: r.rows?.[0] || null, rowCount: String(r.rowCount ?? 0) });
 
   if (!r.rowCount) {
     throw new Error("profile photo DB clear affected 0 rows");
@@ -928,23 +1074,18 @@ app.put(
 
       const objectKey = `users/${userID}/profile.${ext}`;
 
-      console.log(
-        "[photo-upload][start] rid=" +
-          req._rid +
-          " userID=" +
-          userID +
-          " objectKey=" +
-          objectKey +
-          " bytes=" +
-          String(req.file.size) +
-          " ct=" +
-          contentType
-      );
+      logger.info("[photo-upload][start]", {
+        rid: req._rid,
+        userID,
+        objectKey,
+        bytes: Number(req.file.size || 0),
+        ct: contentType
+      });
 
       const s3 = makeS3Client();
 
       // Stage 1: S3 upload (fail-fast)
-      console.log("[photo-upload][s3] rid=" + req._rid + " begin");
+      logger.info("[photo-upload][s3] begin", { rid: req._rid, userID });
       await withTimeout(
         s3.send(
           new PutObjectCommand({
@@ -958,26 +1099,29 @@ app.put(
         15000,
         "s3-put"
       );
-      console.log("[photo-upload][s3] rid=" + req._rid + " ok");
+      logger.info("[photo-upload][s3] ok", { rid: req._rid, userID });
 
       // Stage 2: DB update (fail-fast)
-      console.log("[photo-upload][db] rid=" + req._rid + " begin");
-      await withTimeout(
-        setCanonicalProfilePhotoKey(userID, objectKey),
-        8000,
-        "db-set-photo-key"
-      );
-      console.log("[photo-upload][db] rid=" + req._rid + " ok");
+      logger.info("[photo-upload][db] begin", { rid: req._rid, userID });
+      await withTimeout(setCanonicalProfilePhotoKey(userID, objectKey), 8000, "db-set-photo-key");
+      logger.info("[photo-upload][db] ok", { rid: req._rid, userID });
 
       return res.json({ ok: true });
     } catch (err) {
       const msg = String(err?.message || err);
-      console.error("[photo-upload][fail] rid=" + req._rid + " err=" + msg);
+
+      // Keep exact alert match strings from the epic.
+      logger.error("[photo-upload][fail]", {
+        rid: req._rid,
+        err: msg
+      });
 
       if (msg.startsWith("timeout:s3-put")) {
         return res.status(503).json({ error: "object storage timeout" });
       }
       if (msg.startsWith("timeout:db-set-photo-key")) {
+        // Also emit a dedicated string that your alert can match exactly.
+        logger.error("timeout:db-set-photo-key", { rid: req._rid });
         return res.status(503).json({ error: "db timeout setting photo key" });
       }
 
@@ -999,20 +1143,20 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
     const key = await getCanonicalProfilePhotoKey(userID);
     if (!key) return res.json({ ok: true });
 
-    console.log("[photo-delete] rid=" + req._rid + " userID=" + userID + " key=" + key);
+    logger.info("[photo-delete]", { rid: req._rid, userID, key });
 
     const s3 = makeS3Client();
     try {
       await s3.send(new DeleteObjectCommand({ Bucket: bucketName(), Key: key }));
     } catch (err) {
-      console.error("profile-photo delete object failed:", err?.message || err);
+      logger.warn("profile-photo delete object failed", { rid: req._rid, err: err?.message || String(err) });
     }
 
     await clearCanonicalProfilePhotoKey(userID);
 
     return res.json({ ok: true });
   } catch (err) {
-    console.error("profile-photo delete failed:", err?.message || err);
+    logger.error("profile-photo delete failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "delete failed" });
   }
 });
@@ -1036,13 +1180,13 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
       "select profile_photo_object_key, profile_photo_updated_at from users where user_id = $1 limit 1",
       [userID]
     );
-    console.log("[photo-url][probe] rid=" + req._rid + " row=" + JSON.stringify(probe.rows?.[0] || null));
+    logger.info("[photo-url][probe]", { rid: req._rid, userID, row: probe.rows?.[0] || null });
 
     const key = await getCanonicalProfilePhotoKey(userID);
-    console.log("[photo-url] rid=" + req._rid + " userID=" + userID + " key=" + (key || "<null>"));
+    logger.info("[photo-url]", { rid: req._rid, userID, key: key || "<null>" });
 
     if (!key) {
-      console.error("[photo-url] rid=" + req._rid + " no key -> 404");
+      logger.error("[photo-url] no key -> 404", { rid: req._rid, userID });
       return res.status(404).json({ error: "no profile photo" });
     }
 
@@ -1055,7 +1199,7 @@ app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
 
     return res.json({ url, expiresIn: 900 });
   } catch (err) {
-    console.error("profile-photo-url failed:", err?.message || err);
+    logger.error("profile-photo-url failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "failed to sign url" });
   }
 });
@@ -1083,7 +1227,7 @@ app.get("/v1/handles/me", requireSession, async (req, res) => {
 
     return res.json(rows[0]);
   } catch (err) {
-    console.error("handles/me failed:", err?.message || err);
+    logger.error("handles/me failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "resolve failed" });
   }
 });
@@ -1101,5 +1245,5 @@ app.post("/v1/generate/sentences", (req, res) => {
 (async () => {
   await ensureAtLeastOneRootAdminNonFatal("boot");
   const port = process.env.PORT || 8080;
-  app.listen(port, () => console.log(`listening on ${port}`));
+  app.listen(port, () => logger.info("listening", { port: Number(port) }));
 })();
