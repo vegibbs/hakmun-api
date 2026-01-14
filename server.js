@@ -1,22 +1,17 @@
-// server.js — HakMun API (v0.11) — FULL REWRITE (DROP-IN REPLACEMENT)
+// server.js — HakMun API (v0.12) — DROP-IN REPLACEMENT
 // Canonical identity + handles + secure private asset storage (signed URLs)
 //
-// PURPOSE (M1.3):
-// - Stop “black box” behavior by making both sides observable.
-// - Auth must be deterministic (fail-fast, no hangs).
-// - Session refresh endpoint MUST exist.
-// - Profile photo must be canonical (users.profile_photo_object_key).
+// M1.x + OBS1 invariants:
+// - Deterministic auth/session/profile behavior (fail-fast; no hangs)
+// - Session refresh endpoint exists
+// - Canonical profile photo authority: users.profile_photo_object_key (object key only)
+// - stdout JSON logs for Railway + durable shipping to Better Stack (HTTP ingestion)
+// - MUST NOT log secrets (no Authorization/cookie/token dumps)
+// - Request correlation: rid, method, path, status, duration
 //
-// OBS1 (Durable Logs + Alerts):
-// - Keep stdout logs for Railway.
-// - ALSO ship structured logs to Better Stack via HTTP ingestion.
-// - MUST NOT log secrets.
-// - Include request correlation (rid, method, path, status, duration).
-//
-// SECURITY:
-// - No secrets logged.
-// - No auth headers logged.
-// - Signed URLs returned only to authenticated user.
+// OBS1.4 (Debug Hygiene):
+// - Keep high-signal logs always-on (info/warn/error)
+// - Gate noisy diagnostics behind LOG_LEVEL=debug + DEBUG_SCOPES=...
 
 const express = require("express");
 const OpenAI = require("openai");
@@ -55,38 +50,6 @@ function safeJsonStringify(obj) {
   }
 }
 
-function redactValue(v) {
-  if (v == null) return v;
-  const s = String(v);
-  if (!s) return s;
-  // Basic token-ish redaction heuristic.
-  if (s.length >= 24) return s.slice(0, 6) + "…redacted";
-  return "…redacted";
-}
-
-function redactHeaders(headers) {
-  const out = {};
-  if (!headers) return out;
-  for (const [kRaw, v] of Object.entries(headers)) {
-    const k = String(kRaw).toLowerCase();
-    if (
-      k === "authorization" ||
-      k === "cookie" ||
-      k === "set-cookie" ||
-      k === "x-api-key" ||
-      k === "x-auth-token"
-    ) {
-      out[k] = redactValue(v);
-    } else {
-      // Keep common safe headers; avoid dumping huge/unique values.
-      if (k === "user-agent" || k === "content-type" || k === "accept" || k === "host") {
-        out[k] = String(v);
-      }
-    }
-  }
-  return out;
-}
-
 function getBetterStackConfig() {
   const url = process.env.BETTERSTACK_INGEST_URL;
   const token = process.env.BETTERSTACK_TOKEN;
@@ -105,11 +68,6 @@ async function shipToBetterStack(events) {
   if (!BETTERSTACK) return;
   if (!events || !events.length) return;
 
-  // Better Stack HTTP ingestion expects:
-  // - POST to source ingest URL
-  // - Authorization: Bearer $SOURCE_TOKEN
-  // - Content-Type: application/json (single event or array)
-  // Docs: https://betterstack.com/docs/logs/ingesting-data/http/logs/   [oai_citation:0‡Better Stack](https://betterstack.com/docs/logs/ingesting-data/http/logs/?utm_source=chatgpt.com)
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 2000);
@@ -132,23 +90,53 @@ async function shipToBetterStack(events) {
 
 function enqueueShip(evt) {
   if (!BETTERSTACK) return;
-  if (_bsQueue.length >= BS_MAX_QUEUE) {
-    // Drop newest when overloaded (keep app stable).
-    return;
-  }
+  if (_bsQueue.length >= BS_MAX_QUEUE) return;
+
   _bsQueue.push(evt);
   if (_bsFlushing) return;
+
   _bsFlushing = true;
 
   setImmediate(async () => {
     try {
-      const batch = _bsQueue.splice(0, 50);
-      await shipToBetterStack(batch);
+      // Drain queue in bounded batches without generating extra events.
+      while (_bsQueue.length) {
+        const batch = _bsQueue.splice(0, 50);
+        await shipToBetterStack(batch);
+      }
     } finally {
       _bsFlushing = false;
-      if (_bsQueue.length) enqueueShip({ level: "info", msg: "[telemetry] flush-continue" });
     }
   });
+}
+
+/* ------------------------------------------------------------------
+   OBS1.4 — LOG_LEVEL + DEBUG_SCOPES (no admin UI)
+------------------------------------------------------------------ */
+
+function parseLogLevel(raw) {
+  const v = String(raw || "info").toLowerCase().trim();
+  if (v === "error" || v === "warn" || v === "info" || v === "debug") return v;
+  return "info";
+}
+
+const LOG_LEVEL = parseLogLevel(process.env.LOG_LEVEL);
+const DEBUG_SCOPES = new Set(
+  String(process.env.DEBUG_SCOPES || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+const LEVEL_ORDER = { error: 0, warn: 1, info: 2, debug: 3 };
+
+function shouldLog(level) {
+  return LEVEL_ORDER[level] <= LEVEL_ORDER[LOG_LEVEL];
+}
+
+function scopeEnabled(scope) {
+  if (!scope) return false;
+  return DEBUG_SCOPES.has(String(scope).toLowerCase());
 }
 
 function makeLogger() {
@@ -158,6 +146,8 @@ function makeLogger() {
   };
 
   function log(level, msg, fields) {
+    if (!shouldLog(level)) return;
+
     const evt = {
       ts: new Date().toISOString(),
       level,
@@ -167,17 +157,23 @@ function makeLogger() {
     };
 
     // Always log to stdout as JSON for Railway.
-    // (No secrets should be present in msg/fields.)
     process.stdout.write(safeJsonStringify(evt) + "\n");
 
     // Also ship to Better Stack (non-blocking).
     enqueueShip(evt);
   }
 
+  function debug(scope, msg, fields) {
+    if (!shouldLog("debug")) return;
+    if (!scopeEnabled(scope)) return;
+    log("debug", msg, { ...(fields || {}), debug_scope: scope });
+  }
+
   return {
     info: (msg, fields) => log("info", msg, fields),
     warn: (msg, fields) => log("warn", msg, fields),
-    error: (msg, fields) => log("error", msg, fields)
+    error: (msg, fields) => log("error", msg, fields),
+    debug
   };
 }
 
@@ -205,8 +201,6 @@ app.use((req, res, next) => {
   const t0 = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - t0;
-
-    // Structured HTTP event (for Better Stack + durable search/alerts).
     logger.info("[http]", {
       rid,
       method: req.method,
@@ -290,6 +284,8 @@ logger.info("[boot] ROOT_ADMIN_USER_IDS set", {
   root_admin_ids: ROOT_ADMIN_USER_IDS.length ? `${ROOT_ADMIN_USER_IDS.length} pinned` : "none"
 });
 logger.info("[boot] betterstack shipping enabled", { enabled: Boolean(BETTERSTACK) });
+logger.info("[boot] LOG_LEVEL", { LOG_LEVEL });
+logger.info("[boot] DEBUG_SCOPES", { DEBUG_SCOPES: Array.from(DEBUG_SCOPES).join(",") || "<none>" });
 
 /* ------------------------------------------------------------------
    OpenAI (server-side only)
@@ -375,15 +371,6 @@ async function verifyAppleToken(identityToken) {
 /* ------------------------------------------------------------------
    Helpers
 ------------------------------------------------------------------ */
-function normalizeHandle(handle) {
-  return String(handle || "").trim();
-}
-
-function isValidHandle(handle) {
-  // 2–24 chars: letters, numbers, underscore, dot, hyphen, Hangul
-  return /^[\w.\-가-힣]{2,24}$/.test(handle);
-}
-
 function safeMimeType(mime) {
   const m = String(mime || "").toLowerCase().trim();
   if (!m) return "image/jpeg";
@@ -525,6 +512,8 @@ async function ensureLegacyUserProfileNonFatal(appleUserID) {
 }
 
 async function touchLastSeen(userID) {
+  // NOTE: This is a known hot-row write. If it becomes a contention source again,
+  // move to an event log table (future hardening epic).
   await pool.query(
     `
     update users
@@ -583,7 +572,6 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
 
     const userID = r?.rows?.[0]?.user_id || null;
     if (userID) {
-      // bind identity best-effort
       pool
         .query(
           `
@@ -662,7 +650,6 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
         [appleSubject, audience, canonicalUserID]
       );
 
-      // best-effort legacy
       try {
         await client.query(
           `
@@ -822,7 +809,7 @@ async function requireSession(req, res, next) {
 
     return next();
   } catch (err) {
-    logger.error("[session] Session auth error", { err: err?.message || String(err) });
+    logger.error("[session] Session auth error", { rid: req._rid, err: err?.message || String(err) });
     return res.status(401).json({ error: "invalid session" });
   }
 }
@@ -877,7 +864,7 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
   logger.info("[/v1/auth/apple] START", { rid: req._rid });
-  res.set("X-HakMun-AuthApple", "v0.11-debug");
+  res.set("X-HakMun-AuthApple", "v0.12");
 
   try {
     const identityToken = requireJsonField(req, res, "identityToken");
@@ -958,10 +945,7 @@ app.post("/v1/session/refresh", async (req, res) => {
     return res.json(tokens);
   } catch (err) {
     // Keep exact alert match strings from the epic.
-    logger.warn("/v1/session/refresh failed", {
-      rid: req._rid,
-      err: err?.message || String(err)
-    });
+    logger.warn("/v1/session/refresh failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(401).json({ error: "refresh failed" });
   }
 });
@@ -989,7 +973,7 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Canonical profile photo metadata (users table) + logging
+   Canonical profile photo metadata (users table)
 ------------------------------------------------------------------ */
 async function getCanonicalProfilePhotoKey(userID) {
   const { rows } = await pool.query(
@@ -1016,8 +1000,13 @@ async function setCanonicalProfilePhotoKey(userID, objectKey) {
     [userID, objectKey]
   );
 
-  const row = r.rows?.[0] || null;
-  logger.info("[photo-key][set]", { userID, key: objectKey, row, rowCount: String(r.rowCount ?? 0) });
+  // Debug-only row dump (incident tooling)
+  logger.debug("photo_key", "[photo-key][set]", {
+    userID,
+    key: objectKey,
+    row: r.rows?.[0] || null,
+    rowCount: Number(r.rowCount ?? 0)
+  });
 
   if (!r.rowCount) {
     throw new Error("profile photo DB update affected 0 rows");
@@ -1036,7 +1025,12 @@ async function clearCanonicalProfilePhotoKey(userID) {
     [userID]
   );
 
-  logger.info("[photo-key][clear]", { userID, row: r.rows?.[0] || null, rowCount: String(r.rowCount ?? 0) });
+  // Debug-only row dump (incident tooling)
+  logger.debug("photo_key", "[photo-key][clear]", {
+    userID,
+    row: r.rows?.[0] || null,
+    rowCount: Number(r.rowCount ?? 0)
+  });
 
   if (!r.rowCount) {
     throw new Error("profile photo DB clear affected 0 rows");
@@ -1045,90 +1039,83 @@ async function clearCanonicalProfilePhotoKey(userID) {
 
 /* ------------------------------------------------------------------
    PUT /v1/me/profile-photo (upload)
-   - Stage logs + fail-fast timeouts to isolate hangs (S3 vs DB)
+   - High-signal stage logs always-on
+   - Noisy details are debug-scoped
 ------------------------------------------------------------------ */
-app.put(
-  "/v1/me/profile-photo",
-  requireSession,
-  upload.single("photo"),
-  async (req, res) => {
-    const maybe = requireStorageOr503(res);
-    if (maybe) return;
+app.put("/v1/me/profile-photo", requireSession, upload.single("photo"), async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
 
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "photo file required" });
-      }
-
-      const { userID } = req.user;
-
-      const contentType = safeMimeType(req.file.mimetype);
-      const ext =
-        contentType === "image/png"
-          ? "png"
-          : contentType === "image/webp"
-          ? "webp"
-          : contentType === "image/heic"
-          ? "heic"
-          : "jpg";
-
-      const objectKey = `users/${userID}/profile.${ext}`;
-
-      logger.info("[photo-upload][start]", {
-        rid: req._rid,
-        userID,
-        objectKey,
-        bytes: Number(req.file.size || 0),
-        ct: contentType
-      });
-
-      const s3 = makeS3Client();
-
-      // Stage 1: S3 upload (fail-fast)
-      logger.info("[photo-upload][s3] begin", { rid: req._rid, userID });
-      await withTimeout(
-        s3.send(
-          new PutObjectCommand({
-            Bucket: bucketName(),
-            Key: objectKey,
-            Body: req.file.buffer,
-            ContentType: contentType,
-            CacheControl: "no-store"
-          })
-        ),
-        15000,
-        "s3-put"
-      );
-      logger.info("[photo-upload][s3] ok", { rid: req._rid, userID });
-
-      // Stage 2: DB update (fail-fast)
-      logger.info("[photo-upload][db] begin", { rid: req._rid, userID });
-      await withTimeout(setCanonicalProfilePhotoKey(userID, objectKey), 8000, "db-set-photo-key");
-      logger.info("[photo-upload][db] ok", { rid: req._rid, userID });
-
-      return res.json({ ok: true });
-    } catch (err) {
-      const msg = String(err?.message || err);
-
-      // Keep exact alert match strings from the epic.
-      logger.error("[photo-upload][fail]", {
-        rid: req._rid,
-        err: msg
-      });
-
-      if (msg.startsWith("timeout:s3-put")) {
-        return res.status(503).json({ error: "object storage timeout" });
-      }
-      if (msg.startsWith("timeout:db-set-photo-key")) {
-        // Also emit a dedicated string that your alert can match exactly.
-        logger.error("timeout:db-set-photo-key", { rid: req._rid });
-        return res.status(503).json({ error: "db timeout setting photo key" });
-      }
-
-      return res.status(500).json({ error: "upload failed" });
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "photo file required" });
     }
+
+    const { userID } = req.user;
+
+    const contentType = safeMimeType(req.file.mimetype);
+    const ext =
+      contentType === "image/png"
+        ? "png"
+        : contentType === "image/webp"
+        ? "webp"
+        : contentType === "image/heic"
+        ? "heic"
+        : "jpg";
+
+    const objectKey = `users/${userID}/profile.${ext}`;
+
+    logger.info("[photo-upload][start]", {
+      rid: req._rid,
+      userID,
+      objectKey,
+      bytes: Number(req.file.size || 0),
+      ct: contentType
+    });
+
+    const s3 = makeS3Client();
+
+    // Stage 1: S3 upload (fail-fast)
+    logger.info("[photo-upload][s3] begin", { rid: req._rid, userID });
+    await withTimeout(
+      s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName(),
+          Key: objectKey,
+          Body: req.file.buffer,
+          ContentType: contentType,
+          CacheControl: "no-store"
+        })
+      ),
+      15000,
+      "s3-put"
+    );
+    logger.info("[photo-upload][s3] ok", { rid: req._rid, userID });
+
+    // Stage 2: DB update (fail-fast)
+    logger.info("[photo-upload][db] begin", { rid: req._rid, userID });
+    await withTimeout(setCanonicalProfilePhotoKey(userID, objectKey), 8000, "db-set-photo-key");
+    logger.info("[photo-upload][db] ok", { rid: req._rid, userID });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || err);
+
+    // Keep exact alert match strings from the epic.
+    logger.error("[photo-upload][fail]", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:s3-put")) {
+      return res.status(503).json({ error: "object storage timeout" });
+    }
+    if (msg.startsWith("timeout:db-set-photo-key")) {
+      // Dedicated string for alert matching.
+      logger.error("timeout:db-set-photo-key", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout setting photo key" });
+    }
+
+    return res.status(500).json({ error: "upload failed" });
   }
-);
+});
 
 /* ------------------------------------------------------------------
    DELETE /v1/me/profile-photo (delete)
@@ -1164,29 +1151,30 @@ app.delete("/v1/me/profile-photo", requireSession, async (req, res) => {
 /* ------------------------------------------------------------------
    GET /v1/me/profile-photo-url (signed url)
    - Reads canonical key from users table
-   - Probes DB row on-request
+   - DB probe is debug-scoped (db_probe)
 ------------------------------------------------------------------ */
 app.get("/v1/me/profile-photo-url", requireSession, async (req, res) => {
   const maybe = requireStorageOr503(res);
   if (maybe) return;
 
-  res.set("X-HakMun-PhotoURL", "v0.11-canonical");
+  res.set("X-HakMun-PhotoURL", "v0.12-canonical");
 
   try {
     const { userID } = req.user;
 
-    // On-request DB probe: what does Postgres say RIGHT NOW?
-    const probe = await pool.query(
-      "select profile_photo_object_key, profile_photo_updated_at from users where user_id = $1 limit 1",
-      [userID]
-    );
-    logger.info("[photo-url][probe]", { rid: req._rid, userID, row: probe.rows?.[0] || null });
+    // Debug-only DB probe
+    if (shouldLog("debug") && scopeEnabled("db_probe")) {
+      const probe = await pool.query(
+        "select profile_photo_object_key, profile_photo_updated_at from users where user_id = $1 limit 1",
+        [userID]
+      );
+      logger.debug("db_probe", "[photo-url][probe]", { rid: req._rid, userID, row: probe.rows?.[0] || null });
+    }
 
     const key = await getCanonicalProfilePhotoKey(userID);
-    logger.info("[photo-url]", { rid: req._rid, userID, key: key || "<null>" });
+    logger.info("[photo-url]", { rid: req._rid, userID, hasKey: Boolean(key) });
 
     if (!key) {
-      logger.error("[photo-url] no key -> 404", { rid: req._rid, userID });
       return res.status(404).json({ error: "no profile photo" });
     }
 
