@@ -685,6 +685,81 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
 }
 
 /* ------------------------------------------------------------------
+   EPIC 3.2 — Entitlements (server-authoritative)
+   - Clients MUST NOT infer capabilities.
+   - Entitlements are reduced while impersonating.
+------------------------------------------------------------------ */
+
+function computeEntitlementsFromUser(user) {
+  const role = String(user?.role || "student");
+  const isActive = Boolean(user?.isActive);
+  const isRootAdmin = Boolean(user?.isRootAdmin);
+  const isAdmin = Boolean(user?.isAdmin);
+  const impersonating = Boolean(user?.impersonating);
+
+  // Fail-closed: inactive users have no entitlements.
+  if (!isActive) {
+    return {
+      entitlements: [],
+      capabilities: {
+        canUseApp: false,
+        canAccessTeacherTools: false,
+        canAdminUsers: false,
+        canImpersonate: false,
+        canManageRoles: false,
+        canManageActivation: false
+      }
+    };
+  }
+
+  const canAccessTeacherTools = role === "teacher";
+
+  // Admin ops are never permitted while impersonating, even if the target user is admin/root admin.
+  const adminAllowed = isRootAdmin && !impersonating;
+
+  const entitlements = [];
+
+  // Baseline capability: the user can use the app if they are active.
+  entitlements.push("app:use");
+
+  if (canAccessTeacherTools) entitlements.push("teacher:tools");
+
+  if (adminAllowed) {
+    entitlements.push("admin:users:read");
+    entitlements.push("admin:users:write");
+    entitlements.push("admin:impersonate");
+  }
+
+  // Useful for ops/debugging; not an entitlement to grant new powers.
+  if (impersonating) entitlements.push("session:impersonating");
+  if (isAdmin) entitlements.push("flag:is_admin");
+  if (isRootAdmin) entitlements.push("flag:is_root_admin");
+
+  const capabilities = {
+    canUseApp: true,
+    canAccessTeacherTools,
+
+    // Root-admin-only, and forbidden while impersonating.
+    canAdminUsers: adminAllowed,
+    canImpersonate: adminAllowed,
+    canManageRoles: adminAllowed,
+    canManageActivation: adminAllowed
+  };
+
+  return { entitlements, capabilities };
+}
+
+function requireEntitlement(entitlement) {
+  return function (req, res, next) {
+    const ents = req.user?.entitlements || [];
+    if (!Array.isArray(ents) || !ents.includes(entitlement)) {
+      return res.status(403).json({ error: "insufficient entitlement" });
+    }
+    return next();
+  };
+}
+
+/* ------------------------------------------------------------------
    User state (role/admin flags)
 ------------------------------------------------------------------ */
 async function getUserState(userID) {
@@ -810,16 +885,25 @@ async function requireSession(req, res, next) {
     const isActive = Boolean(state.is_active);
     if (!isActive) return res.status(403).json({ error: "account disabled" });
 
-    req.user = {
+    const user = {
       userID: decoded.userID,
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
       isActive,
+      isTeacher: String(state.role || "student") === "teacher",
 
       // Impersonation is an explicit session claim; client must never infer it.
       impersonating: Boolean(decoded.impersonating),
       actorUserID: decoded.actorUserID ? String(decoded.actorUserID) : null
+    };
+
+    const { entitlements, capabilities } = computeEntitlementsFromUser(user);
+
+    req.user = {
+      ...user,
+      entitlements,
+      capabilities
     };
 
     return next();
@@ -836,11 +920,10 @@ async function requireSession(req, res, next) {
 ------------------------------------------------------------------ */
 
 function requireRootAdmin(req, res, next) {
-  if (!req.user?.isRootAdmin) {
+  // Root-admin ops require explicit capability derived server-side.
+  // This also guarantees admin ops are forbidden while impersonating.
+  if (!req.user?.capabilities?.canAdminUsers) {
     return res.status(403).json({ error: "root admin required" });
-  }
-  if (req.user?.impersonating) {
-    return res.status(403).json({ error: "admin ops forbidden while impersonating" });
   }
   return next();
 }
@@ -856,7 +939,9 @@ function requireImpersonating(req, res, next) {
 }
 
 function looksLikeUUID(v) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(v || ""));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(v || "")
+  );
 }
 
 async function issueImpersonationAccessToken({ targetUserID, actorUserID }) {
@@ -1009,6 +1094,7 @@ app.post("/v1/auth/apple", async (req, res) => {
         appleUserID: appleSubject,
         audience,
         role: state.role,
+        isTeacher: String(state.role || "student") === "teacher",
         isAdmin: Boolean(state.is_admin),
         isRootAdmin: Boolean(state.is_root_admin),
         isActive: Boolean(state.is_active)
@@ -1048,6 +1134,11 @@ app.post("/v1/session/refresh", async (req, res) => {
       return res.status(401).json({ error: "refresh token required" });
     }
 
+    // Refresh tokens must never be impersonation tokens.
+    if (decoded.impersonating) {
+      return res.status(401).json({ error: "refresh not allowed for impersonation" });
+    }
+
     const state = await getUserState(decoded.userID);
     if (!Boolean(state.is_active)) {
       return res.status(403).json({ error: "account disabled" });
@@ -1073,13 +1164,25 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
     const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
     return res.json({
-      ...req.user,
+      userID: req.user.userID,
+      role: req.user.role,
+      isTeacher: Boolean(req.user.isTeacher),
+      isAdmin: Boolean(req.user.isAdmin),
+      isRootAdmin: Boolean(req.user.isRootAdmin),
+      isActive: Boolean(req.user.isActive),
+
+      // Impersonation (explicit)
+      impersonating: Boolean(req.user.impersonating),
+      actorUserID: req.user.actorUserID,
+
+      // Server-authoritative capabilities
+      entitlements: req.user.entitlements || [],
+      capabilities: req.user.capabilities || {},
+
+      // Canonical profile facts
       profileComplete,
       primaryHandle,
-      username: primaryHandle,
-
-      // Explicit for contract clarity
-      actorUserID: req.user.actorUserID
+      username: primaryHandle
     });
   } catch (err) {
     logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
@@ -1340,122 +1443,140 @@ app.get("/v1/handles/me", requireSession, async (req, res) => {
 ------------------------------------------------------------------ */
 
 // GET /v1/admin/users?search=<handle-substring-or-uuid>
-app.get("/v1/admin/users", requireSession, requireRootAdmin, async (req, res) => {
-  try {
-    const search = String(req.query?.search || "").trim();
-    const users = await findUsersForAdmin({ search });
-    return res.json({ users });
-  } catch (err) {
-    logger.error("/v1/admin/users failed", { rid: req._rid, err: err?.message || String(err) });
-    return res.status(500).json({ error: "admin users failed" });
+app.get(
+  "/v1/admin/users",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:users:read"),
+  async (req, res) => {
+    try {
+      const search = String(req.query?.search || "").trim();
+      const users = await findUsersForAdmin({ search });
+      return res.json({ users });
+    } catch (err) {
+      logger.error("/v1/admin/users failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "admin users failed" });
+    }
   }
-});
+);
 
 // PATCH /v1/admin/users/:userID { role?, isActive? }
-app.patch("/v1/admin/users/:userID", requireSession, requireRootAdmin, async (req, res) => {
-  try {
-    const targetUserID = String(req.params.userID || "").trim();
-    if (!looksLikeUUID(targetUserID)) {
-      return res.status(400).json({ error: "invalid userID" });
-    }
-
-    const roleRaw = req.body?.role;
-    const isActiveRaw = req.body?.isActive;
-
-    const updates = [];
-    const params = [targetUserID];
-    let idx = 2;
-
-    if (roleRaw !== undefined && roleRaw !== null) {
-      const role = String(roleRaw).trim();
-      if (role !== "student" && role !== "teacher") {
-        return res.status(400).json({ error: "invalid role" });
+app.patch(
+  "/v1/admin/users/:userID",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:users:write"),
+  async (req, res) => {
+    try {
+      const targetUserID = String(req.params.userID || "").trim();
+      if (!looksLikeUUID(targetUserID)) {
+        return res.status(400).json({ error: "invalid userID" });
       }
-      updates.push(`role = $${idx++}`);
-      params.push(role);
-    }
 
-    if (isActiveRaw !== undefined && isActiveRaw !== null) {
-      const isActive = Boolean(isActiveRaw);
-      updates.push(`is_active = $${idx++}`);
-      params.push(isActive);
-    }
+      const roleRaw = req.body?.role;
+      const isActiveRaw = req.body?.isActive;
 
-    if (!updates.length) {
-      return res.status(400).json({ error: "no updates" });
-    }
+      const updates = [];
+      const params = [targetUserID];
+      let idx = 2;
 
-    // Never allow demotion of pinned root admins (safety invariant)
-    if (isPinnedRootAdmin(targetUserID)) {
-      // Prevent disabling pinned root admin by accident
-      if (updates.some((u) => u.startsWith("is_active")) && Boolean(isActiveRaw) === false) {
-        return res.status(403).json({ error: "cannot deactivate pinned root admin" });
+      if (roleRaw !== undefined && roleRaw !== null) {
+        const role = String(roleRaw).trim();
+        if (role !== "student" && role !== "teacher") {
+          return res.status(400).json({ error: "invalid role" });
+        }
+        updates.push(`role = $${idx++}`);
+        params.push(role);
       }
-    }
 
-    const q = `
+      if (isActiveRaw !== undefined && isActiveRaw !== null) {
+        const isActive = Boolean(isActiveRaw);
+        updates.push(`is_active = $${idx++}`);
+        params.push(isActive);
+      }
+
+      if (!updates.length) {
+        return res.status(400).json({ error: "no updates" });
+      }
+
+      // Never allow demotion of pinned root admins (safety invariant)
+      if (isPinnedRootAdmin(targetUserID)) {
+        // Prevent disabling pinned root admin by accident
+        if (updates.some((u) => u.startsWith("is_active")) && Boolean(isActiveRaw) === false) {
+          return res.status(403).json({ error: "cannot deactivate pinned root admin" });
+        }
+      }
+
+      const q = `
       update users
       set ${updates.join(", ")}
       where user_id = $1
       returning user_id, role, is_active, is_admin, is_root_admin
     `;
 
-    const { rows } = await pool.query(q, params);
-    if (!rows || !rows.length) {
-      return res.status(404).json({ error: "user not found" });
+      const { rows } = await pool.query(q, params);
+      if (!rows || !rows.length) {
+        return res.status(404).json({ error: "user not found" });
+      }
+
+      logger.info("[admin] user updated", {
+        rid: req._rid,
+        actorUserID: req.user.userID,
+        targetUserID,
+        changed: updates
+      });
+
+      return res.json({ user: rows[0] });
+    } catch (err) {
+      logger.error("/v1/admin/users/:userID failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "admin update failed" });
     }
-
-    logger.info("[admin] user updated", {
-      rid: req._rid,
-      actorUserID: req.user.userID,
-      targetUserID,
-      changed: updates
-    });
-
-    return res.json({ user: rows[0] });
-  } catch (err) {
-    logger.error("/v1/admin/users/:userID failed", { rid: req._rid, err: err?.message || String(err) });
-    return res.status(500).json({ error: "admin update failed" });
   }
-});
+);
 
 // POST /v1/admin/impersonate { targetUserID }
-app.post("/v1/admin/impersonate", requireSession, requireRootAdmin, async (req, res) => {
-  try {
-    const targetUserID = requireJsonField(req, res, "targetUserID");
-    if (!targetUserID) return;
-    if (!looksLikeUUID(targetUserID)) {
-      return res.status(400).json({ error: "invalid targetUserID" });
+app.post(
+  "/v1/admin/impersonate",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:impersonate"),
+  async (req, res) => {
+    try {
+      const targetUserID = requireJsonField(req, res, "targetUserID");
+      if (!targetUserID) return;
+      if (!looksLikeUUID(targetUserID)) {
+        return res.status(400).json({ error: "invalid targetUserID" });
+      }
+
+      // Target must exist + be active; no bypass.
+      const state = await getUserState(targetUserID);
+      if (!Boolean(state.is_active)) {
+        return res.status(403).json({ error: "target account disabled" });
+      }
+
+      const tokens = await issueImpersonationAccessToken({
+        targetUserID,
+        actorUserID: req.user.userID
+      });
+
+      logger.info("[admin] impersonation started", {
+        rid: req._rid,
+        actorUserID: req.user.userID,
+        targetUserID
+      });
+
+      return res.json({
+        ...tokens,
+        impersonating: true,
+        actorUserID: req.user.userID,
+        targetUserID
+      });
+    } catch (err) {
+      logger.error("/v1/admin/impersonate failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "impersonate failed" });
     }
-
-    // Target must exist + be active; no bypass.
-    const state = await getUserState(targetUserID);
-    if (!Boolean(state.is_active)) {
-      return res.status(403).json({ error: "target account disabled" });
-    }
-
-    const tokens = await issueImpersonationAccessToken({
-      targetUserID,
-      actorUserID: req.user.userID
-    });
-
-    logger.info("[admin] impersonation started", {
-      rid: req._rid,
-      actorUserID: req.user.userID,
-      targetUserID
-    });
-
-    return res.json({
-      ...tokens,
-      impersonating: true,
-      actorUserID: req.user.userID,
-      targetUserID
-    });
-  } catch (err) {
-    logger.error("/v1/admin/impersonate failed", { rid: req._rid, err: err?.message || String(err) });
-    return res.status(500).json({ error: "impersonate failed" });
   }
-});
+);
 
 // POST /v1/admin/impersonate/exit (must be called with an impersonation access token)
 app.post("/v1/admin/impersonate/exit", requireSession, requireImpersonating, async (req, res) => {
