@@ -255,6 +255,8 @@ const ROOT_ADMIN_USER_IDS =
 // Session token lifetimes (seconds)
 const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
 const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
+// Impersonation tokens are short-lived and access-only (no refresh)
+const IMPERSONATION_ACCESS_TTL_SEC = 60 * 10; // 10 minutes
 
 // Session JWT claims
 const SESSION_ISSUER = "hakmun-api";
@@ -782,7 +784,16 @@ async function verifySessionJWT(token) {
     throw new Error(`invalid session token typ: ${String(typ)}`);
   }
 
-  return { userID, typ };
+  // Admin impersonation (server-authoritative, explicit claims)
+  const impersonating = Boolean(payload.imp);
+  const actorUserID = payload.act ? String(payload.act) : null;
+
+  // Safety: impersonation tokens must carry an actor
+  if (impersonating && !actorUserID) {
+    throw new Error("impersonation token missing act");
+  }
+
+  return { userID: String(userID), typ, impersonating, actorUserID };
 }
 
 async function requireSession(req, res, next) {
@@ -804,7 +815,11 @@ async function requireSession(req, res, next) {
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
-      isActive
+      isActive,
+
+      // Impersonation is an explicit session claim; client must never infer it.
+      impersonating: Boolean(decoded.impersonating),
+      actorUserID: decoded.actorUserID ? String(decoded.actorUserID) : null
     };
 
     return next();
@@ -812,6 +827,103 @@ async function requireSession(req, res, next) {
     logger.error("[session] Session auth error", { rid: req._rid, err: err?.message || String(err) });
     return res.status(401).json({ error: "invalid session" });
   }
+}
+
+/* ------------------------------------------------------------------
+   EPIC 3 — Admin Ops (root-admin-only)
+   - No client spoofing; server issues explicit impersonation sessions.
+   - Admin ops are forbidden while impersonating.
+------------------------------------------------------------------ */
+
+function requireRootAdmin(req, res, next) {
+  if (!req.user?.isRootAdmin) {
+    return res.status(403).json({ error: "root admin required" });
+  }
+  if (req.user?.impersonating) {
+    return res.status(403).json({ error: "admin ops forbidden while impersonating" });
+  }
+  return next();
+}
+
+function requireImpersonating(req, res, next) {
+  if (!req.user?.impersonating) {
+    return res.status(400).json({ error: "not impersonating" });
+  }
+  if (!req.user?.actorUserID) {
+    return res.status(400).json({ error: "impersonation missing actor" });
+  }
+  return next();
+}
+
+function looksLikeUUID(v) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(v || ""));
+}
+
+async function issueImpersonationAccessToken({ targetUserID, actorUserID }) {
+  const iat = nowSeconds();
+
+  // Access-only; short TTL; explicit impersonation claims.
+  const accessToken = await new SignJWT({ typ: "access", imp: true, act: String(actorUserID) })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(SESSION_ISSUER)
+    .setAudience(SESSION_AUDIENCE)
+    .setSubject(String(targetUserID))
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + IMPERSONATION_ACCESS_TTL_SEC)
+    .sign(Buffer.from(SESSION_JWT_SECRET));
+
+  return {
+    accessToken,
+    expiresIn: IMPERSONATION_ACCESS_TTL_SEC
+  };
+}
+
+async function findUsersForAdmin({ search }) {
+  const s = String(search || "").trim();
+
+  // If UUID, direct lookup.
+  if (s && looksLikeUUID(s)) {
+    const { rows } = await pool.query(
+      `
+      select
+        u.user_id,
+        u.role,
+        u.is_active,
+        u.is_admin,
+        u.is_root_admin,
+        uh.handle as primary_handle
+      from users u
+      left join user_handles uh
+        on uh.user_id = u.user_id and uh.kind = 'primary'
+      where u.user_id = $1
+      limit 1
+      `,
+      [s]
+    );
+    return rows || [];
+  }
+
+  // Otherwise search by primary handle (case-insensitive substring).
+  const q = s ? `%${s}%` : "%";
+  const { rows } = await pool.query(
+    `
+    select
+      u.user_id,
+      u.role,
+      u.is_active,
+      u.is_admin,
+      u.is_root_admin,
+      uh.handle as primary_handle
+    from users u
+    left join user_handles uh
+      on uh.user_id = u.user_id and uh.kind = 'primary'
+    where ($1 = '%' or uh.handle ilike $1)
+    order by uh.handle nulls last, u.user_id
+    limit 50
+    `,
+    [q]
+  );
+  return rows || [];
 }
 
 /* ------------------------------------------------------------------
@@ -964,7 +1076,10 @@ app.get("/v1/session/whoami", requireSession, async (req, res) => {
       ...req.user,
       profileComplete,
       primaryHandle,
-      username: primaryHandle
+      username: primaryHandle,
+
+      // Explicit for contract clarity
+      actorUserID: req.user.actorUserID
     });
   } catch (err) {
     logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
@@ -1217,6 +1332,152 @@ app.get("/v1/handles/me", requireSession, async (req, res) => {
   } catch (err) {
     logger.error("handles/me failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "resolve failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   EPIC 3 — Admin Ops Routes (root-admin-only)
+------------------------------------------------------------------ */
+
+// GET /v1/admin/users?search=<handle-substring-or-uuid>
+app.get("/v1/admin/users", requireSession, requireRootAdmin, async (req, res) => {
+  try {
+    const search = String(req.query?.search || "").trim();
+    const users = await findUsersForAdmin({ search });
+    return res.json({ users });
+  } catch (err) {
+    logger.error("/v1/admin/users failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "admin users failed" });
+  }
+});
+
+// PATCH /v1/admin/users/:userID { role?, isActive? }
+app.patch("/v1/admin/users/:userID", requireSession, requireRootAdmin, async (req, res) => {
+  try {
+    const targetUserID = String(req.params.userID || "").trim();
+    if (!looksLikeUUID(targetUserID)) {
+      return res.status(400).json({ error: "invalid userID" });
+    }
+
+    const roleRaw = req.body?.role;
+    const isActiveRaw = req.body?.isActive;
+
+    const updates = [];
+    const params = [targetUserID];
+    let idx = 2;
+
+    if (roleRaw !== undefined && roleRaw !== null) {
+      const role = String(roleRaw).trim();
+      if (role !== "student" && role !== "teacher") {
+        return res.status(400).json({ error: "invalid role" });
+      }
+      updates.push(`role = $${idx++}`);
+      params.push(role);
+    }
+
+    if (isActiveRaw !== undefined && isActiveRaw !== null) {
+      const isActive = Boolean(isActiveRaw);
+      updates.push(`is_active = $${idx++}`);
+      params.push(isActive);
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({ error: "no updates" });
+    }
+
+    // Never allow demotion of pinned root admins (safety invariant)
+    if (isPinnedRootAdmin(targetUserID)) {
+      // Prevent disabling pinned root admin by accident
+      if (updates.some((u) => u.startsWith("is_active")) && Boolean(isActiveRaw) === false) {
+        return res.status(403).json({ error: "cannot deactivate pinned root admin" });
+      }
+    }
+
+    const q = `
+      update users
+      set ${updates.join(", ")}
+      where user_id = $1
+      returning user_id, role, is_active, is_admin, is_root_admin
+    `;
+
+    const { rows } = await pool.query(q, params);
+    if (!rows || !rows.length) {
+      return res.status(404).json({ error: "user not found" });
+    }
+
+    logger.info("[admin] user updated", {
+      rid: req._rid,
+      actorUserID: req.user.userID,
+      targetUserID,
+      changed: updates
+    });
+
+    return res.json({ user: rows[0] });
+  } catch (err) {
+    logger.error("/v1/admin/users/:userID failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "admin update failed" });
+  }
+});
+
+// POST /v1/admin/impersonate { targetUserID }
+app.post("/v1/admin/impersonate", requireSession, requireRootAdmin, async (req, res) => {
+  try {
+    const targetUserID = requireJsonField(req, res, "targetUserID");
+    if (!targetUserID) return;
+    if (!looksLikeUUID(targetUserID)) {
+      return res.status(400).json({ error: "invalid targetUserID" });
+    }
+
+    // Target must exist + be active; no bypass.
+    const state = await getUserState(targetUserID);
+    if (!Boolean(state.is_active)) {
+      return res.status(403).json({ error: "target account disabled" });
+    }
+
+    const tokens = await issueImpersonationAccessToken({
+      targetUserID,
+      actorUserID: req.user.userID
+    });
+
+    logger.info("[admin] impersonation started", {
+      rid: req._rid,
+      actorUserID: req.user.userID,
+      targetUserID
+    });
+
+    return res.json({
+      ...tokens,
+      impersonating: true,
+      actorUserID: req.user.userID,
+      targetUserID
+    });
+  } catch (err) {
+    logger.error("/v1/admin/impersonate failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "impersonate failed" });
+  }
+});
+
+// POST /v1/admin/impersonate/exit (must be called with an impersonation access token)
+app.post("/v1/admin/impersonate/exit", requireSession, requireImpersonating, async (req, res) => {
+  try {
+    const actorUserID = req.user.actorUserID;
+
+    // Issue normal session tokens for the actor.
+    const tokens = await issueSessionTokens({ userID: actorUserID });
+
+    logger.info("[admin] impersonation exited", {
+      rid: req._rid,
+      actorUserID,
+      targetUserID: req.user.userID
+    });
+
+    return res.json({
+      ...tokens,
+      impersonating: false
+    });
+  } catch (err) {
+    logger.error("/v1/admin/impersonate/exit failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "exit impersonation failed" });
   }
 });
 
