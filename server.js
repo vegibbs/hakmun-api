@@ -1056,6 +1056,11 @@ async function handleExists(handle) {
   return Boolean(rows && rows.length);
 }
 
+/**
+ * IMPORTANT:
+ * user_handles.primary_handle is NOT NULL.
+ * For primary rows, primary_handle MUST equal handle.
+ */
 async function createUserWithPrimaryHandle({ primaryHandle, role = "student", isActive = true }) {
   const client = await pool.connect();
   try {
@@ -1096,10 +1101,11 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
       throw new Error("failed to create user");
     }
 
+    // Primary handle row MUST include primary_handle (NOT NULL).
     await client.query(
       `
-      insert into user_handles (user_id, kind, handle)
-      values ($1, 'primary', $2)
+      insert into user_handles (user_id, kind, handle, primary_handle)
+      values ($1, 'primary', $2, $2)
       `,
       [user.user_id, primaryHandle]
     );
@@ -1122,13 +1128,11 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
     } catch {}
 
     // If a DB unique index exists, surface it deterministically as handle_taken.
-    const code = err?.code;
-    const msg = String(err?.message || err);
-    if (code === "23505") {
+    if (err?.code === "23505") {
       return { error: "handle_taken" };
     }
 
-    throw new Error(msg);
+    throw new Error(String(err?.message || err));
   } finally {
     client.release();
   }
