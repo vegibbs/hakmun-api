@@ -368,7 +368,11 @@ async function verifyAppleToken(identityToken) {
     throw new Error("Apple token missing subject (sub)");
   }
 
-  return { appleSubject: payload.sub, audience: aud };
+  // Optional legacy bridge signal: Apple email is sometimes present (first auth, relay email, etc.)
+  // This is NOT identity authority; it is only used to migrate legacy rows once.
+  const email = typeof payload.email === "string" ? payload.email : null;
+
+  return { appleSubject: payload.sub, audience: aud, email };
 }
 
 /* ------------------------------------------------------------------
@@ -494,25 +498,10 @@ async function ensureAtLeastOneRootAdminNonFatal(trigger) {
 }
 
 /* ------------------------------------------------------------------
-   Legacy profile helpers (NON-FATAL)
+   Legacy profile helpers (REMOVED)
+   - Post-EPIC 3.5.2 user_profiles is keyed by user_id, not apple_user_id.
+   - Legacy apple_user_id-based helpers are forbidden here.
 ------------------------------------------------------------------ */
-async function ensureLegacyUserProfileNonFatal(appleUserID) {
-  try {
-    await pool.query(
-      `
-      insert into user_profiles (apple_user_id, schema_version, settings_json)
-      values ($1, 1, '{}'::jsonb)
-      on conflict (apple_user_id) do nothing
-      `,
-      [appleUserID]
-    );
-  } catch (err) {
-    logger.warn("[warn] ensureLegacyUserProfileNonFatal failed (continuing)", {
-      code: err?.code,
-      err: err?.detail || err?.message || String(err)
-    });
-  }
-}
 
 async function touchLastSeen(userID) {
   // NOTE: This is a known hot-row write. If it becomes a contention source again,
@@ -528,10 +517,15 @@ async function touchLastSeen(userID) {
 }
 
 /* ------------------------------------------------------------------
-   Canonical identity resolution (fast paths + tx slow path)
+   Canonical identity resolution (auth_identities authority + tx bind)
+   EPIC 3.5.4:
+   - auth_identities is the source of truth for Apple auth.
+   - A single Apple sub MUST resolve to one canonical users.user_id across audiences.
+   - One-time legacy bridge may bind an existing legacy users.apple_user_id (email or old sub) to the real sub.
+   - New users are Apple-independent: users.apple_user_id remains NULL.
 ------------------------------------------------------------------ */
-async function ensureCanonicalUser({ appleSubject, audience }, rid) {
-  // FAST PATH 1: auth_identities
+async function ensureCanonicalUser({ appleSubject, audience, email }, rid) {
+  // FAST PATH 1: exact auth_identities match
   try {
     const r = await withTimeout(
       pool.query(
@@ -549,7 +543,6 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
 
     const userID = r?.rows?.[0]?.user_id || null;
     if (userID) {
-      ensureLegacyUserProfileNonFatal(appleSubject).catch(() => {});
       touchLastSeen(userID).catch(() => {});
       return userID;
     }
@@ -557,24 +550,25 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
     logger.error("[auth] fast auth_identities lookup failed", { rid, err: e?.message || String(e) });
   }
 
-  // FAST PATH 2: users.apple_user_id
+  // FAST PATH 2: same Apple subject already known under a different audience
   try {
     const r = await withTimeout(
       pool.query(
         `
         select user_id
-        from users
-        where apple_user_id = $1
+        from auth_identities
+        where provider = $1 and subject = $2
         limit 1
         `,
-        [appleSubject]
+        ["apple", appleSubject]
       ),
       3000,
-      "users-lookup"
+      "auth_identities-any-audience"
     );
 
     const userID = r?.rows?.[0]?.user_id || null;
     if (userID) {
+      // Bind this audience to the same canonical user.
       pool
         .query(
           `
@@ -585,29 +579,32 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
           [appleSubject, audience, userID]
         )
         .catch((err) =>
-          logger.warn("[warn] auth_identities bind failed", {
+          logger.warn("[warn] auth_identities bind (audience) failed", {
             rid,
             code: err?.code,
             err: err?.detail || err?.message || String(err)
           })
         );
 
-      ensureLegacyUserProfileNonFatal(appleSubject).catch(() => {});
       touchLastSeen(userID).catch(() => {});
       return userID;
     }
   } catch (e) {
-    logger.error("[auth] fast users lookup failed", { rid, err: e?.message || String(e) });
+    logger.error("[auth] fast auth_identities any-audience lookup failed", { rid, err: e?.message || String(e) });
   }
 
-  // SLOW PATH: tx create/bind (fail-fast on locks)
+  // SLOW PATH: transactional create/bind (fail-fast on locks)
   const client = await pool.connect();
   try {
     await client.query(`set statement_timeout = 6000;`);
     await client.query(`set lock_timeout = 2000;`);
     await client.query("BEGIN");
 
-    const rAuth = await client.query(
+    // Single-flight per Apple subject to prevent duplicate user creation.
+    await client.query(`select pg_advisory_xact_lock(hashtext($1));`, [`apple:${appleSubject}`]);
+
+    // Re-check exact match.
+    const rExact = await client.query(
       `
       select user_id
       from auth_identities
@@ -617,10 +614,38 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
       [appleSubject, audience]
     );
 
-    let canonicalUserID = rAuth.rows?.[0]?.user_id || null;
+    let canonicalUserID = rExact.rows?.[0]?.user_id || null;
+
+    // Re-check any-audience match.
+    if (!canonicalUserID) {
+      const rAny = await client.query(
+        `
+        select user_id
+        from auth_identities
+        where provider = 'apple' and subject = $1
+        limit 1
+        `,
+        [appleSubject]
+      );
+      canonicalUserID = rAny.rows?.[0]?.user_id || null;
+    }
+
+    // One-time legacy bridge: match legacy users.apple_user_id by email (preferred) or old sub.
+    if (!canonicalUserID && email) {
+      const rLegacyEmail = await client.query(
+        `
+        select user_id
+        from users
+        where apple_user_id = $1
+        limit 1
+        `,
+        [email]
+      );
+      canonicalUserID = rLegacyEmail.rows?.[0]?.user_id || null;
+    }
 
     if (!canonicalUserID) {
-      const rUser = await client.query(
+      const rLegacySub = await client.query(
         `
         select user_id
         from users
@@ -629,46 +654,30 @@ async function ensureCanonicalUser({ appleSubject, audience }, rid) {
         `,
         [appleSubject]
       );
-
-      canonicalUserID = rUser.rows?.[0]?.user_id || null;
-
-      if (!canonicalUserID) {
-        const created = await client.query(
-          `
-          insert into users (user_id, apple_user_id, last_seen_at)
-          values (gen_random_uuid(), $1, now())
-          returning user_id
-          `,
-          [appleSubject]
-        );
-        canonicalUserID = created.rows[0].user_id;
-      }
-
-      await client.query(
-        `
-        insert into auth_identities (provider, subject, audience, user_id)
-        values ('apple', $1, $2, $3)
-        on conflict do nothing
-        `,
-        [appleSubject, audience, canonicalUserID]
-      );
-
-      try {
-        await client.query(
-          `
-          insert into user_profiles (apple_user_id, schema_version, settings_json)
-          values ($1, 1, '{}'::jsonb)
-          on conflict (apple_user_id) do nothing
-          `,
-          [appleSubject]
-        );
-      } catch (err) {
-        logger.warn("[warn] (tx) legacy user_profiles insert failed (continuing)", {
-          code: err?.code,
-          err: err?.detail || err?.message || String(err)
-        });
-      }
+      canonicalUserID = rLegacySub.rows?.[0]?.user_id || null;
     }
+
+    // Create new canonical user (Apple-independent) if still missing.
+    if (!canonicalUserID) {
+      const created = await client.query(
+        `
+        insert into users (user_id, apple_user_id, last_seen_at, role, is_active, is_admin, is_root_admin)
+        values (gen_random_uuid(), null, now(), 'student', true, false, false)
+        returning user_id
+        `
+      );
+      canonicalUserID = created.rows[0].user_id;
+    }
+
+    // Bind this (sub,aud) to canonical user.
+    await client.query(
+      `
+      insert into auth_identities (provider, subject, audience, user_id)
+      values ('apple', $1, $2, $3)
+      on conflict do nothing
+      `,
+      [appleSubject, audience, canonicalUserID]
+    );
 
     await client.query("COMMIT");
 
@@ -1169,6 +1178,10 @@ app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
    POST /v1/auth/apple
+   EPIC 3.5.4:
+   - Verify Apple token (sub + aud)
+   - Resolve canonical user via auth_identities (Apple sub is auth-only)
+   - Do NOT return Apple identifiers to the client
 ------------------------------------------------------------------ */
 app.post("/v1/auth/apple", async (req, res) => {
   logger.info("[/v1/auth/apple] START", { rid: req._rid });
@@ -1178,11 +1191,11 @@ app.post("/v1/auth/apple", async (req, res) => {
     const identityToken = requireJsonField(req, res, "identityToken");
     if (!identityToken) return;
 
-    const { appleSubject, audience } = await verifyAppleToken(identityToken);
-    logger.info("[/v1/auth/apple] verified", { rid: req._rid, appleSubject, audience });
+    const { appleSubject, audience, email } = await verifyAppleToken(identityToken);
+    logger.info("[/v1/auth/apple] verified", { rid: req._rid, audience, hasEmail: Boolean(email) });
 
     const userID = await withTimeout(
-      ensureCanonicalUser({ appleSubject, audience }, req._rid),
+      ensureCanonicalUser({ appleSubject, audience, email }, req._rid),
       6000,
       "ensureCanonicalUser"
     );
@@ -1202,8 +1215,6 @@ app.post("/v1/auth/apple", async (req, res) => {
       ...tokens,
       user: {
         userID,
-        appleUserID: appleSubject,
-        audience,
         role: state.role,
         isTeacher: String(state.role || "student") === "teacher",
         isAdmin: Boolean(state.is_admin),
