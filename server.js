@@ -17,6 +17,7 @@ const express = require("express");
 const OpenAI = require("openai");
 const { createRemoteJWKSet, jwtVerify, SignJWT } = require("jose");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const multer = require("multer");
 const {
@@ -999,13 +1000,16 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
       return { error: "handle_taken" };
     }
 
+    // Avoid Postgres extensions (gen_random_uuid) and optional columns (last_seen_at).
+    const newUserID = crypto.randomUUID();
+
     const createdUser = await client.query(
       `
-      insert into users (user_id, role, is_active, is_admin, is_root_admin, last_seen_at)
-      values (gen_random_uuid(), $1, $2, false, false, now())
+      insert into users (user_id, role, is_active, is_admin, is_root_admin)
+      values ($1, $2, $3, false, false)
       returning user_id, role, is_active, is_admin, is_root_admin
       `,
-      [role, Boolean(isActive)]
+      [newUserID, role, Boolean(isActive)]
     );
 
     const user = createdUser.rows?.[0];
