@@ -770,7 +770,7 @@ function requireEntitlement(entitlement) {
 }
 
 /* ------------------------------------------------------------------
-   User state (role/admin flags)
+   User state (role/admin flags) + admin test user creation
 ------------------------------------------------------------------ */
 async function getUserState(userID) {
   await ensureAtLeastOneRootAdminNonFatal("getUserState");
@@ -795,6 +795,76 @@ async function getUserState(userID) {
     is_root_admin: false,
     is_active: true
   };
+}
+
+async function createUserWithPrimaryHandle({ primaryHandle, role = "student", isActive = true }) {
+  const client = await pool.connect();
+  try {
+    await client.query(`set statement_timeout = 6000;`);
+    await client.query(`set lock_timeout = 2000;`);
+    await client.query("BEGIN");
+
+    // Enforce uniqueness of primary handle (case-insensitive).
+    const exists = await client.query(
+      `
+      select 1
+      from user_handles
+      where kind = 'primary' and lower(handle) = lower($1)
+      limit 1
+      `,
+      [primaryHandle]
+    );
+
+    if (exists.rows && exists.rows.length) {
+      await client.query("ROLLBACK");
+      return { error: "handle_taken" };
+    }
+
+    const newUserID = crypto.randomUUID();
+
+    // Create Apple-less user row (identity is user_id; username is in user_handles).
+    await client.query(
+      `
+      insert into users (user_id, role, is_active, is_admin, is_root_admin)
+      values ($1, $2, $3, false, false)
+      `,
+      [newUserID, role, Boolean(isActive)]
+    );
+
+    // Register canonical primary handle.
+    await client.query(
+      `
+      insert into user_handles (user_id, kind, handle, primary_handle)
+      values ($1, 'primary', $2, $2)
+      `,
+      [newUserID, primaryHandle]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      user: {
+        user_id: newUserID,
+        role,
+        is_active: Boolean(isActive),
+        is_admin: false,
+        is_root_admin: false,
+        primary_handle: primaryHandle
+      }
+    };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+
+    if (err?.code === "23505") {
+      return { error: "handle_taken" };
+    }
+
+    throw new Error(String(err?.message || err));
+  } finally {
+    client.release();
+  }
 }
 
 /* ------------------------------------------------------------------
