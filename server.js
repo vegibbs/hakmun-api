@@ -944,6 +944,113 @@ function looksLikeUUID(v) {
   );
 }
 
+function normalizeHandle(raw) {
+  // Canonical handle normalization (server-authoritative)
+  // - trim whitespace
+  // - no internal whitespace
+  // - preserve unicode (Korean handles are allowed)
+  return String(raw || "").trim();
+}
+
+function isValidPrimaryHandle(handle) {
+  const h = String(handle || "").trim();
+  if (!h) return false;
+  // Disallow spaces/tabs/newlines anywhere.
+  if (/\s/.test(h)) return false;
+  // Keep it conservative; we can widen later with an explicit rename/process.
+  if (h.length < 2 || h.length > 32) return false;
+  return true;
+}
+
+async function handleExists(handle) {
+  // Case-insensitive uniqueness check for primary handles.
+  const { rows } = await pool.query(
+    `
+    select 1
+    from user_handles
+    where kind = 'primary' and lower(handle) = lower($1)
+    limit 1
+    `,
+    [handle]
+  );
+  return Boolean(rows && rows.length);
+}
+
+async function createUserWithPrimaryHandle({ primaryHandle, role = "student", isActive = true }) {
+  const client = await pool.connect();
+  try {
+    await client.query(`set statement_timeout = 6000;`);
+    await client.query(`set lock_timeout = 2000;`);
+    await client.query("BEGIN");
+
+    // Re-check uniqueness inside the TX.
+    const exists = await client.query(
+      `
+      select 1
+      from user_handles
+      where kind = 'primary' and lower(handle) = lower($1)
+      limit 1
+      `,
+      [primaryHandle]
+    );
+
+    if (exists.rows && exists.rows.length) {
+      await client.query("ROLLBACK");
+      return { error: "handle_taken" };
+    }
+
+    const createdUser = await client.query(
+      `
+      insert into users (user_id, role, is_active, is_admin, is_root_admin, last_seen_at)
+      values (gen_random_uuid(), $1, $2, false, false, now())
+      returning user_id, role, is_active, is_admin, is_root_admin
+      `,
+      [role, Boolean(isActive)]
+    );
+
+    const user = createdUser.rows?.[0];
+    if (!user?.user_id) {
+      throw new Error("failed to create user");
+    }
+
+    await client.query(
+      `
+      insert into user_handles (user_id, kind, handle)
+      values ($1, 'primary', $2)
+      `,
+      [user.user_id, primaryHandle]
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      user: {
+        user_id: user.user_id,
+        role: user.role,
+        is_active: user.is_active,
+        is_admin: user.is_admin,
+        is_root_admin: user.is_root_admin,
+        primary_handle: primaryHandle
+      }
+    };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+
+    // If a DB unique index exists, surface it deterministically as handle_taken.
+    const code = err?.code;
+    const msg = String(err?.message || err);
+    if (code === "23505") {
+      return { error: "handle_taken" };
+    }
+
+    throw new Error(msg);
+  } finally {
+    client.release();
+  }
+}
+
 async function issueImpersonationAccessToken({ targetUserID, actorUserID }) {
   const iat = nowSeconds();
 
@@ -1441,6 +1548,55 @@ app.get("/v1/handles/me", requireSession, async (req, res) => {
 /* ------------------------------------------------------------------
    EPIC 3 — Admin Ops Routes (root-admin-only)
 ------------------------------------------------------------------ */
+
+// POST /v1/admin/users { primaryHandle, role? , isActive? }
+// Purpose: create test users deterministically without new Apple IDs.
+app.post(
+  "/v1/admin/users",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:users:write"),
+  async (req, res) => {
+    try {
+      const rawHandle = requireJsonField(req, res, "primaryHandle");
+      if (!rawHandle) return;
+
+      const primaryHandle = normalizeHandle(rawHandle);
+      if (!isValidPrimaryHandle(primaryHandle)) {
+        return res.status(400).json({ error: "invalid primaryHandle" });
+      }
+
+      // Optional knobs; default to student + active.
+      const roleRaw = req.body?.role;
+      const isActiveRaw = req.body?.isActive;
+
+      const role = roleRaw !== undefined && roleRaw !== null ? String(roleRaw).trim() : "student";
+      if (role !== "student" && role !== "teacher") {
+        return res.status(400).json({ error: "invalid role" });
+      }
+
+      const isActive = isActiveRaw !== undefined && isActiveRaw !== null ? Boolean(isActiveRaw) : true;
+
+      const created = await createUserWithPrimaryHandle({ primaryHandle, role, isActive });
+      if (created?.error === "handle_taken") {
+        return res.status(409).json({ error: "handle already taken" });
+      }
+
+      logger.info("[admin] user created", {
+        rid: req._rid,
+        actorUserID: req.user.userID,
+        primaryHandle,
+        role,
+        isActive
+      });
+
+      return res.json({ user: created.user });
+    } catch (err) {
+      logger.error("/v1/admin/users (POST) failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "admin create user failed" });
+    }
+  }
+);
 
 // GET /v1/admin/users?search=<handle-substring-or-uuid>
 app.get(
