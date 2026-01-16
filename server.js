@@ -1251,6 +1251,88 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
+   STORAGE EPIC 1 — Assets (multipart + validation ONLY; no writes yet)
+   - Enforce MIME allowlist + size limits server-side (S4)
+   - One upload at a time (S5)
+   - DB stores object_key only (S2) — NOT implemented in this step
+------------------------------------------------------------------ */
+
+// NOTE: This is separate from the profile-photo "upload" middleware.
+// We keep asset limits independent and explicit.
+const uploadAsset = multer({
+  storage: multer.memoryStorage(),
+  // Allow the largest permitted asset through multer, then enforce per-type below.
+  limits: { fileSize: 25 * 1024 * 1024 } // 25MB max gate
+});
+
+// Canonical allowlist (initial, per Storage EPIC 1 scope)
+const ASSET_ALLOWED_MIME = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/m4a",
+  "application/pdf"
+]);
+
+// Size limits per mime family (bytes)
+const ASSET_MAX_BYTES = {
+  audio: 25 * 1024 * 1024, // 25MB
+  pdf: 10 * 1024 * 1024    // 10MB
+};
+
+function assetFamilyForMime(mime) {
+  const m = String(mime || "").toLowerCase().trim();
+  if (m.startsWith("audio/")) return "audio";
+  if (m === "application/pdf") return "pdf";
+  return "other";
+}
+
+app.post("/v1/assets", requireSession, uploadAsset.single("file"), async (req, res) => {
+  // Storage must be configured for any asset work.
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "file required" });
+    }
+
+    const mime = String(req.file.mimetype || "").toLowerCase().trim();
+    const sizeBytes = Number(req.file.size || 0);
+
+    if (!mime || !ASSET_ALLOWED_MIME.has(mime)) {
+      return res.status(415).json({ error: "unsupported media type", mime_type: mime || null });
+    }
+
+    const fam = assetFamilyForMime(mime);
+    const maxBytes = ASSET_MAX_BYTES[fam];
+
+    if (!maxBytes) {
+      return res.status(415).json({ error: "unsupported media family", mime_type: mime });
+    }
+
+    if (sizeBytes > maxBytes) {
+      return res.status(413).json({
+        error: "file too large",
+        mime_type: mime,
+        size_bytes: sizeBytes,
+        max_bytes: maxBytes
+      });
+    }
+
+    // Stub response: validated but not yet uploaded/stored.
+    return res.status(501).json({
+      error: "not implemented",
+      validated: true,
+      mime_type: mime,
+      size_bytes: sizeBytes
+    });
+  } catch (err) {
+    logger.error("[/v1/assets] validation failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "asset validation failed" });
+  }
+});
+/* ------------------------------------------------------------------
    POST /v1/auth/apple
    EPIC 3.5.4:
    - Verify Apple token (sub + aud)
