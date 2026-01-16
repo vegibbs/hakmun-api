@@ -2037,6 +2037,119 @@ app.post("/v1/admin/impersonate/exit", requireSession, requireImpersonating, asy
 });
 
 /* ------------------------------------------------------------------
+   STORAGE EPIC 1 — Assets (read surface)
+   - List owned assets (DB only)
+   - Signed read URL (ephemeral; never persisted) (S2)
+------------------------------------------------------------------ */
+
+// GET /v1/assets — list owned assets (no URLs; object_key not returned)
+app.get("/v1/assets", requireSession, async (req, res) => {
+  try {
+    const ownerUserID = req.user.userID;
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          asset_id,
+          mime_type,
+          size_bytes,
+          title,
+          language,
+          duration_ms,
+          created_at,
+          updated_at
+        from media_assets
+        where owner_user_id = $1
+        order by created_at desc
+        limit 200
+        `,
+        [ownerUserID]
+      ),
+      8000,
+      "db-list-assets"
+    );
+
+    return res.json({ assets: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/assets][list] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-assets")) {
+      logger.error("timeout:db-list-assets", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing assets" });
+    }
+
+    return res.status(500).json({ error: "list assets failed" });
+  }
+});
+
+// GET /v1/assets/:asset_id/url — signed read URL (requires storage configured)
+app.get("/v1/assets/:asset_id/url", requireSession, async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
+
+  try {
+    const ownerUserID = req.user.userID;
+    const assetID = String(req.params.asset_id || "").trim();
+
+    if (!looksLikeUUID(assetID)) {
+      return res.status(400).json({ error: "invalid asset_id" });
+    }
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select object_key, mime_type, size_bytes
+        from media_assets
+        where asset_id = $1 and owner_user_id = $2
+        limit 1
+        `,
+        [assetID, ownerUserID]
+      ),
+      8000,
+      "db-get-asset-key"
+    );
+
+    const row = r.rows?.[0];
+    if (!row?.object_key) {
+      return res.status(404).json({ error: "asset not found" });
+    }
+
+    const s3 = makeS3Client();
+    const url = await withTimeout(
+      getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: bucketName(), Key: row.object_key }),
+        { expiresIn: 60 * 15 }
+      ),
+      8000,
+      "sign-asset-url"
+    );
+
+    return res.json({
+      url,
+      expiresIn: 900,
+      mime_type: row.mime_type || null,
+      size_bytes: Number(row.size_bytes || 0)
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/assets][url] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-get-asset-key")) {
+      logger.error("timeout:db-get-asset-key", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout resolving asset" });
+    }
+    if (msg.startsWith("timeout:sign-asset-url")) {
+      return res.status(503).json({ error: "timeout signing url" });
+    }
+
+    return res.status(500).json({ error: "failed to sign url" });
+  }
+});
+
+/* ------------------------------------------------------------------
    Sentence generation (optional)
 ------------------------------------------------------------------ */
 app.post("/v1/generate/sentences", (req, res) => {
