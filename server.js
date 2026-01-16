@@ -2150,6 +2150,64 @@ app.get("/v1/assets/:asset_id/url", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   STORAGE EPIC 2 — Reading (read surface)
+   - Coverage list from derived VIEW (reading_items_coverage)
+   - Returns nullable asset_ids per matrix cell (no URLs; no object_keys)
+   - Authority: owner_user_id = users.user_id (S3)
+------------------------------------------------------------------ */
+
+// GET /v1/reading-items/coverage — list owned reading items with variant matrix (asset_id cells)
+app.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
+  try {
+    const ownerUserID = req.user.userID;
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          reading_item_id,
+          unit_type,
+          text,
+          language,
+          notes,
+          created_at,
+          updated_at,
+
+          female_slow_asset_id,
+          female_moderate_asset_id,
+          female_native_asset_id,
+
+          male_slow_asset_id,
+          male_moderate_asset_id,
+          male_native_asset_id,
+
+          variants_count
+        from reading_items_coverage
+        where owner_user_id = $1
+        order by created_at desc
+        limit 500
+        `,
+        [ownerUserID]
+      ),
+      8000,
+      "db-list-reading-coverage"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/reading-items/coverage] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-reading-coverage")) {
+      logger.error("timeout:db-list-reading-coverage", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing reading coverage" });
+    }
+
+    return res.status(500).json({ error: "list reading coverage failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    Sentence generation (optional)
 ------------------------------------------------------------------ */
 app.post("/v1/generate/sentences", (req, res) => {
