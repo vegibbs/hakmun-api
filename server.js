@@ -1251,10 +1251,11 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
-   STORAGE EPIC 1 — Assets (multipart + validation ONLY; no writes yet)
+   STORAGE EPIC 1 — Assets (multipart + validation + S3 + DB)
    - Enforce MIME allowlist + size limits server-side (S4)
    - One upload at a time (S5)
-   - DB stores object_key only (S2) — NOT implemented in this step
+   - DB stores object_key only; signed URLs are ephemeral (S2)
+   - Authority is users.user_id (S3)
 ------------------------------------------------------------------ */
 
 // NOTE: This is separate from the profile-photo "upload" middleware.
@@ -1285,6 +1286,32 @@ function assetFamilyForMime(mime) {
   if (m.startsWith("audio/")) return "audio";
   if (m === "application/pdf") return "pdf";
   return "other";
+}
+
+function assetExtForMime(mime) {
+  const m = String(mime || "").toLowerCase().trim();
+  if (m === "audio/mpeg") return "mp3";
+  if (m === "audio/wav" || m === "audio/x-wav") return "wav";
+  if (m === "audio/m4a") return "m4a";
+  if (m === "application/pdf") return "pdf";
+  return "bin";
+}
+
+function cleanOptionalText(v, maxLen) {
+  const s = v === undefined || v === null ? "" : String(v).trim();
+  if (!s) return null;
+  if (typeof maxLen === "number" && maxLen > 0) return s.slice(0, maxLen);
+  return s;
+}
+
+function cleanOptionalInt(v, min, max) {
+  if (v === undefined || v === null || String(v).trim() === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  if (typeof min === "number" && i < min) return null;
+  if (typeof max === "number" && i > max) return null;
+  return i;
 }
 
 app.post("/v1/assets", requireSession, uploadAsset.single("file"), async (req, res) => {
@@ -1320,16 +1347,96 @@ app.post("/v1/assets", requireSession, uploadAsset.single("file"), async (req, r
       });
     }
 
-    // Stub response: validated but not yet uploaded/stored.
-    return res.status(501).json({
-      error: "not implemented",
-      validated: true,
+    const ownerUserID = req.user.userID;
+
+    // Optional stable metadata (module meaning stays in use tables)
+    const title = cleanOptionalText(req.body?.title, 140);
+    const language = cleanOptionalText(req.body?.language, 32);
+    const durationMs = cleanOptionalInt(req.body?.duration_ms, 0, 24 * 60 * 60 * 1000); // cap 24h
+
+    // Deterministic object identity: asset_id is created server-side
+    const assetID = crypto.randomUUID();
+    const ext = assetExtForMime(mime);
+
+    // Canonical object key scheme (private bucket)
+    // NOTE: No URLs persisted; key is the only pointer (S2)
+    const objectKey = `users/${ownerUserID}/assets/${assetID}.${ext}`;
+
+    logger.info("[/v1/assets][start]", {
+      rid: req._rid,
+      ownerUserID,
+      assetID,
+      mime_type: mime,
+      size_bytes: sizeBytes
+    });
+
+    // Stage 1: S3 PUT (fail-fast)
+    const s3 = makeS3Client();
+    await withTimeout(
+      s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName(),
+          Key: objectKey,
+          Body: req.file.buffer,
+          ContentType: mime,
+          CacheControl: "no-store"
+        })
+      ),
+      15000,
+      "s3-put-asset"
+    );
+
+    // Stage 2: DB insert (object_key ONLY)
+    const inserted = await withTimeout(
+      pool.query(
+        `
+        insert into media_assets (
+          asset_id,
+          owner_user_id,
+          object_key,
+          mime_type,
+          size_bytes,
+          title,
+          language,
+          duration_ms
+        )
+        values ($1,$2,$3,$4,$5,$6,$7,$8)
+        returning asset_id, created_at
+        `,
+        [assetID, ownerUserID, objectKey, mime, sizeBytes, title, language, durationMs]
+      ),
+      8000,
+      "db-insert-asset"
+    );
+
+    const row = inserted.rows?.[0];
+
+    logger.info("[/v1/assets][ok]", {
+      rid: req._rid,
+      ownerUserID,
+      assetID,
+      object_key: objectKey
+    });
+
+    return res.status(201).json({
+      asset_id: row?.asset_id || assetID,
+      created_at: row?.created_at || null,
       mime_type: mime,
       size_bytes: sizeBytes
     });
   } catch (err) {
-    logger.error("[/v1/assets] validation failed", { rid: req._rid, err: err?.message || String(err) });
-    return res.status(500).json({ error: "asset validation failed" });
+    const msg = String(err?.message || err);
+    logger.error("[/v1/assets] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:s3-put-asset")) {
+      return res.status(503).json({ error: "object storage timeout" });
+    }
+    if (msg.startsWith("timeout:db-insert-asset")) {
+      logger.error("timeout:db-insert-asset", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout inserting asset" });
+    }
+
+    return res.status(500).json({ error: "asset upload failed" });
   }
 });
 /* ------------------------------------------------------------------
