@@ -2521,6 +2521,98 @@ app.post("/v1/library/share/user/revoke", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (write surfaces v0)
+   - Create class share grant (idempotent)
+   - Fail-closed if class system is not present
+------------------------------------------------------------------ */
+
+// POST /v1/library/share/class
+// Body: { content_type, content_id, class_id }
+app.post("/v1/library/share/class", requireSession, async (req, res) => {
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const classID = String(req.body?.class_id || "").trim();
+
+    if (!contentType || !looksLikeUUID(contentID) || !looksLikeUUID(classID)) {
+      return res.status(400).json({ error: "invalid content_type, content_id, or class_id" });
+    }
+
+    // Authorization (v0):
+    // - Only teacher or root admin may share to a class.
+    if (!req.user.isTeacher && !req.user.isRootAdmin) {
+      return res.status(403).json({ error: "teacher or root admin required" });
+    }
+
+    // Fail-closed validation that the class exists (and optionally that actor is a member/teacher).
+    // If class system tables are absent, do NOT bypass: return 501.
+    try {
+      const c = await withTimeout(
+        pool.query(
+          `
+          select 1
+          from classes
+          where class_id = $1
+          limit 1
+          `,
+          [classID]
+        ),
+        8000,
+        "db-class-exists-check"
+      );
+
+      if (!c.rows || c.rows.length === 0) {
+        return res.status(404).json({ error: "class not found" });
+      }
+    } catch (err) {
+      if (String(err?.code || "") === "42P01") {
+        // undefined_table
+        return res.status(501).json({ error: "class system not implemented on server" });
+      }
+      throw err;
+    }
+
+    // Idempotent insert
+    await withTimeout(
+      pool.query(
+        `
+        insert into library_share_grants (
+          content_type,
+          content_id,
+          grant_type,
+          grantee_id,
+          granted_by_user_id
+        )
+        values ($1, $2, 'class', $3, $4)
+        on conflict do nothing
+        `,
+        [contentType, contentID, classID, actorUserID]
+      ),
+      8000,
+      "db-insert-share-class"
+    );
+
+    return res.status(201).json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/share/class] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-class-exists-check")) {
+      logger.error("timeout:db-class-exists-check", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout checking class" });
+    }
+    if (msg.startsWith("timeout:db-insert-share-class")) {
+      logger.error("timeout:db-insert-share-class", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout creating class share" });
+    }
+
+    return res.status(500).json({ error: "create class share failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
