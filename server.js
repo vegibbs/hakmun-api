@@ -2673,7 +2673,8 @@ app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
    - needs_review: active -> under_review + queue + audit log
    - restore: under_review -> prior snapshot + resolve queue + audit log
    - approve: (global) preliminary -> approved (active only) + audit log
-   - NO reject/keep_under_review in this step
+   - reject: (global) preliminary|approved -> rejected (active only) + audit log
+   - NO keep_under_review in this step
 ------------------------------------------------------------------ */
 
 // POST /v1/library/needs-review
@@ -2723,8 +2724,7 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         return res.status(404).json({ error: "registry item not found" });
       }
 
-      // Authorization (v0, safe):
-      // - root admin OR teacher OR registry owner
+      // Authorization (v0, safe): root admin OR teacher OR registry owner
       const isOwner = String(item.owner_user_id) === String(actorUserID);
       if (!req.user.isRootAdmin && !req.user.isTeacher && !isOwner) {
         await client.query("ROLLBACK");
@@ -3106,7 +3106,6 @@ app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, re
       }
 
       if (String(item.global_state) !== "preliminary") {
-        // Idempotent-ish: approving an already-approved item returns ok.
         if (String(item.global_state) === "approved") {
           await client.query("COMMIT");
           return res.json({ ok: true, already_approved: true });
@@ -3216,6 +3215,180 @@ app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, re
     }
 
     return res.status(500).json({ error: "approve failed" });
+  }
+});
+
+// POST /v1/library/reject
+// Body: { content_type, content_id, reason? }
+// Rejects global content: preliminary|approved -> rejected (ACTIVE only; cannot reject under_review).
+// Root-admin-only for now (approver workflow is root-admin-only today).
+app.post("/v1/library/reject", requireSession, requireRootAdmin, async (req, res) => {
+  const rid = req._rid;
+
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const reason = req.body?.reason !== undefined ? String(req.body.reason).trim().slice(0, 500) : null;
+
+    if (!contentType || !looksLikeUUID(contentID)) {
+      return res.status(400).json({ error: "invalid content_type or content_id" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(`set statement_timeout = 8000;`);
+      await client.query(`set lock_timeout = 2000;`);
+      await client.query("BEGIN");
+
+      const r = await client.query(
+        `
+        select
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where content_type = $1 and content_id = $2
+        for update
+        `,
+        [contentType, contentID]
+      );
+
+      const item = r.rows?.[0];
+      if (!item?.id) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "registry item not found" });
+      }
+
+      if (String(item.operational_status) === "under_review") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot reject: item is under_review" });
+      }
+
+      if (String(item.audience) !== "global") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot reject: item is not global" });
+      }
+
+      const gs = String(item.global_state || "");
+      if (gs === "rejected") {
+        await client.query("COMMIT");
+        return res.json({ ok: true, already_rejected: true });
+      }
+
+      if (gs !== "preliminary" && gs !== "approved") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot reject: invalid global_state" });
+      }
+
+      const beforeSnapshot = {
+        registry_item_id: item.id,
+        content_type: item.content_type,
+        content_id: item.content_id,
+        audience: item.audience,
+        global_state: item.global_state,
+        operational_status: item.operational_status,
+        owner_user_id: item.owner_user_id,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+      };
+
+      const updated = await client.query(
+        `
+        update library_registry_items
+        set global_state = 'rejected',
+            updated_at = now()
+        where id = $1
+        returning
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        `,
+        [item.id]
+      );
+
+      const after = updated.rows?.[0];
+      const afterSnapshot = {
+        registry_item_id: after.id,
+        content_type: after.content_type,
+        content_id: after.content_id,
+        audience: after.audience,
+        global_state: after.global_state,
+        operational_status: after.operational_status,
+        owner_user_id: after.owner_user_id,
+        created_at: after.created_at,
+        updated_at: after.updated_at
+      };
+
+      // Defensive: resolve any unresolved review queue entries (should be none if active).
+      await client.query(
+        `
+        update library_review_queue
+        set resolved_at = now()
+        where registry_item_id = $1
+          and resolved_at is null
+        `,
+        [item.id]
+      );
+
+      await client.query(
+        `
+        insert into library_moderation_actions (
+          content_type,
+          content_id,
+          actor_user_id,
+          action,
+          reason,
+          before_snapshot,
+          after_snapshot,
+          meta
+        )
+        values ($1,$2,$3,'reject',$4,$5,$6,$7)
+        `,
+        [contentType, contentID, actorUserID, reason, beforeSnapshot, afterSnapshot, { rid }]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("[/v1/library/reject][ok]", {
+        rid,
+        actorUserID,
+        contentType,
+        contentID,
+        registry_item_id: item.id
+      });
+
+      return res.json({ ok: true, registry_item_id: item.id });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/reject] failed", { rid: req._rid, err: msg });
+
+    if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
+      return res.status(503).json({ error: "db timeout" });
+    }
+
+    return res.status(500).json({ error: "reject failed" });
   }
 });
 
