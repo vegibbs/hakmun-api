@@ -2613,6 +2613,62 @@ app.post("/v1/library/share/class", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (write surfaces v0)
+   - Revoke class share grant (soft revoke)
+   - No deletions; forensic-safe
+------------------------------------------------------------------ */
+
+// POST /v1/library/share/class/revoke
+// Body: { content_type, content_id, class_id }
+app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
+  try {
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const classID = String(req.body?.class_id || "").trim();
+
+    if (!contentType || !looksLikeUUID(contentID) || !looksLikeUUID(classID)) {
+      return res.status(400).json({ error: "invalid content_type, content_id, or class_id" });
+    }
+
+    // Authorization (v0):
+    // - Only teacher or root admin may revoke class shares.
+    if (!req.user.isTeacher && !req.user.isRootAdmin) {
+      return res.status(403).json({ error: "teacher or root admin required" });
+    }
+
+    const updated = await withTimeout(
+      pool.query(
+        `
+        update library_share_grants
+        set revoked_at = now()
+        where content_type = $1
+          and content_id = $2
+          and grant_type = 'class'
+          and grantee_id = $3
+          and revoked_at is null
+        `,
+        [contentType, contentID, classID]
+      ),
+      8000,
+      "db-revoke-share-class"
+    );
+
+    // Idempotent behavior: revoking an already-revoked/non-existent grant returns ok.
+    return res.json({ ok: true, revoked: Number(updated.rowCount || 0) });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/share/class/revoke] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-revoke-share-class")) {
+      logger.error("timeout:db-revoke-share-class", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout revoking class share" });
+    }
+
+    return res.status(500).json({ error: "revoke class share failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
