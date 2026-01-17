@@ -2214,6 +2214,116 @@ app.get("/v1/library/shared-with-me", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (read surfaces v0)
+   - Shared-with-class listing (class grants)
+   - Authorization:
+     - user must be a member of the class OR root admin
+   - Registry-aware quarantine:
+     - exclude under_review items when registry row exists
+   - NOTE: No write paths in Step 2
+------------------------------------------------------------------ */
+
+// GET /v1/library/shared-with-class?class_id=<uuid>
+app.get("/v1/library/shared-with-class", requireSession, async (req, res) => {
+  try {
+    const userID = req.user.userID;
+    const classID = String(req.query?.class_id || "").trim();
+
+    if (!looksLikeUUID(classID)) {
+      return res.status(400).json({ error: "class_id (uuid) is required" });
+    }
+
+    // Authorization: class membership OR root admin.
+    // Membership table is expected to exist once class sharing is active.
+    // If the membership table does not exist yet, fail closed (501) rather than bypass auth.
+    if (!req.user?.capabilities?.canAdminUsers) {
+      try {
+        const m = await withTimeout(
+          pool.query(
+            `
+            select 1
+            from class_memberships
+            where class_id = $1
+              and user_id = $2
+              and (revoked_at is null)
+            limit 1
+            `,
+            [classID, userID]
+          ),
+          8000,
+          "db-class-membership-check"
+        );
+
+        if (!m.rows || m.rows.length === 0) {
+          return res.status(403).json({ error: "not a member of this class" });
+        }
+      } catch (err) {
+        // If the class system isn't present yet, do NOT guess; fail closed deterministically.
+        if (String(err?.code || "") === "42P01") {
+          // undefined_table
+          return res.status(501).json({ error: "class membership not implemented on server" });
+        }
+        throw err;
+      }
+    }
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          sg.id as share_grant_id,
+          sg.content_type,
+          sg.content_id,
+          sg.granted_by_user_id,
+          sg.created_at as granted_at,
+
+          -- Registry fields are optional for personal/shared items; join is best-effort.
+          ri.id as registry_item_id,
+          ri.audience,
+          ri.global_state,
+          ri.operational_status,
+          ri.owner_user_id as registry_owner_user_id
+
+        from library_share_grants sg
+        left join library_registry_items ri
+          on ri.content_type = sg.content_type
+         and ri.content_id = sg.content_id
+
+        where sg.grant_type = 'class'
+          and sg.grantee_id = $1
+          and sg.revoked_at is null
+
+          -- Quarantine rule: if registry row exists and is under_review, exclude from serving.
+          and (ri.id is null or ri.operational_status <> 'under_review')
+
+        order by sg.created_at desc
+        limit 200
+        `,
+        [classID]
+      ),
+      8000,
+      "db-list-shared-with-class"
+    );
+
+    return res.json({ class_id: classID, items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/shared-with-class] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-class-membership-check")) {
+      logger.error("timeout:db-class-membership-check", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout checking class membership" });
+    }
+    if (msg.startsWith("timeout:db-list-shared-with-class")) {
+      logger.error("timeout:db-list-shared-with-class", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing class shared items" });
+    }
+
+    return res.status(500).json({ error: "list class shared items failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
