@@ -2208,6 +2208,104 @@ app.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
+   - Global library listing: global + active + (preliminary|approved)
+   - Review inbox listing: under_review items (restricted)
+   - NOTE: This is registry-only; no module joins in v0.
+------------------------------------------------------------------ */
+
+// GET /v1/library/global — list globally discoverable content items (registry-only)
+app.get("/v1/library/global", requireSession, async (req, res) => {
+  try {
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          id as registry_item_id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where audience = 'global'
+          and operational_status = 'active'
+          and global_state in ('preliminary', 'approved')
+        order by created_at desc
+        limit 200
+        `
+      ),
+      8000,
+      "db-list-global-library"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/global] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-global-library")) {
+      logger.error("timeout:db-list-global-library", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing global library" });
+    }
+
+    return res.status(500).json({ error: "list global library failed" });
+  }
+});
+
+// GET /v1/library/review-inbox — list under_review items (restricted)
+app.get("/v1/library/review-inbox", requireSession, requireRootAdmin, async (req, res) => {
+  try {
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          rq.id as review_queue_id,
+          rq.registry_item_id,
+          rq.flagged_by_user_id,
+          rq.flagged_at,
+          rq.reason,
+          rq.prior_snapshot,
+
+          ri.content_type,
+          ri.content_id,
+          ri.audience,
+          ri.global_state,
+          ri.operational_status,
+          ri.owner_user_id,
+          ri.created_at,
+          ri.updated_at
+        from library_review_queue rq
+        join library_registry_items ri
+          on ri.id = rq.registry_item_id
+        where ri.operational_status = 'under_review'
+          and rq.resolved_at is null
+        order by rq.flagged_at desc
+        limit 200
+        `
+      ),
+      8000,
+      "db-list-review-inbox"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/review-inbox] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-review-inbox")) {
+      logger.error("timeout:db-list-review-inbox", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing review inbox" });
+    }
+
+    return res.status(500).json({ error: "list review inbox failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    Sentence generation (optional)
 ------------------------------------------------------------------ */
 app.post("/v1/generate/sentences", (req, res) => {
