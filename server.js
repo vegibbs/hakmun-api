@@ -2669,6 +2669,210 @@ app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 3 — Moderation Actions (Step 1a)
+   - needs_review: set operational_status=under_review
+   - creates/maintains a Review Inbox entry (unresolved)
+   - appends to library_moderation_actions (forensic)
+   - NO other moderation actions in this step
+------------------------------------------------------------------ */
+
+// POST /v1/library/needs-review
+// Body: { content_type, content_id, reason? }
+app.post("/v1/library/needs-review", requireSession, async (req, res) => {
+  const rid = req._rid;
+
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const reason = req.body?.reason !== undefined ? String(req.body.reason).trim().slice(0, 500) : null;
+
+    if (!contentType || !looksLikeUUID(contentID)) {
+      return res.status(400).json({ error: "invalid content_type or content_id" });
+    }
+
+    // Require registry row to exist (registry is canonical authority).
+    const client = await pool.connect();
+    try {
+      await client.query(`set statement_timeout = 8000;`);
+      await client.query(`set lock_timeout = 2000;`);
+      await client.query("BEGIN");
+
+      // Lock registry item row for deterministic state change.
+      const r = await client.query(
+        `
+        select
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where content_type = $1 and content_id = $2
+        for update
+        `,
+        [contentType, contentID]
+      );
+
+      const item = r.rows?.[0];
+      if (!item?.id) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "registry item not found" });
+      }
+
+      // Authorization (v0, safe):
+      // - root admin OR
+      // - teacher OR
+      // - registry owner
+      const isOwner = String(item.owner_user_id) === String(actorUserID);
+      if (!req.user.isRootAdmin && !req.user.isTeacher && !isOwner) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "not authorized to flag needs_review" });
+      }
+
+      // Idempotent: if already under_review, do not duplicate queue/action.
+      if (String(item.operational_status) === "under_review") {
+        await client.query("COMMIT");
+        return res.json({ ok: true, already_under_review: true });
+      }
+
+      const beforeSnapshot = {
+        registry_item_id: item.id,
+        content_type: item.content_type,
+        content_id: item.content_id,
+        audience: item.audience,
+        global_state: item.global_state,
+        operational_status: item.operational_status,
+        owner_user_id: item.owner_user_id,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+      };
+
+      // Update registry item to under_review.
+      const updated = await client.query(
+        `
+        update library_registry_items
+        set operational_status = 'under_review',
+            updated_at = now()
+        where id = $1
+        returning
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        `,
+        [item.id]
+      );
+
+      const after = updated.rows?.[0];
+      const afterSnapshot = {
+        registry_item_id: after.id,
+        content_type: after.content_type,
+        content_id: after.content_id,
+        audience: after.audience,
+        global_state: after.global_state,
+        operational_status: after.operational_status,
+        owner_user_id: after.owner_user_id,
+        created_at: after.created_at,
+        updated_at: after.updated_at
+      };
+
+      // Ensure there is exactly one unresolved review queue entry.
+      const existingRQ = await client.query(
+        `
+        select id
+        from library_review_queue
+        where registry_item_id = $1
+          and resolved_at is null
+        limit 1
+        `,
+        [item.id]
+      );
+
+      if (!existingRQ.rows?.length) {
+        await client.query(
+          `
+          insert into library_review_queue (
+            registry_item_id,
+            flagged_by_user_id,
+            flagged_at,
+            reason,
+            prior_snapshot
+          )
+          values ($1, $2, now(), $3, $4)
+          `,
+          [item.id, actorUserID, reason, beforeSnapshot]
+        );
+      }
+
+      // Append-only forensic action log.
+      await client.query(
+        `
+        insert into library_moderation_actions (
+          content_type,
+          content_id,
+          actor_user_id,
+          action,
+          reason,
+          before_snapshot,
+          after_snapshot,
+          meta
+        )
+        values ($1,$2,$3,'needs_review',$4,$5,$6,$7)
+        `,
+        [
+          contentType,
+          contentID,
+          actorUserID,
+          reason,
+          beforeSnapshot,
+          afterSnapshot,
+          { rid }
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("[/v1/library/needs-review][ok]", {
+        rid,
+        actorUserID,
+        contentType,
+        contentID,
+        registry_item_id: item.id
+      });
+
+      return res.json({ ok: true, registry_item_id: item.id });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/needs-review] failed", { rid: req._rid, err: msg });
+
+    if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
+      return res.status(503).json({ error: "db timeout" });
+    }
+
+    return res.status(500).json({ error: "needs_review failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
