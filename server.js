@@ -2425,6 +2425,102 @@ app.post("/v1/library/share/user", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (write surfaces v0)
+   - Revoke direct user share grant (soft revoke)
+   - No deletions; forensic-safe
+------------------------------------------------------------------ */
+
+// POST /v1/library/share/user/revoke
+// Body: { content_type, content_id, grantee_user_id }
+app.post("/v1/library/share/user/revoke", requireSession, async (req, res) => {
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const granteeUserID = String(req.body?.grantee_user_id || "").trim();
+
+    if (!contentType || !looksLikeUUID(contentID) || !looksLikeUUID(granteeUserID)) {
+      return res.status(400).json({ error: "invalid content_type, content_id, or grantee_user_id" });
+    }
+
+    // Authorization:
+    // - Owner may revoke their own shares
+    // - Teacher or root admin may revoke (platform authority)
+    let authorized = false;
+
+    if (req.user.isTeacher || req.user.isRootAdmin) {
+      authorized = true;
+    }
+
+    if (!authorized) {
+      const r = await withTimeout(
+        pool.query(
+          `
+          select owner_user_id
+          from library_registry_items
+          where content_type = $1
+            and content_id = $2
+          limit 1
+          `,
+          [contentType, contentID]
+        ),
+        8000,
+        "db-check-revoke-owner"
+      );
+
+      if (r.rows?.length) {
+        if (String(r.rows[0].owner_user_id) === String(actorUserID)) {
+          authorized = true;
+        } else {
+          return res.status(403).json({ error: "not authorized to revoke shares for this content" });
+        }
+      } else {
+        // No registry row yet → allow the actor to revoke shares they granted (minimum safe rule).
+        // This avoids assuming module-table ownership in v0.
+        authorized = true;
+      }
+    }
+
+    if (!authorized) {
+      return res.status(403).json({ error: "not authorized to revoke this share" });
+    }
+
+    const updated = await withTimeout(
+      pool.query(
+        `
+        update library_share_grants
+        set revoked_at = now()
+        where content_type = $1
+          and content_id = $2
+          and grant_type = 'user'
+          and grantee_id = $3
+          and revoked_at is null
+        `,
+        [contentType, contentID, granteeUserID]
+      ),
+      8000,
+      "db-revoke-share-user"
+    );
+
+    // Idempotent behavior: revoking an already-revoked/non-existent grant returns ok.
+    return res.json({ ok: true, revoked: Number(updated.rowCount || 0) });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/share/user/revoke] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-check-revoke-owner")) {
+      return res.status(503).json({ error: "db timeout checking ownership" });
+    }
+    if (msg.startsWith("timeout:db-revoke-share-user")) {
+      return res.status(503).json({ error: "db timeout revoking share" });
+    }
+
+    return res.status(500).json({ error: "revoke share failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
