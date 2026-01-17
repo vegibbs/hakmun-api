@@ -2675,6 +2675,7 @@ app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
    - approve: (global) preliminary -> approved (active only) + audit log
    - reject: (global) preliminary|approved -> rejected (active only) + audit log
    - keep_under_review: explicit no-op (must be under_review) + audit log
+   - Guardrail: rate-limit needs_review (server-authoritative)
 ------------------------------------------------------------------ */
 
 // POST /v1/library/needs-review
@@ -2693,12 +2694,43 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
       return res.status(400).json({ error: "invalid content_type or content_id" });
     }
 
+    // Policy guardrail: basic rate limit (per actor) to prevent abuse.
+    // Uses append-only moderation actions as evidence (no new tables).
+    const NEEDS_REVIEW_MAX_PER_HOUR = 20;
+
+    const rate = await withTimeout(
+      pool.query(
+        `
+        select count(*)::int as c
+        from library_moderation_actions
+        where actor_user_id = $1
+          and action = 'needs_review'
+          and created_at > now() - interval '1 hour'
+        `,
+        [actorUserID]
+      ),
+      8000,
+      "db-needs-review-rate"
+    );
+
+    const c = rate.rows?.[0]?.c ?? 0;
+    if (c >= NEEDS_REVIEW_MAX_PER_HOUR) {
+      return res.status(429).json({
+        error: "rate_limited",
+        action: "needs_review",
+        window_sec: 3600,
+        limit: NEEDS_REVIEW_MAX_PER_HOUR
+      });
+    }
+
+    // Require registry row to exist (registry is canonical authority).
     const client = await pool.connect();
     try {
       await client.query(`set statement_timeout = 8000;`);
       await client.query(`set lock_timeout = 2000;`);
       await client.query("BEGIN");
 
+      // Lock registry item row for deterministic state change.
       const r = await client.query(
         `
         select
@@ -2724,13 +2756,17 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         return res.status(404).json({ error: "registry item not found" });
       }
 
-      // Authorization (v0, safe): root admin OR teacher OR registry owner
+      // Authorization (v0, safe):
+      // - root admin OR
+      // - teacher OR
+      // - registry owner
       const isOwner = String(item.owner_user_id) === String(actorUserID);
       if (!req.user.isRootAdmin && !req.user.isTeacher && !isOwner) {
         await client.query("ROLLBACK");
         return res.status(403).json({ error: "not authorized to flag needs_review" });
       }
 
+      // Idempotent: if already under_review, do not duplicate queue/action.
       if (String(item.operational_status) === "under_review") {
         await client.query("COMMIT");
         return res.json({ ok: true, already_under_review: true });
@@ -2748,6 +2784,7 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         updated_at: item.updated_at
       };
 
+      // Update registry item to under_review.
       const updated = await client.query(
         `
         update library_registry_items
@@ -2781,6 +2818,7 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         updated_at: after.updated_at
       };
 
+      // Ensure there is exactly one unresolved review queue entry.
       const existingRQ = await client.query(
         `
         select id
@@ -2808,6 +2846,7 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         );
       }
 
+      // Append-only forensic action log.
       await client.query(
         `
         insert into library_moderation_actions (
@@ -2848,6 +2887,11 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
     const msg = String(err?.message || err);
     logger.error("[/v1/library/needs-review] failed", { rid: req._rid, err: msg });
 
+    if (msg.startsWith("timeout:db-needs-review-rate")) {
+      logger.error("timeout:db-needs-review-rate", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout rate limiting" });
+    }
+
     if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
       return res.status(503).json({ error: "db timeout" });
     }
@@ -2880,6 +2924,7 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
       await client.query(`set lock_timeout = 2000;`);
       await client.query("BEGIN");
 
+      // Lock registry item.
       const r = await client.query(
         `
         select
@@ -2905,11 +2950,13 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         return res.status(404).json({ error: "registry item not found" });
       }
 
+      // Idempotent: if not under_review, nothing to restore.
       if (String(item.operational_status) !== "under_review") {
         await client.query("COMMIT");
         return res.json({ ok: true, already_active: true });
       }
 
+      // Load latest unresolved review queue entry (must exist for deterministic restore).
       const rq = await client.query(
         `
         select id, prior_snapshot
@@ -2931,6 +2978,7 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
 
       const prior = rqRow.prior_snapshot;
 
+      // Minimal validation of snapshot shape.
       const priorAudience = prior?.audience ? String(prior.audience) : null;
       const priorGlobalState = prior?.global_state !== undefined ? prior.global_state : null;
       const priorOpStatus = prior?.operational_status ? String(prior.operational_status) : null;
@@ -2952,6 +3000,7 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         updated_at: item.updated_at
       };
 
+      // Restore only the registry-governed fields (audience/global_state/operational_status).
       const restored = await client.query(
         `
         update library_registry_items
@@ -2987,6 +3036,7 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         updated_at: after.updated_at
       };
 
+      // Resolve ALL unresolved queue entries for this registry item (defensive; should usually be 1).
       await client.query(
         `
         update library_review_queue
@@ -2997,6 +3047,7 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         [item.id]
       );
 
+      // Append-only forensic action log.
       await client.query(
         `
         insert into library_moderation_actions (
@@ -3106,6 +3157,7 @@ app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, re
       }
 
       if (String(item.global_state) !== "preliminary") {
+        // Idempotent-ish: approving an already-approved item returns ok.
         if (String(item.global_state) === "approved") {
           await client.query("COMMIT");
           return res.json({ ok: true, already_approved: true });
@@ -3159,6 +3211,7 @@ app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, re
         updated_at: after.updated_at
       };
 
+      // Defensive: resolve any unresolved review queue entries (should be none if active).
       await client.query(
         `
         update library_review_queue
@@ -3332,6 +3385,7 @@ app.post("/v1/library/reject", requireSession, requireRootAdmin, async (req, res
         updated_at: after.updated_at
       };
 
+      // Defensive: resolve any unresolved review queue entries (should be none if active).
       await client.query(
         `
         update library_review_queue
