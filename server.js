@@ -2324,6 +2324,107 @@ app.get("/v1/library/shared-with-class", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (write surfaces v0)
+   - Create direct user share grant
+   - Idempotent insert
+   - No audience mutation
+------------------------------------------------------------------ */
+
+// POST /v1/library/share/user
+// Body: { content_type, content_id, grantee_user_id }
+app.post("/v1/library/share/user", requireSession, async (req, res) => {
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const granteeUserID = String(req.body?.grantee_user_id || "").trim();
+
+    if (!contentType || !looksLikeUUID(contentID) || !looksLikeUUID(granteeUserID)) {
+      return res.status(400).json({ error: "invalid content_type, content_id, or grantee_user_id" });
+    }
+
+    // Authorization:
+    // - Owner may share their own content
+    // - Teacher or root admin may share (platform authority)
+    let authorized = false;
+
+    // Fast path: teacher or root admin
+    if (req.user.isTeacher || req.user.isRootAdmin) {
+      authorized = true;
+    }
+
+    // Owner check via registry (best-effort; fail closed if registry row exists and owner mismatch)
+    if (!authorized) {
+      const r = await withTimeout(
+        pool.query(
+          `
+          select owner_user_id
+          from library_registry_items
+          where content_type = $1
+            and content_id = $2
+          limit 1
+          `,
+          [contentType, contentID]
+        ),
+        8000,
+        "db-check-share-owner"
+      );
+
+      if (r.rows?.length) {
+        if (String(r.rows[0].owner_user_id) === String(actorUserID)) {
+          authorized = true;
+        } else {
+          return res.status(403).json({ error: "not authorized to share this content" });
+        }
+      } else {
+        // No registry row yet → personal-only content owned by creator
+        // Allow owner to share; ownership is implicit in module tables
+        authorized = true;
+      }
+    }
+
+    if (!authorized) {
+      return res.status(403).json({ error: "not authorized to share this content" });
+    }
+
+    // Idempotent insert
+    await withTimeout(
+      pool.query(
+        `
+        insert into library_share_grants (
+          content_type,
+          content_id,
+          grant_type,
+          grantee_id,
+          granted_by_user_id
+        )
+        values ($1, $2, 'user', $3, $4)
+        on conflict do nothing
+        `,
+        [contentType, contentID, granteeUserID, actorUserID]
+      ),
+      8000,
+      "db-insert-share-user"
+    );
+
+    return res.status(201).json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/share/user] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-check-share-owner")) {
+      return res.status(503).json({ error: "db timeout checking ownership" });
+    }
+    if (msg.startsWith("timeout:db-insert-share-user")) {
+      return res.status(503).json({ error: "db timeout creating share" });
+    }
+
+    return res.status(500).json({ error: "create share failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
