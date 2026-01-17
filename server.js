@@ -3642,6 +3642,8 @@ app.get("/v1/library/item-status", requireSession, async (req, res) => {
   }
 });
 
+
+
 /* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
