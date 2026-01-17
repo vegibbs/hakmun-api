@@ -2150,6 +2150,70 @@ app.get("/v1/assets/:asset_id/url", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 2 — Sharing Grants (read surfaces v0)
+   - Shared-with-me listing (direct user grants)
+   - Registry-aware quarantine: exclude under_review items when registry row exists
+   - NOTE: No write paths in Step 1
+------------------------------------------------------------------ */
+
+// GET /v1/library/shared-with-me — list content items shared directly to this user
+app.get("/v1/library/shared-with-me", requireSession, async (req, res) => {
+  try {
+    const userID = req.user.userID;
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          sg.id as share_grant_id,
+          sg.content_type,
+          sg.content_id,
+          sg.granted_by_user_id,
+          sg.created_at as granted_at,
+
+          -- Registry fields are optional for personal/shared items; join is best-effort.
+          ri.id as registry_item_id,
+          ri.audience,
+          ri.global_state,
+          ri.operational_status,
+          ri.owner_user_id as registry_owner_user_id
+
+        from library_share_grants sg
+        left join library_registry_items ri
+          on ri.content_type = sg.content_type
+         and ri.content_id = sg.content_id
+
+        where sg.grant_type = 'user'
+          and sg.grantee_id = $1
+          and sg.revoked_at is null
+
+          -- Quarantine rule: if registry row exists and is under_review, exclude from serving.
+          and (ri.id is null or ri.operational_status <> 'under_review')
+
+        order by sg.created_at desc
+        limit 200
+        `,
+        [userID]
+      ),
+      8000,
+      "db-list-shared-with-me"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/shared-with-me] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-shared-with-me")) {
+      logger.error("timeout:db-list-shared-with-me", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing shared items" });
+    }
+
+    return res.status(500).json({ error: "list shared items failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
