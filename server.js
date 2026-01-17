@@ -2669,10 +2669,11 @@ app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   REGISTRY EPIC 3 — Moderation Actions (Step 1a + 1b)
-   - needs_review: set operational_status=under_review + queue + audit log
-   - restore: resolve under_review back to prior snapshot + resolve queue + audit log
-   - NO approve/reject in this step
+   REGISTRY EPIC 3 — Moderation Actions (Step 1: server write-side)
+   - needs_review: active -> under_review + queue + audit log
+   - restore: under_review -> prior snapshot + resolve queue + audit log
+   - approve: (global) preliminary -> approved (active only) + audit log
+   - NO reject/keep_under_review in this step
 ------------------------------------------------------------------ */
 
 // POST /v1/library/needs-review
@@ -2691,14 +2692,12 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
       return res.status(400).json({ error: "invalid content_type or content_id" });
     }
 
-    // Require registry row to exist (registry is canonical authority).
     const client = await pool.connect();
     try {
       await client.query(`set statement_timeout = 8000;`);
       await client.query(`set lock_timeout = 2000;`);
       await client.query("BEGIN");
 
-      // Lock registry item row for deterministic state change.
       const r = await client.query(
         `
         select
@@ -2725,16 +2724,13 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
       }
 
       // Authorization (v0, safe):
-      // - root admin OR
-      // - teacher OR
-      // - registry owner
+      // - root admin OR teacher OR registry owner
       const isOwner = String(item.owner_user_id) === String(actorUserID);
       if (!req.user.isRootAdmin && !req.user.isTeacher && !isOwner) {
         await client.query("ROLLBACK");
         return res.status(403).json({ error: "not authorized to flag needs_review" });
       }
 
-      // Idempotent: if already under_review, do not duplicate queue/action.
       if (String(item.operational_status) === "under_review") {
         await client.query("COMMIT");
         return res.json({ ok: true, already_under_review: true });
@@ -2752,7 +2748,6 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         updated_at: item.updated_at
       };
 
-      // Update registry item to under_review.
       const updated = await client.query(
         `
         update library_registry_items
@@ -2786,7 +2781,6 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         updated_at: after.updated_at
       };
 
-      // Ensure there is exactly one unresolved review queue entry.
       const existingRQ = await client.query(
         `
         select id
@@ -2814,7 +2808,6 @@ app.post("/v1/library/needs-review", requireSession, async (req, res) => {
         );
       }
 
-      // Append-only forensic action log.
       await client.query(
         `
         insert into library_moderation_actions (
@@ -2887,7 +2880,6 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
       await client.query(`set lock_timeout = 2000;`);
       await client.query("BEGIN");
 
-      // Lock registry item.
       const r = await client.query(
         `
         select
@@ -2913,13 +2905,11 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         return res.status(404).json({ error: "registry item not found" });
       }
 
-      // Idempotent: if not under_review, nothing to restore.
       if (String(item.operational_status) !== "under_review") {
         await client.query("COMMIT");
         return res.json({ ok: true, already_active: true });
       }
 
-      // Load latest unresolved review queue entry (must exist for deterministic restore).
       const rq = await client.query(
         `
         select id, prior_snapshot
@@ -2941,7 +2931,6 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
 
       const prior = rqRow.prior_snapshot;
 
-      // Minimal validation of snapshot shape.
       const priorAudience = prior?.audience ? String(prior.audience) : null;
       const priorGlobalState = prior?.global_state !== undefined ? prior.global_state : null;
       const priorOpStatus = prior?.operational_status ? String(prior.operational_status) : null;
@@ -2963,7 +2952,6 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         updated_at: item.updated_at
       };
 
-      // Restore only the registry-governed fields (audience/global_state/operational_status).
       const restored = await client.query(
         `
         update library_registry_items
@@ -2999,7 +2987,6 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         updated_at: after.updated_at
       };
 
-      // Resolve ALL unresolved queue entries for this registry item (defensive; should usually be 1).
       await client.query(
         `
         update library_review_queue
@@ -3010,7 +2997,6 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
         [item.id]
       );
 
-      // Append-only forensic action log.
       await client.query(
         `
         insert into library_moderation_actions (
@@ -3057,6 +3043,179 @@ app.post("/v1/library/restore", requireSession, requireRootAdmin, async (req, re
     }
 
     return res.status(500).json({ error: "restore failed" });
+  }
+});
+
+// POST /v1/library/approve
+// Body: { content_type, content_id, reason? }
+// Approves global content: preliminary -> approved (ACTIVE only; cannot approve under_review).
+// Root-admin-only for now (approver workflow is root-admin-only today).
+app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, res) => {
+  const rid = req._rid;
+
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const reason = req.body?.reason !== undefined ? String(req.body.reason).trim().slice(0, 500) : null;
+
+    if (!contentType || !looksLikeUUID(contentID)) {
+      return res.status(400).json({ error: "invalid content_type or content_id" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(`set statement_timeout = 8000;`);
+      await client.query(`set lock_timeout = 2000;`);
+      await client.query("BEGIN");
+
+      const r = await client.query(
+        `
+        select
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where content_type = $1 and content_id = $2
+        for update
+        `,
+        [contentType, contentID]
+      );
+
+      const item = r.rows?.[0];
+      if (!item?.id) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "registry item not found" });
+      }
+
+      if (String(item.operational_status) === "under_review") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot approve: item is under_review" });
+      }
+
+      if (String(item.audience) !== "global") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot approve: item is not global" });
+      }
+
+      if (String(item.global_state) !== "preliminary") {
+        // Idempotent-ish: approving an already-approved item returns ok.
+        if (String(item.global_state) === "approved") {
+          await client.query("COMMIT");
+          return res.json({ ok: true, already_approved: true });
+        }
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot approve: global_state must be preliminary" });
+      }
+
+      const beforeSnapshot = {
+        registry_item_id: item.id,
+        content_type: item.content_type,
+        content_id: item.content_id,
+        audience: item.audience,
+        global_state: item.global_state,
+        operational_status: item.operational_status,
+        owner_user_id: item.owner_user_id,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+      };
+
+      const updated = await client.query(
+        `
+        update library_registry_items
+        set global_state = 'approved',
+            updated_at = now()
+        where id = $1
+        returning
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        `,
+        [item.id]
+      );
+
+      const after = updated.rows?.[0];
+      const afterSnapshot = {
+        registry_item_id: after.id,
+        content_type: after.content_type,
+        content_id: after.content_id,
+        audience: after.audience,
+        global_state: after.global_state,
+        operational_status: after.operational_status,
+        owner_user_id: after.owner_user_id,
+        created_at: after.created_at,
+        updated_at: after.updated_at
+      };
+
+      // Defensive: resolve any unresolved review queue entries (should be none if active).
+      await client.query(
+        `
+        update library_review_queue
+        set resolved_at = now()
+        where registry_item_id = $1
+          and resolved_at is null
+        `,
+        [item.id]
+      );
+
+      await client.query(
+        `
+        insert into library_moderation_actions (
+          content_type,
+          content_id,
+          actor_user_id,
+          action,
+          reason,
+          before_snapshot,
+          after_snapshot,
+          meta
+        )
+        values ($1,$2,$3,'approve',$4,$5,$6,$7)
+        `,
+        [contentType, contentID, actorUserID, reason, beforeSnapshot, afterSnapshot, { rid }]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("[/v1/library/approve][ok]", {
+        rid,
+        actorUserID,
+        contentType,
+        contentID,
+        registry_item_id: item.id
+      });
+
+      return res.json({ ok: true, registry_item_id: item.id });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/approve] failed", { rid: req._rid, err: msg });
+
+    if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
+      return res.status(503).json({ error: "db timeout" });
+    }
+
+    return res.status(500).json({ error: "approve failed" });
   }
 });
 
