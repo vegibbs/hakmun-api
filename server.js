@@ -3642,7 +3642,63 @@ app.get("/v1/library/item-status", requireSession, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   REGISTRY EPIC 3 — Review Inbox History (read-only)
+   - Recently resolved moderation actions for ops visibility
+   - Root-admin-only
+------------------------------------------------------------------ */
 
+// GET /v1/library/review-inbox/history?limit=50
+app.get("/v1/library/review-inbox/history", requireSession, requireRootAdmin, async (req, res) => {
+  const rid = req._rid;
+  const limit = Math.min(Math.max(parseInt(req.query?.limit || "50", 10), 1), 200);
+
+  try {
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          ma.action,
+          ma.created_at as action_at,
+          ma.actor_user_id,
+          ma.content_type,
+          ma.content_id,
+          rq.id as review_queue_id,
+          rq.resolved_at,
+          ri.owner_user_id,
+          ri.audience,
+          ri.global_state,
+          ri.operational_status
+        from library_moderation_actions ma
+        left join library_registry_items ri
+          on ri.content_type = ma.content_type
+         and ri.content_id = ma.content_id
+        left join library_review_queue rq
+          on rq.registry_item_id = ri.id
+        where ma.action in ('restore','approve','reject')
+          and rq.resolved_at is not null
+        order by ma.created_at desc
+        limit $1
+        `,
+        [limit]
+      ),
+      8000,
+      "db-list-review-inbox-history"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/review-inbox/history] failed", { rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-review-inbox-history")) {
+      logger.error("timeout:db-list-review-inbox-history", { rid });
+      return res.status(503).json({ error: "db timeout listing review history" });
+    }
+
+    return res.status(500).json({ error: "review history failed" });
+  }
+});
 
 /* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
