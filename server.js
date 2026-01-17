@@ -3755,6 +3755,57 @@ app.get("/v1/library/review-inbox/history", requireSession, requireRootAdmin, as
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 4 — Teacher "My Content" Inventory (read-only)
+   - Lists owned content items (registry-only)
+   - Active items ONLY (under_review excluded)
+   - No sharing, no mutation, no module joins
+------------------------------------------------------------------ */
+
+// GET /v1/library/my-content
+app.get("/v1/library/my-content", requireSession, async (req, res) => {
+  try {
+    const ownerUserID = req.user.userID;
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          id as registry_item_id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where owner_user_id = $1
+          and operational_status = 'active'
+        order by created_at desc
+        limit 500
+        `,
+        [ownerUserID]
+      ),
+      8000,
+      "db-list-my-content"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/my-content] failed", { rid: req._rid, err: msg });
+
+    if (msg.startsWith("timeout:db-list-my-content")) {
+      logger.error("timeout:db-list-my-content", { rid: req._rid });
+      return res.status(503).json({ error: "db timeout listing owned content" });
+    }
+
+    return res.status(500).json({ error: "list my content failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Universal Library Registry (read surfaces v0)
    - Global library listing: global + active + (preliminary|approved)
    - Review inbox listing: under_review items (restricted)
