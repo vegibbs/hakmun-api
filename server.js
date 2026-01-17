@@ -2674,7 +2674,7 @@ app.post("/v1/library/share/class/revoke", requireSession, async (req, res) => {
    - restore: under_review -> prior snapshot + resolve queue + audit log
    - approve: (global) preliminary -> approved (active only) + audit log
    - reject: (global) preliminary|approved -> rejected (active only) + audit log
-   - NO keep_under_review in this step
+   - keep_under_review: explicit no-op (must be under_review) + audit log
 ------------------------------------------------------------------ */
 
 // POST /v1/library/needs-review
@@ -3159,7 +3159,6 @@ app.post("/v1/library/approve", requireSession, requireRootAdmin, async (req, re
         updated_at: after.updated_at
       };
 
-      // Defensive: resolve any unresolved review queue entries (should be none if active).
       await client.query(
         `
         update library_review_queue
@@ -3333,7 +3332,6 @@ app.post("/v1/library/reject", requireSession, requireRootAdmin, async (req, res
         updated_at: after.updated_at
       };
 
-      // Defensive: resolve any unresolved review queue entries (should be none if active).
       await client.query(
         `
         update library_review_queue
@@ -3389,6 +3387,142 @@ app.post("/v1/library/reject", requireSession, requireRootAdmin, async (req, res
     }
 
     return res.status(500).json({ error: "reject failed" });
+  }
+});
+
+// POST /v1/library/keep-under-review
+// Body: { content_type, content_id, reason? }
+// Explicit no-op: item must already be under_review; does NOT resolve queue; audit logged.
+// Root-admin-only for now (review inbox is root-admin-only today).
+app.post("/v1/library/keep-under-review", requireSession, requireRootAdmin, async (req, res) => {
+  const rid = req._rid;
+
+  try {
+    const actorUserID = req.user.userID;
+
+    const contentType = String(req.body?.content_type || "").trim();
+    const contentID = String(req.body?.content_id || "").trim();
+    const reason = req.body?.reason !== undefined ? String(req.body.reason).trim().slice(0, 500) : null;
+
+    if (!contentType || !looksLikeUUID(contentID)) {
+      return res.status(400).json({ error: "invalid content_type or content_id" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(`set statement_timeout = 8000;`);
+      await client.query(`set lock_timeout = 2000;`);
+      await client.query("BEGIN");
+
+      // Lock registry item.
+      const r = await client.query(
+        `
+        select
+          id,
+          content_type,
+          content_id,
+          audience,
+          global_state,
+          operational_status,
+          owner_user_id,
+          created_at,
+          updated_at
+        from library_registry_items
+        where content_type = $1 and content_id = $2
+        for update
+        `,
+        [contentType, contentID]
+      );
+
+      const item = r.rows?.[0];
+      if (!item?.id) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "registry item not found" });
+      }
+
+      if (String(item.operational_status) !== "under_review") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot keep_under_review: item is not under_review" });
+      }
+
+      // Ensure there is an unresolved review queue row (operational invariant).
+      const rq = await client.query(
+        `
+        select id
+        from library_review_queue
+        where registry_item_id = $1
+          and resolved_at is null
+        order by flagged_at desc
+        limit 1
+        `,
+        [item.id]
+      );
+
+      const rqRow = rq.rows?.[0];
+      if (!rqRow?.id) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "cannot keep_under_review: missing unresolved review queue row" });
+      }
+
+      const snapshot = {
+        registry_item_id: item.id,
+        content_type: item.content_type,
+        content_id: item.content_id,
+        audience: item.audience,
+        global_state: item.global_state,
+        operational_status: item.operational_status,
+        owner_user_id: item.owner_user_id,
+        created_at: item.created_at,
+        updated_at: item.updated_at
+      };
+
+      // Append-only forensic action log (before == after; explicit no-op).
+      await client.query(
+        `
+        insert into library_moderation_actions (
+          content_type,
+          content_id,
+          actor_user_id,
+          action,
+          reason,
+          before_snapshot,
+          after_snapshot,
+          meta
+        )
+        values ($1,$2,$3,'keep_under_review',$4,$5,$6,$7)
+        `,
+        [contentType, contentID, actorUserID, reason, snapshot, snapshot, { rid, review_queue_id: rqRow.id }]
+      );
+
+      await client.query("COMMIT");
+
+      logger.info("[/v1/library/keep-under-review][ok]", {
+        rid,
+        actorUserID,
+        contentType,
+        contentID,
+        registry_item_id: item.id,
+        review_queue_id: rqRow.id
+      });
+
+      return res.json({ ok: true, registry_item_id: item.id });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/library/keep-under-review] failed", { rid: req._rid, err: msg });
+
+    if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
+      return res.status(503).json({ error: "db timeout" });
+    }
+
+    return res.status(500).json({ error: "keep_under_review failed" });
   }
 });
 
