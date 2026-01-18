@@ -83,9 +83,12 @@ function logBootEnv(logger, env) {
     enabled: Boolean(BETTERSTACK_ENABLED)
   });
   L.info("[boot] LOG_LEVEL", { LOG_LEVEL });
-  L.info("[boot] DEBUG_SCOPES", {
-    DEBUG_SCOPES: Array.from(DEBUG_SCOPES).join(",") || "<none>"
-  });
+   const debugScopesText =
+    DEBUG_SCOPES && typeof DEBUG_SCOPES[Symbol.iterator] === "function"
+      ? (Array.from(DEBUG_SCOPES).join(",") || "<none>")
+      : "<none>";
+
+  L.info("[boot] DEBUG_SCOPES", { DEBUG_SCOPES: debugScopesText });
 }
 
 module.exports = {
