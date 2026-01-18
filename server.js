@@ -1251,6 +1251,46 @@ function bucketName() {
 app.get("/", (req, res) => res.send("hakmun-api up"));
 
 /* ------------------------------------------------------------------
+   DEV — Smoke Token (backend-only)
+   - Disabled unless ENABLE_SMOKE_TOKEN=1
+   - Requires X-Smoke-Secret header
+   - NEVER logs tokens
+------------------------------------------------------------------ */
+
+function smokeTokenEnabled() {
+  return String(process.env.ENABLE_SMOKE_TOKEN || "").trim() === "1";
+}
+
+function requireSmokeSecret(req) {
+  const expected = String(process.env.SMOKE_TEST_SECRET || "").trim();
+  if (!expected) return false;
+  const got = String(req.headers["x-smoke-secret"] || "").trim();
+  if (!got) return false;
+  return crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+}
+
+app.post("/v1/dev/smoke-token", async (req, res) => {
+  try {
+    if (!smokeTokenEnabled()) return res.status(404).json({ error: "not found" });
+    if (!requireSmokeSecret(req)) return res.status(401).json({ error: "unauthorized" });
+
+    const userID = String(process.env.SMOKE_TEST_USER_ID || "").trim();
+    if (!userID || !looksLikeUUID(userID)) {
+      return res.status(500).json({ error: "smoke user not configured" });
+    }
+
+    const state = await getUserState(userID);
+    if (!Boolean(state.is_active)) return res.status(403).json({ error: "smoke user inactive" });
+
+    const tokens = await issueSessionTokens({ userID });
+    return res.json({ accessToken: tokens.accessToken, expiresIn: tokens.expiresIn });
+  } catch (err) {
+    logger.error("[/v1/dev/smoke-token] failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "smoke token failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    STORAGE EPIC 1 — Assets (multipart + validation + S3 + DB)
    - Enforce MIME allowlist + size limits server-side (S4)
    - One upload at a time (S5)
