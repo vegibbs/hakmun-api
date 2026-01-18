@@ -28,7 +28,7 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const { logger, shouldLog, scopeEnabled } = require("./util/log");
+const { logger, shouldLog, scopeEnabled, LOG_LEVEL, DEBUG_SCOPES } = require("./util/log");
 
 /* ------------------------------------------------------------------
    App + JSON
