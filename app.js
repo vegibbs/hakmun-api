@@ -39,9 +39,30 @@ app.use(express.json({ limit: "1mb" }));
 
 /* ------------------------------------------------------------------
    Request ID + safe request logging (NO secrets)
+   - Logging must never crash the server
 ------------------------------------------------------------------ */
 function makeReqID() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function safeHttpLog(fields) {
+  try {
+    if (logger && typeof logger.info === "function") {
+      logger.info("[http]", fields);
+      return;
+    }
+
+    process.stdout.write(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "info",
+        msg: "[http]",
+        ...(fields && typeof fields === "object" ? fields : {})
+      }) + "\n"
+    );
+  } catch {
+    // Never crash on logging.
+  }
 }
 
 app.use((req, res, next) => {
@@ -52,7 +73,7 @@ app.use((req, res, next) => {
   const t0 = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - t0;
-    logger.info("[http]", {
+    safeHttpLog({
       rid,
       method: req.method,
       path: req.path,
@@ -63,39 +84,6 @@ app.use((req, res, next) => {
 
   next();
 });
-
-const { requireEnv, parseCsvEnv, logBootEnv } = require("./util/env");
-
-const APPLE_CLIENT_IDS = requireEnv("APPLE_CLIENT_IDS")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const DATABASE_URL = requireEnv("DATABASE_URL");
-const SESSION_JWT_SECRET = requireEnv("SESSION_JWT_SECRET");
-
-const NODE_ENV = process.env.NODE_ENV || "<unset>";
-const ROOT_ADMIN_USER_IDS =
-  NODE_ENV === "production"
-    ? parseCsvEnv("ROOT_ADMIN_USER_IDS").length
-      ? parseCsvEnv("ROOT_ADMIN_USER_IDS")
-      : (() => {
-          requireEnv("ROOT_ADMIN_USER_IDS");
-          return parseCsvEnv("ROOT_ADMIN_USER_IDS");
-        })()
-    : parseCsvEnv("ROOT_ADMIN_USER_IDS");
-
-// Session token lifetimes (seconds)
-const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
-const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
-// Impersonation tokens are short-lived and access-only (no refresh)
-const IMPERSONATION_ACCESS_TTL_SEC = 60 * 10; // 10 minutes
-
-// Session JWT claims
-const SESSION_ISSUER = "hakmun-api";
-const SESSION_AUDIENCE = "hakmun-client";
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 /* ------------------------------------------------------------------
    Safe boot logging (no secrets)
