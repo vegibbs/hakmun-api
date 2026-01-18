@@ -29,6 +29,25 @@ function safeDbHost(url) {
 }
 
 function logBootEnv(logger, env) {
+  // Fail-safe: boot logging must never crash the server.
+  // If logger is missing, fall back to stdout JSON lines.
+  const fallback = {
+    info: (msg, fields) => {
+      try {
+        process.stdout.write(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "info",
+            msg,
+            ...(fields && typeof fields === "object" ? fields : {})
+          }) + "\n"
+        );
+      } catch {}
+    }
+  };
+
+  const L = logger && typeof logger.info === "function" ? logger : fallback;
+
   const {
     NODE_ENV,
     APPLE_CLIENT_IDS,
@@ -41,30 +60,30 @@ function logBootEnv(logger, env) {
     DEBUG_SCOPES
   } = env;
 
-  logger.info("[boot] HakMun API starting");
-  logger.info("[boot] NODE_ENV", { NODE_ENV });
-  logger.info("[boot] APPLE_CLIENT_IDS", {
+  L.info("[boot] HakMun API starting");
+  L.info("[boot] NODE_ENV", { NODE_ENV });
+  L.info("[boot] APPLE_CLIENT_IDS", {
     apple_client_ids: APPLE_CLIENT_IDS.join(", ")
   });
-  logger.info("[boot] DATABASE_URL host", {
+  L.info("[boot] DATABASE_URL host", {
     db_host: safeDbHost(DATABASE_URL)
   });
-  logger.info("[boot] SESSION_JWT_SECRET set", {
+  L.info("[boot] SESSION_JWT_SECRET set", {
     session_jwt_secret_set: Boolean(SESSION_JWT_SECRET)
   });
-  logger.info("[boot] OPENAI_API_KEY set", {
+  L.info("[boot] OPENAI_API_KEY set", {
     openai_api_key_set: Boolean(OPENAI_API_KEY)
   });
-  logger.info("[boot] ROOT_ADMIN_USER_IDS set", {
+  L.info("[boot] ROOT_ADMIN_USER_IDS set", {
     root_admin_ids: ROOT_ADMIN_USER_IDS.length
       ? `${ROOT_ADMIN_USER_IDS.length} pinned`
       : "none"
   });
-  logger.info("[boot] betterstack shipping enabled", {
+  L.info("[boot] betterstack shipping enabled", {
     enabled: Boolean(BETTERSTACK_ENABLED)
   });
-  logger.info("[boot] LOG_LEVEL", { LOG_LEVEL });
-  logger.info("[boot] DEBUG_SCOPES", {
+  L.info("[boot] LOG_LEVEL", { LOG_LEVEL });
+  L.info("[boot] DEBUG_SCOPES", {
     DEBUG_SCOPES: Array.from(DEBUG_SCOPES).join(",") || "<none>"
   });
 }
