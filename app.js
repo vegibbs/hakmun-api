@@ -107,7 +107,7 @@ logBootEnv(logger, {
   SESSION_JWT_SECRET,
   OPENAI_API_KEY,
   ROOT_ADMIN_USER_IDS,
-  BETTERSTACK_ENABLED: BETTERSTACK,
+  BETTERSTACK_ENABLED: true,
   LOG_LEVEL,
   DEBUG_SCOPES
 });
@@ -123,34 +123,9 @@ const openai =
 /* ------------------------------------------------------------------
    Postgres (Railway)
 ------------------------------------------------------------------ */
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 8000,
-  idleTimeoutMillis: 30_000,
-  max: 10
-});
 
-pool.on("error", (err) => {
-  logger.error("[pg] pool error", { err: err?.message || String(err) });
-});
-
-// DB fingerprint (removes ambiguity)
-pool
-  .query(
-    `
-  select
-    current_database() as db,
-    current_schema() as schema,
-    inet_server_addr() as addr,
-    inet_server_port() as port,
-    version() as version
-`
-  )
-  .then((r) => logger.info("[boot] db_fingerprint", { db_fingerprint: r.rows?.[0] || "<none>" }))
-  .catch((e) => logger.error("[boot] db_fingerprint failed", { err: e?.message || String(e) }));
-
-const { withTimeout } = require("./util/time");
+const { createPool } = require("./db/pool");
+const pool = createPool({ DATABASE_URL, NODE_ENV, logger });
 
 /* ------------------------------------------------------------------
    Apple Sign In verification (fail-fast)
