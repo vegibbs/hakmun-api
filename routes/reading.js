@@ -51,14 +51,15 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
         `
         insert into reading_items (
           reading_item_id,
+          owner_user_id,
           unit_type,
           text,
           language,
           notes
         )
-        values ($1, $2, $3, $4, $5)
+        values ($1, $2, $3, $4, $5, $6)
         `,
-        [readingItemID, unitType, text, language, notes]
+        [readingItemID, ownerUserID, unitType, text, language, notes]
       );
 
       // 2) Create registry row (personal + active)
