@@ -137,6 +137,81 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   REGISTRY EPIC 4 — Personal Reading Items (read surface)
+   - Lists the caller's personal Reading items (text included)
+   - Registry-gated: only items with registry row active are served
+   - No global items, no sharing surfaces
+------------------------------------------------------------------ */
+
+// GET /v1/reading/items — personal reading items owned by the caller
+router.get("/v1/reading/items", requireSession, async (req, res) => {
+  const rid = req._rid;
+
+  try {
+    const ownerUserID = req.user.userID;
+
+    const r = await withTimeout(
+      pool.query(
+        `
+        select
+          ri.reading_item_id,
+          ri.unit_type,
+          ri.text,
+          ri.language,
+          ri.notes,
+          ri.created_at,
+          ri.updated_at,
+
+          lri.id as registry_item_id,
+          lri.content_type,
+          lri.content_id,
+          lri.audience,
+          lri.global_state,
+          lri.operational_status,
+          lri.owner_user_id
+
+        from reading_items ri
+        join library_registry_items lri
+          on lri.content_type = 'reading_item'
+         and lri.content_id = ri.reading_item_id
+
+        where lri.owner_user_id = $1
+          and lri.audience = 'personal'
+          and lri.operational_status = 'active'
+
+        order by ri.created_at desc
+        limit 500
+        `,
+        [ownerUserID]
+      ),
+      8000,
+      "db-list-reading-items-personal"
+    );
+
+    return res.json({ items: r.rows || [] });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/reading/items GET] failed", { rid, err: msg });
+
+    if (String(err?.code || "") === "42P01") {
+      // undefined_table
+      return res.status(501).json({ error: "reading items table not implemented on server" });
+    }
+
+    if (
+      msg.startsWith("timeout:db-list-reading-items-personal") ||
+      msg.includes("statement timeout") ||
+      msg.includes("lock timeout")
+    ) {
+      logger.error("timeout:db-list-reading-items-personal", { rid });
+      return res.status(503).json({ error: "db timeout listing personal reading items" });
+    }
+
+    return res.status(500).json({ error: "list reading items failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
    REGISTRY EPIC 1 — Reading Coverage (registry-gated read surface)
    - Coverage applies ONLY to global + active items
    - Global state: preliminary | approved
