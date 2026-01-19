@@ -34,7 +34,7 @@ body_prefix() {
   python3 -c 'import sys; t=sys.stdin.read().replace("\n"," ").replace("\r"," "); print((t[:220] + ("..." if len(t)>220 else "")))'
 }
 
-http_status() { curl -s -o /dev/null -w "%{http_code}" "$@"; }
+http_status() { curl -sS -o /dev/null -w "%{http_code}" "$@"; }
 
 need_cmd git
 need_cmd curl
@@ -59,7 +59,7 @@ HAKMUN_API_BASE_URL="${HAKMUN_API_BASE_URL%/}"
 
 print_section "1) Mint smoke access token"
 
-TOKEN_BODY="$(curl -s -X POST "$HAKMUN_API_BASE_URL/v1/dev/smoke-token" -H "X-Smoke-Secret: $SMOKE_TEST_SECRET")"
+TOKEN_BODY="$(curl -sS -X POST "$HAKMUN_API_BASE_URL/v1/dev/smoke-token" -H "X-Smoke-Secret: $SMOKE_TEST_SECRET")"
 TOKEN="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("accessToken","") or "")' <<< "$TOKEN_BODY")"
 EXPIRES_IN="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(d.get("expiresIn","") or "")' <<< "$TOKEN_BODY")"
 
@@ -73,25 +73,76 @@ print_section "2) Smoke endpoints"
 hit() {
   local name="$1"
   local url="$2"
+  local expect="${3:-200}"
   local code
   code="$(http_status "$url" -H "$AUTH_HEADER")"
   echo "[$code] $name"
-  if [[ "$code" != "200" ]]; then
+  if [[ "$code" != "$expect" ]]; then
     echo "  Body:"
-    curl -s "$url" -H "$AUTH_HEADER" | body_prefix
+    curl -sS "$url" -H "$AUTH_HEADER" | body_prefix
     echo ""
     return 1
   fi
   echo -n "  OK: "
-  curl -s "$url" -H "$AUTH_HEADER" | body_prefix
+  curl -sS "$url" -H "$AUTH_HEADER" | body_prefix
   echo ""
 }
 
+post_reading_item() {
+  local text="$1"
+  local url="$HAKMUN_API_BASE_URL/v1/reading/items"
+
+  local json_body
+  json_body="$(python3 - <<PY
+import json
+print(json.dumps({"text": """$text""", "unit_type": "sentence", "language": "ko"}))
+PY
+)"
+
+  local resp_file
+  resp_file="$(mktemp)"
+
+  local code
+  code="$(curl -sS -o "$resp_file" -w "%{http_code}" -X POST "$url" \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    --data-binary "$json_body")"
+
+  echo "[$code] reading create -> POST /v1/reading/items"
+  if [[ "$code" != "201" ]]; then
+    echo "  Body:"
+    cat "$resp_file" | body_prefix
+    echo ""
+    rm -f "$resp_file"
+    return 1
+  fi
+
+  echo -n "  OK: "
+  cat "$resp_file" | body_prefix
+  echo ""
+
+  local created_id
+  created_id="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print((d.get("reading_item",{}) or {}).get("reading_item_id",""))' < "$resp_file")"
+  rm -f "$resp_file"
+
+  [[ -n "$created_id" ]] || die "reading create did not return reading_item.reading_item_id"
+  return 0
+}
+
+# Baseline endpoints
 hit "whoami -> /v1/session/whoami" "$HAKMUN_API_BASE_URL/v1/session/whoami"
 hit "library/global -> /v1/library/global" "$HAKMUN_API_BASE_URL/v1/library/global"
 hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/library/review-inbox"
 hit "reading coverage -> /v1/reading-items/coverage" "$HAKMUN_API_BASE_URL/v1/reading-items/coverage"
 hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
+
+# Reading personal library (EPIC 4): list + create + list
+hit "reading items (personal) -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
+
+READING_TEXT="Smoke test reading sentence $(date +%Y-%m-%dT%H:%M:%S)"
+post_reading_item "$READING_TEXT"
+
+hit "reading items (personal) after create -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
 
 print_section "DONE"
 echo "✅ Smoke suite complete."
