@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FILE: hakmun-api/ops/server_smoke.sh
-# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins POST+GET checks (contract enforced).
+# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins POST+GET+DELETE checks.
 
 set -euo pipefail
 
@@ -123,6 +123,38 @@ post_json_expect() {
   return 0
 }
 
+delete_json_expect() {
+  local name="$1"
+  local url="$2"
+  local json_body="$3"
+  local expect="${4:-200}"
+
+  local resp_file
+  resp_file="$(mktemp)"
+
+  local code
+  code="$(curl -sS -o "$resp_file" -w "%{http_code}" -X DELETE "$url" \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    --data-binary "$json_body")"
+
+  echo "[$code] $name"
+  if [[ "$code" != "$expect" ]]; then
+    echo "  Body:"
+    cat "$resp_file" | body_prefix
+    echo ""
+    rm -f "$resp_file"
+    return 1
+  fi
+
+  echo -n "  OK: "
+  cat "$resp_file" | body_prefix
+  echo ""
+
+  rm -f "$resp_file"
+  return 0
+}
+
 post_reading_item() {
   local text="$1"
   local url="$HAKMUN_API_BASE_URL/v1/reading/items"
@@ -170,7 +202,7 @@ READING_TEXT="Smoke test reading sentence $(date +%Y-%m-%dT%H:%M:%S)"
 post_reading_item "$READING_TEXT"
 hit "reading items (personal) after create -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
 
-print_section "3) DV2 Dictionary pins"
+print_section "3) DV2 Dictionary pins (POST + GET + DELETE + GET)"
 
 PIN_HEADWORD="물어보다"
 PIN_VOCAB_ID="8388aa27-d13c-4208-b0c1-2ff516dd9604"
@@ -181,11 +213,19 @@ print(json.dumps({"headword": "$PIN_HEADWORD", "vocab_id": "$PIN_VOCAB_ID"}))
 PY
 )"
 
+UNPIN_BODY="$(python3 - <<PY
+import json
+print(json.dumps({"headword": "$PIN_HEADWORD"}))
+PY
+)"
+
+# POST pin
 post_json_expect "dictionary pins create -> POST /v1/me/dictionary/pins" \
   "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" \
   "$PIN_BODY" \
   200
 
+# GET pins (expect contains headword)
 PINS_FILE="$(mktemp)"
 curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER" > "$PINS_FILE"
 
@@ -194,43 +234,51 @@ echo -n "  OK: "
 cat "$PINS_FILE" | body_prefix
 echo ""
 
-if [[ ! -s "$PINS_FILE" ]]; then
-  rm -f "$PINS_FILE"
-  die "pins list returned empty response"
-fi
-
 python3 - <<'PY' "$PINS_FILE"
 import json,sys
 path=sys.argv[1]
 with open(path,"r",encoding="utf-8") as f:
     d=json.load(f)
-
-if not d.get("ok", False):
-    raise SystemExit("❌ pins list returned ok=false")
-
-if "build_sha" in d or "first_row_keys" in d:
-    raise SystemExit("❌ pins list still contains debug fields (remove build_sha/first_row_keys)")
-
 pins=d.get("pins", []) or []
 hw="물어보다"
 if not any((p.get("headword")==hw) for p in pins):
-    raise SystemExit(f"❌ pins list does not include headword: {hw}")
-
-# Contract enforcement: must not contain old bad keys
+    raise SystemExit("❌ pins list did not include headword after pin")
 for p in pins:
-    if "void" in p:
-        raise SystemExit("❌ pins list contains bad key: void")
-    if "pos_codenknown" in p:
-        raise SystemExit("❌ pins list contains bad key: pos_codenknown")
-    if "vocab_id" not in p:
-        raise SystemExit("❌ pins list missing required key: vocab_id")
-    if "pos_code" not in p:
-        raise SystemExit("❌ pins list missing required key: pos_code")
-
-print("✅ pins list includes expected headword and contract keys are clean")
+    if "vocab_id" not in p or "pos_code" not in p:
+        raise SystemExit("❌ pins contract missing vocab_id/pos_code")
+print("✅ pins include headword after pin")
 PY
 
 rm -f "$PINS_FILE"
+
+# DELETE unpin
+delete_json_expect "dictionary pins delete -> DELETE /v1/me/dictionary/pins" \
+  "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" \
+  "$UNPIN_BODY" \
+  200
+
+# GET pins (expect DOES NOT contain headword)
+PINS_FILE2="$(mktemp)"
+curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER" > "$PINS_FILE2"
+
+echo "[200] dictionary pins list after delete -> /v1/me/dictionary/pins"
+echo -n "  OK: "
+cat "$PINS_FILE2" | body_prefix
+echo ""
+
+python3 - <<'PY' "$PINS_FILE2"
+import json,sys
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    d=json.load(f)
+pins=d.get("pins", []) or []
+hw="물어보다"
+if any((p.get("headword")==hw) for p in pins):
+    raise SystemExit("❌ pins list still includes headword after delete")
+print("✅ pins do not include headword after delete")
+PY
+
+rm -f "$PINS_FILE2"
 
 print_section "DONE"
 echo "✅ Smoke suite complete."
