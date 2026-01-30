@@ -12,7 +12,7 @@ const pool = require("../db/pool");
 // POST /v1/me/dictionary/pins
 // Body: { headword: string, vocab_id?: uuid|null }
 router.post("/v1/me/dictionary/pins", requireSession, async (req, res) => {
-  const userId = req.user?.user_id;
+  const userId = req.user?.userID || req.userID || req.user?.user_id;
   if (!userId) {
     return res.status(401).json({ ok: false, error: "NO_SESSION" });
   }

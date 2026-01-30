@@ -11,7 +11,7 @@ const pool = require("../db/pool");
 
 // GET /v1/me/dictionary/pins
 router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
-  const userId = req.user?.user_id;
+  const userId = req.user?.userID || req.userID || req.user?.user_id;
   if (!userId) {
     return res.status(401).json({ ok: false, error: "NO_SESSION" });
   }
