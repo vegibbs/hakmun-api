@@ -1,9 +1,6 @@
-// routes/dictionary_pins.js
-//
-// DV2: My Dictionary (Pins) — READ PATH
-// - GET /v1/me/dictionary/pins
-//
-// Full replacement file.
+// FILE: hakmun-api/routes/dictionary_pins.js
+// PURPOSE: DV2 – My Dictionary pins (READ)
+// ENDPOINT: GET /v1/me/dictionary/pins
 
 const express = require("express");
 const router = express.Router();
@@ -12,24 +9,19 @@ const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
 
 function getUserId(req) {
-  // HakMun session payload uses userID (camelCase) as seen in /v1/session/whoami.
   return req.user?.userID || req.userID || req.user?.user_id || null;
 }
 
 function dbQuery(sql, params) {
-  // Support db being a Pool or { pool: Pool }
   if (db && typeof db.query === "function") return db.query(sql, params);
   if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
-  throw new Error("db/pool export does not provide a query() function");
+  throw new Error("db/pool export does not provide query()");
 }
 
-// GET /v1/me/dictionary/pins
 router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
-    if (!userId) {
-      return res.status(401).json({ ok: false, error: "NO_SESSION" });
-    }
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
     const sql = `
       SELECT
