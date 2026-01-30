@@ -23,16 +23,17 @@ router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
+    // NOTE: explicit aliases to prevent bad JSON keys
     const sql = `
       SELECT
-        p.created_at,
-        p.headword,
-        p.vocab_id AS vocab_id,
-        tv.lemma,
-        tv.part_of_speech,
-        tv.pos_code,
-        tv.pos_label,
-        vg.text AS gloss_en
+        p.created_at AS created_at,
+        p.headword   AS headword,
+        p.vocab_id   AS vocab_id,
+        tv.lemma     AS lemma,
+        tv.part_of_speech AS part_of_speech,
+        tv.pos_code  AS pos_code,
+        tv.pos_label AS pos_label,
+        vg.text      AS gloss_en
       FROM user_dictionary_pins p
       LEFT JOIN teaching_vocab tv
         ON tv.id = p.vocab_id
