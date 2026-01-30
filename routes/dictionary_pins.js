@@ -1,12 +1,11 @@
 // FILE: hakmun-api/routes/dictionary_pins.js
-// PURPOSE: DV2 – My Dictionary pins (READ) — normalize output keys defensively
+// PURPOSE: DV2 – My Dictionary pins (READ) — build marker + debug keys
 // ENDPOINT: GET /v1/me/dictionary/pins
 //
-// Why this exists:
-// - We observed unexpected keys in live responses ("void", "pos_codenknown") that
-//   are not present in the codebase anymore.
-// - To make the API contract stable, we normalize row keys explicitly before
-//   returning JSON.
+// TEMP DEBUG:
+// - Adds build_sha to prove which deploy is serving.
+// - Adds first_row_keys to show what the DB driver is returning.
+// Remove these debug fields once confirmed.
 
 const express = require("express");
 const router = express.Router();
@@ -25,10 +24,7 @@ function dbQuery(sql, params) {
 }
 
 function normalizePinRow(r) {
-  // Defensive normalization: accept either correct keys or the observed bad keys.
   const vocabId = r.vocab_id ?? r.void ?? null;
-
-  // pos_code fallback handles a previously-observed mangled key
   const posCode = r.pos_code ?? r.pos_codenknown ?? null;
 
   return {
@@ -70,9 +66,23 @@ router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
     `;
 
     const { rows } = await dbQuery(sql, [userId]);
+
+    const firstRowKeys = rows && rows.length ? Object.keys(rows[0]) : [];
     const pins = (rows || []).map(normalizePinRow);
 
-    return res.json({ ok: true, pins });
+    // Railway commonly exposes commit info in one of these env vars.
+    const buildSha =
+      process.env.RAILWAY_GIT_COMMIT_SHA ||
+      process.env.GITHUB_SHA ||
+      process.env.COMMIT_SHA ||
+      null;
+
+    return res.json({
+      ok: true,
+      build_sha: buildSha,
+      first_row_keys: firstRowKeys,
+      pins,
+    });
   } catch (err) {
     console.error("dictionary pins GET failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
