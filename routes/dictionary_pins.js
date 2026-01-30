@@ -3,10 +3,7 @@
 // DV2: My Dictionary (Pins) — READ PATH
 // - GET /v1/me/dictionary/pins
 //
-// Fix: db/pool export is not a pg.Pool instance (pool.query was undefined).
-// We use a dbQuery() wrapper that supports either:
-// - module exports a Pool directly with .query
-// - module exports { pool } where pool.query exists
+// Full replacement file.
 
 const express = require("express");
 const router = express.Router();
@@ -15,10 +12,12 @@ const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
 
 function getUserId(req) {
+  // HakMun session payload uses userID (camelCase) as seen in /v1/session/whoami.
   return req.user?.userID || req.userID || req.user?.user_id || null;
 }
 
 function dbQuery(sql, params) {
+  // Support db being a Pool or { pool: Pool }
   if (db && typeof db.query === "function") return db.query(sql, params);
   if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
   throw new Error("db/pool export does not provide a query() function");
@@ -36,7 +35,7 @@ router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
       SELECT
         p.created_at,
         p.headword,
-        p.vocab_id,
+        p.vocab_id AS vocab_id,
         tv.lemma,
         tv.part_of_speech,
         tv.pos_code,

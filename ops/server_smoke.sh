@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# FILE: hakmun-api/ops/server_smoke.sh
+# PURPOSE: Smoke test for HakMun API (local only)
 set -euo pipefail
 
 EXPECTED_REMOTE_SUBSTR="vegibbs/hakmun-api.git"
@@ -65,7 +67,8 @@ EXPIRES_IN="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print
 
 [[ -n "$TOKEN" ]] || die "Failed to mint token. Response: $(echo "$TOKEN_BODY" | body_prefix)"
 
-echo "✅ Token minted (expiresIn=${EXPIRES_IN:-?}s). Prefix: ${TOKEN:0:18}..."
+echo "✅ Token minted (expiresIn=${EXPIRES_IN}s)"
+echo "TOKEN=${TOKEN}"
 AUTH_HEADER="Authorization: Bearer $TOKEN"
 
 print_section "2) Smoke endpoints"
@@ -86,6 +89,38 @@ hit() {
   echo -n "  OK: "
   curl -sS "$url" -H "$AUTH_HEADER" | body_prefix
   echo ""
+}
+
+post_json_expect() {
+  local name="$1"
+  local url="$2"
+  local json_body="$3"
+  local expect="${4:-200}"
+
+  local resp_file
+  resp_file="$(mktemp)"
+
+  local code
+  code="$(curl -sS -o "$resp_file" -w "%{http_code}" -X POST "$url" \
+    -H "$AUTH_HEADER" \
+    -H "Content-Type: application/json" \
+    --data-binary "$json_body")"
+
+  echo "[$code] $name"
+  if [[ "$code" != "$expect" ]]; then
+    echo "  Body:"
+    cat "$resp_file" | body_prefix
+    echo ""
+    rm -f "$resp_file"
+    return 1
+  fi
+
+  echo -n "  OK: "
+  cat "$resp_file" | body_prefix
+  echo ""
+
+  rm -f "$resp_file"
+  return 0
 }
 
 post_reading_item() {
@@ -136,13 +171,51 @@ hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/
 hit "reading coverage -> /v1/reading-items/coverage" "$HAKMUN_API_BASE_URL/v1/reading-items/coverage"
 hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
 
-# Reading personal library (EPIC 4): list + create + list
+# Reading personal library: list + create + list
 hit "reading items (personal) -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
 
 READING_TEXT="Smoke test reading sentence $(date +%Y-%m-%dT%H:%M:%S)"
 post_reading_item "$READING_TEXT"
 
 hit "reading items (personal) after create -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
+
+# DV2: Dictionary pins (POST + GET + JSON assert)
+print_section "3) DV2 Dictionary pins"
+
+PIN_HEADWORD="물어보다"
+PIN_VOCAB_ID="8388aa27-d13c-4208-b0c1-2ff516dd9604"
+
+PIN_BODY="$(python3 - <<PY
+import json
+print(json.dumps({"headword": "$PIN_HEADWORD", "vocab_id": "$PIN_VOCAB_ID"}))
+PY
+)"
+
+post_json_expect "dictionary pins create -> POST /v1/me/dictionary/pins" \
+  "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" \
+  "$PIN_BODY" \
+  200
+
+PINS_JSON="$(curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER")"
+
+echo "[200] dictionary pins list -> /v1/me/dictionary/pins"
+echo -n "  OK: "
+echo "$PINS_JSON" | body_prefix
+echo ""
+
+[[ -n "$PINS_JSON" ]] || die "pins list returned empty response"
+
+echo "$PINS_JSON" | python3 - <<'PY'
+import json,sys
+d=json.load(sys.stdin)
+if not d.get("ok", False):
+    raise SystemExit("❌ pins list returned ok=false")
+pins=d.get("pins", []) or []
+hw="물어보다"
+if not any((p.get("headword")==hw) for p in pins):
+    raise SystemExit(f"❌ pins list does not include headword: {hw}")
+print("✅ pins list includes expected headword")
+PY
 
 print_section "DONE"
 echo "✅ Smoke suite complete."
