@@ -1,12 +1,11 @@
-// routes/dictionary_pins_write.js
+// FILE: hakmun-api/routes/dictionary_pins_write.js
+// PURPOSE: DV2/DV3 – Pin a word AND record exposure
+// ENDPOINT: POST /v1/me/dictionary/pins
 //
-// DV2: My Dictionary (Pins) — WRITE PATH
-// - POST /v1/me/dictionary/pins
-//
-// Fix: db/pool export is not a pg.Pool instance (pool.query was undefined).
-// We use a dbQuery() wrapper that supports either:
-// - module exports a Pool directly with .query
-// - module exports { pool } where pool.query exists
+// Behavior:
+// - Idempotently insert pin
+// - Record exposure (source_kind = 'pin')
+// - Upsert user_vocab_items (monotonic membership)
 
 const express = require("express");
 const router = express.Router();
@@ -23,20 +22,16 @@ function isUuidLike(v) {
 }
 
 function dbQuery(sql, params) {
-  // Support db being a Pool or { pool: Pool }
   if (db && typeof db.query === "function") return db.query(sql, params);
   if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
-  throw new Error("db/pool export does not provide a query() function");
+  throw new Error("db/pool export does not provide query()");
 }
 
 // POST /v1/me/dictionary/pins
-// Body: { headword: string, vocab_id?: uuid|null }
 router.post("/v1/me/dictionary/pins", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
-    if (!userId) {
-      return res.status(401).json({ ok: false, error: "NO_SESSION" });
-    }
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
     const headword = typeof req.body?.headword === "string" ? req.body.headword.trim() : "";
     const vocabIdRaw = req.body?.vocab_id ?? null;
@@ -46,20 +41,74 @@ router.post("/v1/me/dictionary/pins", requireSession, async (req, res) => {
     }
 
     let vocabId = null;
-    if (vocabIdRaw !== null && vocabIdRaw !== undefined && String(vocabIdRaw).trim() !== "") {
+    if (vocabIdRaw !== null && String(vocabIdRaw).trim() !== "") {
       if (!isUuidLike(vocabIdRaw)) {
         return res.status(400).json({ ok: false, error: "INVALID_VOCAB_ID" });
       }
       vocabId = String(vocabIdRaw);
     }
 
-    const sql = `
+    // 1) Pin (idempotent)
+    await dbQuery(
+      `
       INSERT INTO user_dictionary_pins (user_id, headword, vocab_id)
       VALUES ($1::uuid, $2::text, $3::uuid)
       ON CONFLICT (user_id, headword) DO NOTHING
-    `;
+      `,
+      [userId, headword, vocabId]
+    );
 
-    await dbQuery(sql, [userId, headword, vocabId]);
+    // 2) Record exposure (append-only)
+    await dbQuery(
+      `
+      INSERT INTO user_vocab_exposures (
+        exposure_id,
+        user_id,
+        lemma,
+        surface,
+        vocab_id,
+        source_kind,
+        source_id
+      )
+      VALUES (
+        gen_random_uuid(),
+        $1::uuid,
+        $2::text,
+        $2::text,
+        $3::uuid,
+        'pin',
+        NULL
+      )
+      `,
+      [userId, headword, vocabId]
+    );
+
+    // 3) Upsert personal vocab item (monotonic membership)
+    await dbQuery(
+      `
+      INSERT INTO user_vocab_items (
+        user_id,
+        lemma,
+        vocab_id,
+        first_seen_at,
+        last_seen_at,
+        seen_count
+      )
+      VALUES (
+        $1::uuid,
+        $2::text,
+        $3::uuid,
+        now(),
+        now(),
+        1
+      )
+      ON CONFLICT (user_id, lemma)
+      DO UPDATE SET
+        last_seen_at = EXCLUDED.last_seen_at,
+        seen_count = user_vocab_items.seen_count + 1
+      `,
+      [userId, headword, vocabId]
+    );
 
     return res.json({ ok: true });
   } catch (err) {
