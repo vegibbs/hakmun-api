@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FILE: hakmun-api/ops/server_smoke.sh
-# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins POST+GET checks.
+# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins POST+GET checks (contract enforced).
 
 set -euo pipefail
 
@@ -69,7 +69,6 @@ EXPIRES_IN="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print
 [[ -n "$TOKEN" ]] || die "Failed to mint token. Response: $(echo "$TOKEN_BODY" | body_prefix)"
 
 echo "✅ Token minted (expiresIn=${EXPIRES_IN}s)"
-echo "TOKEN=${TOKEN}"
 AUTH_HEADER="Authorization: Bearer $TOKEN"
 
 print_section "2) Smoke endpoints"
@@ -160,7 +159,6 @@ PY
   return 0
 }
 
-# Baseline endpoints
 hit "whoami -> /v1/session/whoami" "$HAKMUN_API_BASE_URL/v1/session/whoami"
 hit "library/global -> /v1/library/global" "$HAKMUN_API_BASE_URL/v1/library/global"
 hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/library/review-inbox"
@@ -168,7 +166,6 @@ hit "reading coverage -> /v1/reading-items/coverage" "$HAKMUN_API_BASE_URL/v1/re
 hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
 
 hit "reading items (personal) -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
-
 READING_TEXT="Smoke test reading sentence $(date +%Y-%m-%dT%H:%M:%S)"
 post_reading_item "$READING_TEXT"
 hit "reading items (personal) after create -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
@@ -189,27 +186,51 @@ post_json_expect "dictionary pins create -> POST /v1/me/dictionary/pins" \
   "$PIN_BODY" \
   200
 
-PINS_JSON="$(curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER")"
+PINS_FILE="$(mktemp)"
+curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER" > "$PINS_FILE"
 
 echo "[200] dictionary pins list -> /v1/me/dictionary/pins"
 echo -n "  OK: "
-echo "$PINS_JSON" | body_prefix
+cat "$PINS_FILE" | body_prefix
 echo ""
 
-[[ -n "$PINS_JSON" ]] || die "pins list returned empty response"
+if [[ ! -s "$PINS_FILE" ]]; then
+  rm -f "$PINS_FILE"
+  die "pins list returned empty response"
+fi
 
-# Strict check without fragile heredoc parsing
-echo "$PINS_JSON" | python3 - <<'PY'
+python3 - <<'PY' "$PINS_FILE"
 import json,sys
-d=json.load(sys.stdin)
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    d=json.load(f)
+
 if not d.get("ok", False):
     raise SystemExit("❌ pins list returned ok=false")
+
+if "build_sha" in d or "first_row_keys" in d:
+    raise SystemExit("❌ pins list still contains debug fields (remove build_sha/first_row_keys)")
+
 pins=d.get("pins", []) or []
 hw="물어보다"
-if not any(p.get("headword")==hw for p in pins):
+if not any((p.get("headword")==hw) for p in pins):
     raise SystemExit(f"❌ pins list does not include headword: {hw}")
-print("✅ pins list includes expected headword")
+
+# Contract enforcement: must not contain old bad keys
+for p in pins:
+    if "void" in p:
+        raise SystemExit("❌ pins list contains bad key: void")
+    if "pos_codenknown" in p:
+        raise SystemExit("❌ pins list contains bad key: pos_codenknown")
+    if "vocab_id" not in p:
+        raise SystemExit("❌ pins list missing required key: vocab_id")
+    if "pos_code" not in p:
+        raise SystemExit("❌ pins list missing required key: pos_code")
+
+print("✅ pins list includes expected headword and contract keys are clean")
 PY
+
+rm -f "$PINS_FILE"
 
 print_section "DONE"
 echo "✅ Smoke suite complete."

@@ -1,11 +1,14 @@
 // FILE: hakmun-api/routes/dictionary_pins.js
-// PURPOSE: DV2 – My Dictionary pins (READ) — build marker + debug keys
+// PURPOSE: DV2 – My Dictionary pins (READ) — final contract
 // ENDPOINT: GET /v1/me/dictionary/pins
 //
-// TEMP DEBUG:
-// - Adds build_sha to prove which deploy is serving.
-// - Adds first_row_keys to show what the DB driver is returning.
-// Remove these debug fields once confirmed.
+// Contract:
+// {
+//   ok: true,
+//   pins: [
+//     { created_at, headword, vocab_id, lemma, part_of_speech, pos_code, pos_label, gloss_en }
+//   ]
+// }
 
 const express = require("express");
 const router = express.Router();
@@ -21,22 +24,6 @@ function dbQuery(sql, params) {
   if (db && typeof db.query === "function") return db.query(sql, params);
   if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
   throw new Error("db/pool export does not provide query()");
-}
-
-function normalizePinRow(r) {
-  const vocabId = r.vocab_id ?? r.void ?? null;
-  const posCode = r.pos_code ?? r.pos_codenknown ?? null;
-
-  return {
-    created_at: r.created_at ?? null,
-    headword: r.headword ?? null,
-    vocab_id: vocabId,
-    lemma: r.lemma ?? null,
-    part_of_speech: r.part_of_speech ?? null,
-    pos_code: posCode,
-    pos_label: r.pos_label ?? null,
-    gloss_en: r.gloss_en ?? null,
-  };
 }
 
 router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
@@ -66,23 +53,7 @@ router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
     `;
 
     const { rows } = await dbQuery(sql, [userId]);
-
-    const firstRowKeys = rows && rows.length ? Object.keys(rows[0]) : [];
-    const pins = (rows || []).map(normalizePinRow);
-
-    // Railway commonly exposes commit info in one of these env vars.
-    const buildSha =
-      process.env.RAILWAY_GIT_COMMIT_SHA ||
-      process.env.GITHUB_SHA ||
-      process.env.COMMIT_SHA ||
-      null;
-
-    return res.json({
-      ok: true,
-      build_sha: buildSha,
-      first_row_keys: firstRowKeys,
-      pins,
-    });
+    return res.json({ ok: true, pins: rows || [] });
   } catch (err) {
     console.error("dictionary pins GET failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
