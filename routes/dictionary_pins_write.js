@@ -3,24 +3,30 @@
 // DV2: My Dictionary (Pins) — WRITE PATH
 // - POST /v1/me/dictionary/pins
 //
-// Notes:
-// - Uses the same session model as existing endpoints (req.user.userID).
-// - Returns JSON on errors (no HTML 500 pages).
-// - Does not yet implement "pin => personal vocab exposure" (DV3).
+// Fix: db/pool export is not a pg.Pool instance (pool.query was undefined).
+// We use a dbQuery() wrapper that supports either:
+// - module exports a Pool directly with .query
+// - module exports { pool } where pool.query exists
 
 const express = require("express");
 const router = express.Router();
 
 const { requireSession } = require("../auth/session");
-const pool = require("../db/pool");
+const db = require("../db/pool");
 
 function getUserId(req) {
-  // HakMun session payload uses userID (camelCase) as seen in /v1/session/whoami.
   return req.user?.userID || req.userID || req.user?.user_id || null;
 }
 
 function isUuidLike(v) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v));
+}
+
+function dbQuery(sql, params) {
+  // Support db being a Pool or { pool: Pool }
+  if (db && typeof db.query === "function") return db.query(sql, params);
+  if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
+  throw new Error("db/pool export does not provide a query() function");
 }
 
 // POST /v1/me/dictionary/pins
@@ -53,7 +59,7 @@ router.post("/v1/me/dictionary/pins", requireSession, async (req, res) => {
       ON CONFLICT (user_id, headword) DO NOTHING
     `;
 
-    await pool.query(sql, [userId, headword, vocabId]);
+    await dbQuery(sql, [userId, headword, vocabId]);
 
     return res.json({ ok: true });
   } catch (err) {

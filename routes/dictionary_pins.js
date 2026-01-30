@@ -3,18 +3,25 @@
 // DV2: My Dictionary (Pins) — READ PATH
 // - GET /v1/me/dictionary/pins
 //
-// Notes:
-// - Uses the same session model as existing endpoints (req.user.userID).
-// - Enriches pins with teaching_vocab + primary EN gloss when vocab_id is present.
+// Fix: db/pool export is not a pg.Pool instance (pool.query was undefined).
+// We use a dbQuery() wrapper that supports either:
+// - module exports a Pool directly with .query
+// - module exports { pool } where pool.query exists
 
 const express = require("express");
 const router = express.Router();
 
 const { requireSession } = require("../auth/session");
-const pool = require("../db/pool");
+const db = require("../db/pool");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
+}
+
+function dbQuery(sql, params) {
+  if (db && typeof db.query === "function") return db.query(sql, params);
+  if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
+  throw new Error("db/pool export does not provide a query() function");
 }
 
 // GET /v1/me/dictionary/pins
@@ -46,7 +53,7 @@ router.get("/v1/me/dictionary/pins", requireSession, async (req, res) => {
       ORDER BY p.created_at DESC
     `;
 
-    const { rows } = await pool.query(sql, [userId]);
+    const { rows } = await dbQuery(sql, [userId]);
     return res.json({ ok: true, pins: rows });
   } catch (err) {
     console.error("dictionary pins GET failed:", err);
