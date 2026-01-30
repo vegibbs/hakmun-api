@@ -61,6 +61,7 @@ app.use(require("./routes/library"));
 app.use(require("./routes/reading"));
 app.use(require("./routes/generate"));
 app.use(require("./routes/dictionary_pins"));
+app.use(require("./routes/dictionary_pins_write"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
