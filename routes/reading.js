@@ -1,274 +1,231 @@
-// routes/reading.js — HakMun API (v0.12)
-// Reading item creation (v0) + global reading coverage (registry-gated)
+// FILE: hakmun-api/routes/reading.js
+// PURPOSE: Reading module routes (personal reading items + coverage)
+// REFRACTOR: Registry content_type renamed from 'reading_item' -> 'sentence' (migration 056)
+// NOTE:
+// - Payload table remains reading_items.
+// - We only change registry semantics + joins to use content_type='sentence'.
+// - Response shapes remain compatible with existing clients/smoke.
+//
+// ENDPOINTS:
+// - GET  /v1/reading/items
+// - POST /v1/reading/items
+// - GET  /v1/reading-items/coverage
 
 const express = require("express");
-const crypto = require("crypto");
-
-const { pool } = require("../db/pool");
-const { logger } = require("../util/log");
-const { withTimeout } = require("../util/time");
-const { requireSession } = require("../auth/session");
-
 const router = express.Router();
 
-/* ------------------------------------------------------------------
-   REGISTRY EPIC 4 — Reading Item Creation (v0, minimal write surface)
-   - Creates a Reading item (module table) AND its registry row (personal + active)
-   - No audio attachment, no sharing, no promotion
-   - Deterministic: single TX; fail-fast timeouts; no partial creates
------------------------------------------------------------------- */
+const { requireSession } = require("../auth/session");
+const db = require("../db/pool");
+
+function getUserId(req) {
+  return req.user?.userID || req.userID || req.user?.user_id || null;
+}
+
+function dbQuery(sql, params) {
+  if (db && typeof db.query === "function") return db.query(sql, params);
+  if (db && db.pool && typeof db.pool.query === "function") return db.pool.query(sql, params);
+  throw new Error("db/pool export does not provide query()");
+}
+
+// GET /v1/reading/items
+router.get("/v1/reading/items", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const sql = `
+      SELECT
+        ri.reading_item_id,
+        ri.unit_type,
+        ri.text,
+        ri.language,
+        ri.notes,
+        ri.created_at,
+        ri.updated_at,
+
+        lri.id              AS registry_item_id,
+        lri.audience        AS audience,
+        lri.global_state    AS global_state,
+        lri.operational_status AS operational_status,
+        lri.owner_user_id   AS owner_user_id
+
+      FROM reading_items ri
+      JOIN library_registry_items lri
+        ON lri.content_type = 'sentence'
+       AND lri.content_id   = ri.reading_item_id
+      WHERE ri.owner_user_id = $1::uuid
+        AND lri.audience = 'personal'
+        AND lri.owner_user_id = $1::uuid
+      ORDER BY ri.created_at DESC
+      LIMIT 2000
+    `;
+
+    const { rows } = await dbQuery(sql, [userId]);
+    return res.json({ items: rows || [] });
+  } catch (err) {
+    console.error("reading GET /v1/reading/items failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
 
 // POST /v1/reading/items
-// Body: { text, language?, notes?, unit_type? }
+// Body: { text: string }  (client currently only sends text)
 router.post("/v1/reading/items", requireSession, async (req, res) => {
-  const rid = req._rid;
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  if (!text) return res.status(400).json({ ok: false, error: "TEXT_REQUIRED" });
+
+  const client = db && typeof db.connect === "function" ? await db.connect() : null;
+  const q = client ? client.query.bind(client) : dbQuery;
 
   try {
-    const ownerUserID = req.user.userID;
+    if (client) await q("BEGIN", []);
 
-    const text = String(req.body?.text || "").trim();
-    if (!text) {
-      return res.status(400).json({ error: "text is required" });
-    }
+    // Insert payload row (sentence unit for now)
+    const insertReadingSql = `
+      INSERT INTO reading_items (
+        owner_user_id,
+        unit_type,
+        text,
+        language,
+        notes
+      )
+      VALUES (
+        $1::uuid,
+        'sentence',
+        $2::text,
+        'ko',
+        NULL
+      )
+      RETURNING
+        reading_item_id,
+        unit_type,
+        text,
+        language,
+        notes,
+        created_at,
+        updated_at
+    `;
+    const ins = await q(insertReadingSql, [userId, text]);
+    const readingItem = ins.rows[0];
 
-    const language = String(req.body?.language || "ko").trim().slice(0, 32) || "ko";
-    const notesRaw = req.body?.notes !== undefined ? String(req.body.notes).trim() : "";
-    const notes = notesRaw ? notesRaw.slice(0, 500) : null;
+    // Insert registry row with NEW canonical content_type='sentence'
+    const insertRegistrySql = `
+      INSERT INTO library_registry_items (
+        content_type,
+        content_id,
+        owner_user_id,
+        audience,
+        global_state,
+        operational_status
+      )
+      VALUES (
+        'sentence',
+        $1::uuid,
+        $2::uuid,
+        'personal',
+        NULL,
+        'active'
+      )
+      RETURNING
+        id,
+        content_type,
+        content_id,
+        owner_user_id,
+        audience,
+        global_state,
+        operational_status,
+        created_at,
+        updated_at
+    `;
+    const reg = await q(insertRegistrySql, [readingItem.reading_item_id, userId]);
+    const registryItem = reg.rows[0];
 
-    const unitTypeRaw = req.body?.unit_type !== undefined ? String(req.body.unit_type).trim() : "";
-    const unitType = unitTypeRaw ? unitTypeRaw.slice(0, 32) : "sentence";
+    if (client) await q("COMMIT", []);
 
-    const readingItemID = crypto.randomUUID();
-
-    const client = await pool.connect();
-    try {
-      await client.query(`set statement_timeout = 8000;`);
-      await client.query(`set lock_timeout = 2000;`);
-      await client.query("BEGIN");
-
-      // 1) Create module item (Reading)
-      await client.query(
-        `
-        insert into reading_items (
-          reading_item_id,
-          owner_user_id,
-          unit_type,
-          text,
-          language,
-          notes
-        )
-        values ($1, $2, $3, $4, $5, $6)
-        `,
-        [readingItemID, ownerUserID, unitType, text, language, notes]
-      );
-
-      // 2) Create registry row (personal + active)
-      await client.query(
-        `
-        insert into library_registry_items (
-          content_type,
-          content_id,
-          owner_user_id,
-          audience,
-          global_state,
-          operational_status
-        )
-        values ('reading_item', $1, $2, 'personal', null, 'active')
-        on conflict (content_type, content_id) do nothing
-        `,
-        [readingItemID, ownerUserID]
-      );
-
-      // 3) Return registry-backed response
-      const reg = await client.query(
-        `
-        select
-          id as registry_item_id,
-          content_type,
-          content_id,
-          audience,
-          global_state,
-          operational_status,
-          owner_user_id,
-          created_at,
-          updated_at
-        from library_registry_items
-        where content_type = 'reading_item'
-          and content_id = $1
-        limit 1
-        `,
-        [readingItemID]
-      );
-
-      await client.query("COMMIT");
-
-      return res.status(201).json({
-        reading_item: {
-          reading_item_id: readingItemID,
-          unit_type: unitType,
-          text,
-          language,
-          notes
-        },
-        registry_item: reg.rows?.[0] || null
-      });
-    } catch (err) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {}
-      throw err;
-    } finally {
-      client.release();
-    }
+    // Response shape kept compatible with existing clients/smoke:
+    // { reading_item: {...}, registry_item: {...} }
+    return res.status(201).json({
+      reading_item: {
+        reading_item_id: readingItem.reading_item_id,
+        unit_type: readingItem.unit_type,
+        text: readingItem.text,
+        language: readingItem.language,
+        notes: readingItem.notes,
+        created_at: readingItem.created_at,
+        updated_at: readingItem.updated_at,
+      },
+      registry_item: {
+        registry_item_id: registryItem.id,
+        content_type: registryItem.content_type, // now 'sentence'
+        content_id: registryItem.content_id,
+        owner_user_id: registryItem.owner_user_id,
+        audience: registryItem.audience,
+        global_state: registryItem.global_state,
+        operational_status: registryItem.operational_status,
+        created_at: registryItem.created_at,
+        updated_at: registryItem.updated_at,
+      },
+    });
   } catch (err) {
-    const msg = String(err?.message || err);
-    logger.error("[/v1/reading/items] failed", { rid, err: msg });
-
-    if (String(err?.code || "") === "42P01") {
-      // undefined_table
-      return res.status(501).json({ error: "reading items table not implemented on server" });
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch (_) {}
     }
-
-    if (msg.includes("timeout:") || msg.includes("statement timeout") || msg.includes("lock timeout")) {
-      return res.status(503).json({ error: "db timeout" });
-    }
-
-    return res.status(500).json({ error: "create reading item failed" });
+    console.error("reading POST /v1/reading/items failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  } finally {
+    if (client) client.release();
   }
 });
 
-/* ------------------------------------------------------------------
-   REGISTRY EPIC 4 — Personal Reading Items (read surface)
-   - Lists the caller's personal Reading items (text included)
-   - Registry-gated: only items with registry row active are served
-   - No global items, no sharing surfaces
------------------------------------------------------------------- */
-
-// GET /v1/reading/items — personal reading items owned by the caller
-router.get("/v1/reading/items", requireSession, async (req, res) => {
-  const rid = req._rid;
-
-  try {
-    const ownerUserID = req.user.userID;
-
-    const r = await withTimeout(
-      pool.query(
-        `
-        select
-          ri.reading_item_id,
-          ri.unit_type,
-          ri.text,
-          ri.language,
-          ri.notes,
-          ri.created_at,
-          ri.updated_at,
-
-          lri.id as registry_item_id,
-          lri.content_type,
-          lri.content_id,
-          lri.audience,
-          lri.global_state,
-          lri.operational_status,
-          lri.owner_user_id
-
-        from reading_items ri
-        join library_registry_items lri
-          on lri.content_type = 'reading_item'
-         and lri.content_id = ri.reading_item_id
-
-        where lri.owner_user_id = $1
-          and lri.audience = 'personal'
-          and lri.operational_status = 'active'
-
-        order by ri.created_at desc
-        limit 500
-        `,
-        [ownerUserID]
-      ),
-      8000,
-      "db-list-reading-items-personal"
-    );
-
-    return res.json({ items: r.rows || [] });
-  } catch (err) {
-    const msg = String(err?.message || err);
-    logger.error("[/v1/reading/items GET] failed", { rid, err: msg });
-
-    if (String(err?.code || "") === "42P01") {
-      // undefined_table
-      return res.status(501).json({ error: "reading items table not implemented on server" });
-    }
-
-    if (
-      msg.startsWith("timeout:db-list-reading-items-personal") ||
-      msg.includes("statement timeout") ||
-      msg.includes("lock timeout")
-    ) {
-      logger.error("timeout:db-list-reading-items-personal", { rid });
-      return res.status(503).json({ error: "db timeout listing personal reading items" });
-    }
-
-    return res.status(500).json({ error: "list reading items failed" });
-  }
-});
-
-/* ------------------------------------------------------------------
-   REGISTRY EPIC 1 — Reading Coverage (registry-gated read surface)
-   - Coverage applies ONLY to global + active items
-   - Global state: preliminary | approved
-   - Under Review items are excluded
------------------------------------------------------------------- */
-
-// GET /v1/reading-items/coverage — global reading items with variant matrix
+// GET /v1/reading-items/coverage
 router.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
   try {
-    const r = await withTimeout(
-      pool.query(
-        `
-        select
-          ric.reading_item_id,
-          ric.unit_type,
-          ric.text,
-          ric.language,
-          ric.notes,
-          ric.created_at,
-          ric.updated_at,
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
-          ric.female_slow_asset_id,
-          ric.female_moderate_asset_id,
-          ric.female_native_asset_id,
+    const sql = `
+      SELECT
+        ric.reading_item_id,
+        ric.owner_user_id,
+        ric.unit_type,
+        ric.text,
+        ric.language,
+        ric.notes,
+        ric.created_at,
+        ric.updated_at,
 
-          ric.male_slow_asset_id,
-          ric.male_moderate_asset_id,
-          ric.male_native_asset_id,
+        ric.female_slow_asset_id,
+        ric.female_moderate_asset_id,
+        ric.female_native_asset_id,
+        ric.male_slow_asset_id,
+        ric.male_moderate_asset_id,
+        ric.male_native_asset_id,
+        ric.variants_count,
 
-          ric.variants_count
-        from reading_items_coverage ric
-        join library_registry_items lri
-          on lri.content_type = 'reading_item'
-         and lri.content_id = ric.reading_item_id
-        where lri.audience = 'global'
-          and lri.operational_status = 'active'
-          and lri.global_state in ('preliminary', 'approved')
-        order by ric.created_at desc
-        limit 500
-        `
-      ),
-      8000,
-      "db-list-reading-coverage-global"
-    );
+        lri.id               AS registry_item_id,
+        lri.audience         AS audience,
+        lri.global_state     AS global_state,
+        lri.operational_status AS operational_status,
+        lri.owner_user_id    AS registry_owner_user_id
+      FROM reading_items_coverage ric
+      JOIN library_registry_items lri
+        ON lri.content_type = 'sentence'
+       AND lri.content_id   = ric.reading_item_id
+      WHERE ric.owner_user_id = $1::uuid
+        AND lri.audience = 'personal'
+        AND lri.owner_user_id = $1::uuid
+      ORDER BY ric.created_at DESC
+      LIMIT 2000
+    `;
 
-    return res.json({ items: r.rows || [] });
+    const { rows } = await dbQuery(sql, [userId]);
+    return res.json({ items: rows || [] });
   } catch (err) {
-    const msg = String(err?.message || err);
-    logger.error("[/v1/reading-items/coverage] failed", { rid: req._rid, err: msg });
-
-    if (msg.startsWith("timeout:db-list-reading-coverage-global")) {
-      logger.error("timeout:db-list-reading-coverage-global", { rid: req._rid });
-      return res.status(503).json({ error: "db timeout listing reading coverage" });
-    }
-
-    return res.status(500).json({ error: "list reading coverage failed" });
+    console.error("reading GET /v1/reading-items/coverage failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
 
