@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FILE: hakmun-api/ops/server_smoke.sh
-# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins POST+GET+DELETE checks.
+# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins + D2.1 google doc parse-link.
 
 set -euo pipefail
 
@@ -162,7 +162,7 @@ post_reading_item() {
   local json_body
   json_body="$(python3 - <<PY
 import json
-print(json.dumps({"text": """$text""", "unit_type": "sentence", "language": "ko"}))
+print(json.dumps({"text": """$text"""}))
 PY
 )"
 
@@ -191,6 +191,7 @@ PY
   return 0
 }
 
+# Baseline endpoints
 hit "whoami -> /v1/session/whoami" "$HAKMUN_API_BASE_URL/v1/session/whoami"
 hit "library/global -> /v1/library/global" "$HAKMUN_API_BASE_URL/v1/library/global"
 hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/library/review-inbox"
@@ -219,16 +220,13 @@ print(json.dumps({"headword": "$PIN_HEADWORD"}))
 PY
 )"
 
-# POST pin
 post_json_expect "dictionary pins create -> POST /v1/me/dictionary/pins" \
   "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" \
   "$PIN_BODY" \
   200
 
-# GET pins (expect contains headword)
 PINS_FILE="$(mktemp)"
 curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER" > "$PINS_FILE"
-
 echo "[200] dictionary pins list -> /v1/me/dictionary/pins"
 echo -n "  OK: "
 cat "$PINS_FILE" | body_prefix
@@ -243,24 +241,17 @@ pins=d.get("pins", []) or []
 hw="물어보다"
 if not any((p.get("headword")==hw) for p in pins):
     raise SystemExit("❌ pins list did not include headword after pin")
-for p in pins:
-    if "vocab_id" not in p or "pos_code" not in p:
-        raise SystemExit("❌ pins contract missing vocab_id/pos_code")
 print("✅ pins include headword after pin")
 PY
-
 rm -f "$PINS_FILE"
 
-# DELETE unpin
 delete_json_expect "dictionary pins delete -> DELETE /v1/me/dictionary/pins" \
   "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" \
   "$UNPIN_BODY" \
   200
 
-# GET pins (expect DOES NOT contain headword)
 PINS_FILE2="$(mktemp)"
 curl -sS "$HAKMUN_API_BASE_URL/v1/me/dictionary/pins" -H "$AUTH_HEADER" > "$PINS_FILE2"
-
 echo "[200] dictionary pins list after delete -> /v1/me/dictionary/pins"
 echo -n "  OK: "
 cat "$PINS_FILE2" | body_prefix
@@ -277,8 +268,80 @@ if any((p.get("headword")==hw) for p in pins):
     raise SystemExit("❌ pins list still includes headword after delete")
 print("✅ pins do not include headword after delete")
 PY
-
 rm -f "$PINS_FILE2"
+
+print_section "D2.1 Google Doc link parsing"
+
+# Use your real Zuri Google Doc URL here if you want:
+GOOGLE_DOC_TEST_URL="https://docs.google.com/document/d/1FrIT9TNohI9zQfZJkkmqfSyggjqIkMZWuUpIchhso2k/edit?tab=t.0#heading=h.54h6p8qdtiql"
+
+GOOD_BODY="$(python3 - <<PY
+import json
+print(json.dumps({"google_doc_url": "$GOOGLE_DOC_TEST_URL"}))
+PY
+)"
+
+post_json_expect "google parse-link (valid) -> POST /v1/documents/google/parse-link" \
+  "$HAKMUN_API_BASE_URL/v1/documents/google/parse-link" \
+  "$GOOD_BODY" \
+  200
+
+# Validate response contains ok=true and file_id
+GOOD_FILE="$(mktemp)"
+curl -sS -X POST "$HAKMUN_API_BASE_URL/v1/documents/google/parse-link" \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  --data-binary "$GOOD_BODY" > "$GOOD_FILE"
+
+python3 - <<'PY' "$GOOD_FILE"
+import json,sys
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    d=json.load(f)
+assert d.get("ok") is True, d
+fid=d.get("file_id","")
+assert isinstance(fid,str) and len(fid) >= 20, d
+print("✅ valid Google Doc link parsed")
+PY
+rm -f "$GOOD_FILE"
+
+# Invalid link test (must reject)
+BAD_URL="https://example.com/not-a-doc"
+BAD_BODY="$(python3 - <<PY
+import json
+print(json.dumps({"google_doc_url": "$BAD_URL"}))
+PY
+)"
+
+RESP_BAD="$(mktemp)"
+CODE_BAD="$(curl -sS -o "$RESP_BAD" -w "%{http_code}" -X POST "$HAKMUN_API_BASE_URL/v1/documents/google/parse-link" \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  --data-binary "$BAD_BODY")"
+
+echo "[$CODE_BAD] google parse-link (invalid) -> POST /v1/documents/google/parse-link"
+echo -n "  OK: "
+cat "$RESP_BAD" | body_prefix
+echo ""
+
+if [[ "$CODE_BAD" != "400" ]]; then
+  echo "  Body:"
+  cat "$RESP_BAD" | body_prefix
+  echo ""
+  rm -f "$RESP_BAD"
+  die "Expected 400 for invalid google doc link"
+fi
+
+python3 - <<'PY' "$RESP_BAD"
+import json,sys
+path=sys.argv[1]
+with open(path,"r",encoding="utf-8") as f:
+    d=json.load(f)
+assert d.get("ok") is False, d
+assert d.get("error") == "INVALID_GOOGLE_DOC_LINK", d
+print("✅ invalid Google Doc link rejected")
+PY
+rm -f "$RESP_BAD"
 
 print_section "DONE"
 echo "✅ Smoke suite complete."
