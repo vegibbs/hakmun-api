@@ -1,8 +1,8 @@
 // FILE: hakmun-api/routes/google_oauth.js
 // PURPOSE: D2.2 — Google OAuth connect (per-user) for Google Docs import
 // ENDPOINTS:
-//   GET /v1/auth/google/start
-//   GET /v1/auth/google/callback
+//   GET /v1/auth/google/start        (API mode: returns auth_url JSON)
+//   GET /v1/auth/google/callback     (Google redirects here; stores tokens)
 //
 // Scope policy (locked): drive.readonly
 //
@@ -13,7 +13,7 @@
 //   GOOGLE_OAUTH_STATE_SECRET      (random secret for signing state)
 //
 // DB:
-//   google_oauth_connections (already created by migration 062)
+//   google_oauth_connections (migration 062)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -63,7 +63,6 @@ function verifyState(state, secret) {
   const expectedSig = crypto.createHmac("sha256", secret).update(payloadB64).digest();
   const expectedSigB64 = b64url(expectedSig);
 
-  // timing-safe compare
   const a = Buffer.from(sigB64);
   const b = Buffer.from(expectedSigB64);
   if (a.length !== b.length) return null;
@@ -78,6 +77,8 @@ function verifyState(state, secret) {
 }
 
 // GET /v1/auth/google/start
+// Auth required (Bearer token).
+// Returns JSON with auth_url for the client to open in a browser.
 router.get("/v1/auth/google/start", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -90,13 +91,8 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
     const scope = "https://www.googleapis.com/auth/drive.readonly";
     const nonce = crypto.randomBytes(16).toString("hex");
 
-    // State is signed; contains user_id + nonce + timestamp.
     const state = signState(
-      {
-        uid: userId,
-        nonce,
-        ts: Date.now(),
-      },
+      { uid: userId, nonce, ts: Date.now() },
       stateSecret
     );
 
@@ -105,14 +101,14 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
       redirect_uri: redirectUri,
       response_type: "code",
       scope,
-      access_type: "offline", // request refresh_token
-      prompt: "consent",      // force refresh_token issuance more reliably
+      access_type: "offline",
+      prompt: "consent",
       include_granted_scopes: "true",
       state,
     });
 
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-    return res.redirect(authUrl);
+    return res.json({ ok: true, auth_url: authUrl });
   } catch (err) {
     console.error("google oauth start failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
@@ -126,12 +122,8 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     const state = typeof req.query?.state === "string" ? req.query.state : "";
     const oauthError = typeof req.query?.error === "string" ? req.query.error : "";
 
-    if (oauthError) {
-      return res.status(400).send(`Google OAuth error: ${oauthError}`);
-    }
-    if (!code) {
-      return res.status(400).send("Missing code");
-    }
+    if (oauthError) return res.status(400).send(`Google OAuth error: ${oauthError}`);
+    if (!code) return res.status(400).send("Missing code");
 
     const clientId = mustEnv("GOOGLE_OAUTH_CLIENT_ID");
     const clientSecret = mustEnv("GOOGLE_OAUTH_CLIENT_SECRET");
@@ -139,12 +131,9 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     const stateSecret = mustEnv("GOOGLE_OAUTH_STATE_SECRET");
 
     const parsed = verifyState(state, stateSecret);
-    if (!parsed || !parsed.uid) {
-      return res.status(400).send("Invalid state");
-    }
+    if (!parsed || !parsed.uid) return res.status(400).send("Invalid state");
     const userId = parsed.uid;
 
-    // Exchange code for tokens
     const tokenParams = new URLSearchParams({
       code,
       client_id: clientId,
@@ -169,12 +158,8 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     const refreshToken = tokenJson.refresh_token || null;
     const expiresIn = tokenJson.expires_in || null;
     const scopeStr = tokenJson.scope || "https://www.googleapis.com/auth/drive.readonly";
-
     const expiresAt = expiresIn ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString() : null;
 
-    // Upsert connection
-    // - If refresh_token is not returned (Google sometimes omits it on re-consent),
-    //   keep existing refresh_token if present; otherwise fail.
     const existing = await dbQuery(
       `SELECT refresh_token FROM google_oauth_connections WHERE user_id = $1::uuid`,
       [userId]
@@ -192,13 +177,7 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     await dbQuery(
       `
       INSERT INTO google_oauth_connections (
-        user_id,
-        scopes,
-        refresh_token,
-        access_token,
-        access_token_expires_at,
-        created_at,
-        updated_at
+        user_id, scopes, refresh_token, access_token, access_token_expires_at, created_at, updated_at
       )
       VALUES ($1::uuid, $2::text, $3::text, $4::text, $5::timestamptz, now(), now())
       ON CONFLICT (user_id)
@@ -212,7 +191,6 @@ router.get("/v1/auth/google/callback", async (req, res) => {
       [userId, scopeStr, finalRefresh, accessToken, expiresAt]
     );
 
-    // Minimal user-facing response
     return res.status(200).send("Google connected. You can return to HakMun.");
   } catch (err) {
     console.error("google oauth callback failed:", err);
