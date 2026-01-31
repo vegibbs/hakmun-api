@@ -66,6 +66,7 @@ app.use(require("./routes/dictionary_pins_delete"));
 app.use(require("./routes/my_vocab"));
 app.use(require("./routes/dictionary_sets"));
 app.use(require("./routes/google_docs"));
+app.use(require("./routes/google_oauth"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
