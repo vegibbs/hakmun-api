@@ -69,6 +69,7 @@ app.use(require("./routes/google_docs"));
 app.use(require("./routes/google_oauth"));
 app.use(require("./routes/google_docs_import"));
 app.use(require("./routes/google_docs_view"));
+app.use(require("./routes/google_docs_ingest"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
