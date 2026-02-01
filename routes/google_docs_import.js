@@ -1,33 +1,9 @@
 // FILE: hakmun-api/routes/google_docs_import.js
 // PURPOSE: D2.3 — Import Google Doc by link (export -> asset -> document -> parse_run -> job enqueue)
-// ENDPOINT:
-//   POST /v1/documents/google/import-link
-//
-// Behavior:
-// - Requires user session (Bearer)
-// - Uses per-user google_oauth_connections to export a Google Doc to DOCX
-// - Stores exported bytes in bucket as a media_assets row (no URLs persisted)
-// - Creates documents row (source_kind=google_doc)
-// - Creates document_parse_runs row (status=running)
-// - Enqueues docparse_jobs row (status=queued)
-// - Returns IDs immediately (async; no parsing inline)
-//
-// ENV REQUIRED (already used by google_oauth.js):
-//   GOOGLE_OAUTH_CLIENT_ID
-//   GOOGLE_OAUTH_CLIENT_SECRET
-//
-// ENV REQUIRED (storage; already used by routes/assets.js):
-//   OBJECT_STORAGE_ENDPOINT
-//   OBJECT_STORAGE_BUCKET
-//   OBJECT_STORAGE_ACCESS_KEY_ID
-//   OBJECT_STORAGE_SECRET_ACCESS_KEY
-//   OBJECT_STORAGE_REGION (optional)
 
 const express = require("express");
 const crypto = require("crypto");
-
 const { PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
-
 const { requireSession } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
@@ -103,7 +79,7 @@ async function refreshAccessToken(refreshToken) {
 
   const json = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(`google_refresh_failed:${JSON.stringify(json).slice(0, 300)}`);
+    throw new Error(`google_refresh_failed:${JSON.stringify(json).slice(0, 500)}`);
   }
 
   return {
@@ -113,8 +89,12 @@ async function refreshAccessToken(refreshToken) {
   };
 }
 
+// IMPORTANT: supportsAllDrives=true so Shared Drives work
 async function googleDriveGetMeta(fileId, accessToken) {
-  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,modifiedTime,mimeType`;
+  const url =
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
+    `?fields=id,name,modifiedTime,mimeType&supportsAllDrives=true`;
+
   const resp = await fetch(url, {
     method: "GET",
     headers: { Authorization: `Bearer ${accessToken}` }
@@ -122,14 +102,23 @@ async function googleDriveGetMeta(fileId, accessToken) {
 
   const json = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(`google_files_get_failed:${JSON.stringify(json).slice(0, 300)}`);
+    // Keep detail in logs; return a stable error to client.
+    logger.error("[google-import][files.get] failed", {
+      fileId,
+      status: resp.status,
+      body: JSON.stringify(json).slice(0, 500)
+    });
+    throw new Error("google_files_get_failed");
   }
   return json;
 }
 
+// IMPORTANT: supportsAllDrives=true so Shared Drives work
 async function googleDriveExportDocx(fileId, accessToken) {
   const mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent(mime)}`;
+  const url =
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export` +
+    `?mimeType=${encodeURIComponent(mime)}&supportsAllDrives=true`;
 
   const resp = await fetch(url, {
     method: "GET",
@@ -138,7 +127,12 @@ async function googleDriveExportDocx(fileId, accessToken) {
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
-    throw new Error(`google_export_failed:${txt.slice(0, 300)}`);
+    logger.error("[google-import][export] failed", {
+      fileId,
+      status: resp.status,
+      body: txt.slice(0, 500)
+    });
+    throw new Error("google_export_failed");
   }
 
   const ab = await resp.arrayBuffer();
@@ -161,7 +155,6 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
     const fileId = extractGoogleDocFileId(googleDocUrl);
     if (!fileId) return res.status(400).json({ ok: false, error: "INVALID_GOOGLE_DOC_LINK" });
 
-    // Get OAuth connection
     const connR = await withTimeout(
       pool.query(
         `SELECT refresh_token, access_token, access_token_expires_at, scopes
@@ -179,11 +172,10 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
       return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
     }
 
-    // Decide whether access token is usable
     let accessToken = conn.access_token || null;
     const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
     const now = Date.now();
-    const stillValid = accessToken && expiresAt && (expiresAt - now > 60_000); // 60s buffer
+    const stillValid = accessToken && expiresAt && (expiresAt - now > 60_000);
 
     if (!stillValid) {
       const refreshed = await refreshAccessToken(conn.refresh_token);
@@ -205,19 +197,23 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
       );
     }
 
-    // Fetch metadata (title)
     const meta = await googleDriveGetMeta(fileId, accessToken);
-    const title = (typeof req.body?.title === "string" && req.body.title.trim())
-      ? String(req.body.title).trim().slice(0, 140)
-      : String(meta?.name || "Google Doc").slice(0, 140);
 
-    // Export DOCX bytes
+    const title =
+      (typeof req.body?.title === "string" && req.body.title.trim())
+        ? String(req.body.title).trim().slice(0, 140)
+        : String(meta?.name || "Google Doc").slice(0, 140);
+
     const exported = await googleDriveExportDocx(fileId, accessToken);
 
-    // Hard cap for v0 evidence size (can raise later); avoid bucket abuse.
-    const MAX_DOCX_BYTES = 200 * 1024 * 1024; // 200MB
+    const MAX_DOCX_BYTES = 200 * 1024 * 1024;
     if (exported.size_bytes > MAX_DOCX_BYTES) {
-      return res.status(413).json({ ok: false, error: "DOC_TOO_LARGE", size_bytes: exported.size_bytes, max_bytes: MAX_DOCX_BYTES });
+      return res.status(413).json({
+        ok: false,
+        error: "DOC_TOO_LARGE",
+        size_bytes: exported.size_bytes,
+        max_bytes: MAX_DOCX_BYTES
+      });
     }
 
     const assetId = crypto.randomUUID();
@@ -225,7 +221,6 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
 
     logger.info("[google-import][start]", { rid: req._rid, userId, fileId, assetId, size_bytes: exported.size_bytes });
 
-    // Put to bucket
     const s3 = makeS3Client();
     await withTimeout(
       s3.send(
@@ -241,17 +236,11 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
       "s3-put-google-docx"
     );
 
-    // Insert media_assets row (reuse existing assets scheme)
     await withTimeout(
       pool.query(
         `
         INSERT INTO media_assets (
-          asset_id,
-          owner_user_id,
-          object_key,
-          mime_type,
-          size_bytes,
-          title
+          asset_id, owner_user_id, object_key, mime_type, size_bytes, title
         )
         VALUES ($1,$2,$3,$4,$5,$6)
         `,
@@ -261,19 +250,12 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
       "db-insert-asset"
     );
 
-    // Create documents row
     const documentId = crypto.randomUUID();
     await withTimeout(
       pool.query(
         `
         INSERT INTO documents (
-          document_id,
-          owner_user_id,
-          asset_id,
-          source_kind,
-          source_uri,
-          title,
-          ingest_status
+          document_id, owner_user_id, asset_id, source_kind, source_uri, title, ingest_status
         )
         VALUES ($1,$2,$3,'google_doc',$4,$5,'pending')
         `,
@@ -283,15 +265,12 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
       "db-insert-document"
     );
 
-    // Create parse run + job (queued)
     const parseRunId = crypto.randomUUID();
     const parserVersion = "docparse-0.1";
     await withTimeout(
       pool.query(
         `
-        INSERT INTO document_parse_runs (
-          parse_run_id, document_id, parser_version, status
-        )
+        INSERT INTO document_parse_runs (parse_run_id, document_id, parser_version, status)
         VALUES ($1,$2,$3,'running')
         `,
         [parseRunId, documentId, parserVersion]
@@ -311,9 +290,7 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
     await withTimeout(
       pool.query(
         `
-        INSERT INTO docparse_jobs (
-          job_id, parse_run_id, document_id, status, payload, available_at
-        )
+        INSERT INTO docparse_jobs (job_id, parse_run_id, document_id, status, payload, available_at)
         VALUES ($1,$2,$3,'queued',$4::jsonb, now())
         `,
         [jobId, parseRunId, documentId, JSON.stringify(payload)]
@@ -339,8 +316,9 @@ router.post("/v1/documents/google/import-link", requireSession, async (req, res)
     if (msg.startsWith("timeout:s3-put-google-docx")) return res.status(503).json({ ok: false, error: "OBJECT_STORAGE_TIMEOUT" });
     if (msg.startsWith("timeout:db-")) return res.status(503).json({ ok: false, error: "DB_TIMEOUT" });
     if (msg.startsWith("google_refresh_failed:")) return res.status(401).json({ ok: false, error: "GOOGLE_REFRESH_FAILED" });
-    if (msg.startsWith("google_files_get_failed:")) return res.status(403).json({ ok: false, error: "GOOGLE_FILES_GET_FAILED" });
-    if (msg.startsWith("google_export_failed:")) return res.status(403).json({ ok: false, error: "GOOGLE_EXPORT_FAILED" });
+
+    if (msg === "google_files_get_failed") return res.status(403).json({ ok: false, error: "GOOGLE_FILES_GET_FAILED" });
+    if (msg === "google_export_failed") return res.status(403).json({ ok: false, error: "GOOGLE_EXPORT_FAILED" });
 
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
