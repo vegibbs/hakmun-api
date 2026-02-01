@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # FILE: hakmun-api/ops/server_smoke.sh
-# PURPOSE: Smoke test HakMun API (local only). Includes DV2 pins + D2.1 google doc parse-link.
+# PURPOSE: Smoke test HakMun API (local only).
+# - Baseline: whoami, library, assets
+# - Canonical content items: list + create + coverage (NO /v1/reading/*)
+# - DV2 dictionary pins (POST + GET + DELETE + GET)
+# - D2.1 google doc parse-link (valid + invalid)
 
 set -euo pipefail
 
@@ -68,7 +72,11 @@ EXPIRES_IN="$(python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print
 
 [[ -n "$TOKEN" ]] || die "Failed to mint token. Response: $(echo "$TOKEN_BODY" | body_prefix)"
 
+# -------------------------------------------------------------------
+# 🔒 INVARIANT: ALWAYS PRINT ACCESS TOKEN
+# -------------------------------------------------------------------
 echo "✅ Token minted (expiresIn=${EXPIRES_IN}s)"
+echo "TOKEN=$TOKEN"
 AUTH_HEADER="Authorization: Bearer $TOKEN"
 
 print_section "2) Smoke endpoints"
@@ -155,53 +163,36 @@ delete_json_expect() {
   return 0
 }
 
-post_reading_item() {
-  local text="$1"
-  local url="$HAKMUN_API_BASE_URL/v1/reading/items"
-
-  local json_body
-  json_body="$(python3 - <<PY
-import json
-print(json.dumps({"text": """$text"""}))
-PY
-)"
-
-  local resp_file
-  resp_file="$(mktemp)"
-
-  local code
-  code="$(curl -sS -o "$resp_file" -w "%{http_code}" -X POST "$url" \
-    -H "$AUTH_HEADER" \
-    -H "Content-Type: application/json" \
-    --data-binary "$json_body")"
-
-  echo "[$code] reading create -> POST /v1/reading/items"
-  if [[ "$code" != "201" ]]; then
-    echo "  Body:"
-    cat "$resp_file" | body_prefix
-    echo ""
-    rm -f "$resp_file"
-    return 1
-  fi
-
-  echo -n "  OK: "
-  cat "$resp_file" | body_prefix
-  echo ""
-  rm -f "$resp_file"
-  return 0
-}
-
 # Baseline endpoints
 hit "whoami -> /v1/session/whoami" "$HAKMUN_API_BASE_URL/v1/session/whoami"
 hit "library/global -> /v1/library/global" "$HAKMUN_API_BASE_URL/v1/library/global"
 hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/library/review-inbox"
-hit "reading coverage -> /v1/reading-items/coverage" "$HAKMUN_API_BASE_URL/v1/reading-items/coverage"
 hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
 
-hit "reading items (personal) -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
-READING_TEXT="Smoke test reading sentence $(date +%Y-%m-%dT%H:%M:%S)"
-post_reading_item "$READING_TEXT"
-hit "reading items (personal) after create -> /v1/reading/items" "$HAKMUN_API_BASE_URL/v1/reading/items"
+# Canonical content items (sentences)
+hit "content items (sentences) -> /v1/content/items?content_type=sentence" \
+  "$HAKMUN_API_BASE_URL/v1/content/items?content_type=sentence"
+
+CONTENT_TEXT="Smoke test sentence $(date +%Y-%m-%dT%H:%M:%S)"
+CONTENT_BODY="$(python3 - <<PY
+import json
+print(json.dumps({
+  "content_type": "sentence",
+  "text": "$CONTENT_TEXT"
+}))
+PY
+)"
+
+post_json_expect "content item create -> POST /v1/content/items" \
+  "$HAKMUN_API_BASE_URL/v1/content/items" \
+  "$CONTENT_BODY" \
+  201
+
+hit "content items (sentences) after create -> /v1/content/items?content_type=sentence" \
+  "$HAKMUN_API_BASE_URL/v1/content/items?content_type=sentence"
+
+hit "content coverage (sentences) -> /v1/content/items/coverage?content_type=sentence" \
+  "$HAKMUN_API_BASE_URL/v1/content/items/coverage?content_type=sentence"
 
 print_section "3) DV2 Dictionary pins (POST + GET + DELETE + GET)"
 
@@ -272,7 +263,6 @@ rm -f "$PINS_FILE2"
 
 print_section "D2.1 Google Doc link parsing"
 
-# Use your real Zuri Google Doc URL here if you want:
 GOOGLE_DOC_TEST_URL="https://docs.google.com/document/d/1FrIT9TNohI9zQfZJkkmqfSyggjqIkMZWuUpIchhso2k/edit?tab=t.0#heading=h.54h6p8qdtiql"
 
 GOOD_BODY="$(python3 - <<PY
@@ -286,7 +276,6 @@ post_json_expect "google parse-link (valid) -> POST /v1/documents/google/parse-l
   "$GOOD_BODY" \
   200
 
-# Validate response contains ok=true and file_id
 GOOD_FILE="$(mktemp)"
 curl -sS -X POST "$HAKMUN_API_BASE_URL/v1/documents/google/parse-link" \
   -H "$AUTH_HEADER" \
@@ -305,7 +294,6 @@ print("✅ valid Google Doc link parsed")
 PY
 rm -f "$GOOD_FILE"
 
-# Invalid link test (must reject)
 BAD_URL="https://example.com/not-a-doc"
 BAD_BODY="$(python3 - <<PY
 import json
