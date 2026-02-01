@@ -36,7 +36,9 @@ function normalizeContentType(v) {
   return null;
 }
 
+// ------------------------------------------------------------------
 // GET /v1/content/items?content_type=sentence
+// ------------------------------------------------------------------
 router.get("/v1/content/items", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -78,8 +80,10 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------------
 // POST /v1/content/items
 // Body: { content_type: "sentence", text: "..." }
+// ------------------------------------------------------------------
 router.post("/v1/content/items", requireSession, async (req, res) => {
   const userId = getUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -106,8 +110,10 @@ router.post("/v1/content/items", requireSession, async (req, res) => {
 
     const reg = await q(
       `
-      INSERT INTO library_registry_items (content_type, content_id, owner_user_id, audience, global_state, operational_status)
-      VALUES ($1::text, $2::uuid, $3::uuid, 'personal', NULL, 'active')
+      INSERT INTO library_registry_items
+        (content_type, content_id, owner_user_id, audience, global_state, operational_status)
+      VALUES
+        ($1::text, $2::uuid, $3::uuid, 'personal', NULL, 'active')
       RETURNING id, audience, global_state, operational_status
       `,
       [item.content_type, item.content_item_id, userId]
@@ -143,7 +149,13 @@ router.post("/v1/content/items", requireSession, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------------
 // GET /v1/content/items/coverage?content_type=sentence
+//
+// Capability-only surface:
+// - answers module participation (e.g., Listening)
+// - MUST NOT expose content or lifecycle fields
+// ------------------------------------------------------------------
 router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -154,13 +166,7 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
     const sql = `
       SELECT
         cic.content_item_id,
-        cic.owner_user_id,
         cic.content_type,
-        cic.text,
-        cic.language,
-        cic.notes,
-        cic.created_at,
-        cic.updated_at,
 
         cic.female_slow_asset_id,
         cic.female_moderate_asset_id,
@@ -172,7 +178,7 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
       FROM content_items_coverage cic
       WHERE cic.owner_user_id = $1::uuid
         AND cic.content_type = $2::text
-      ORDER BY cic.created_at DESC
+      ORDER BY cic.content_item_id
       LIMIT 2000
     `;
 

@@ -99,6 +99,11 @@ hit() {
   echo ""
 }
 
+# Negative: /v1/reading must not exist
+hit "reading items must be gone -> /v1/reading/items" \
+  "$HAKMUN_API_BASE_URL/v1/reading/items" \
+  404
+
 post_json_expect() {
   local name="$1"
   local url="$2"
