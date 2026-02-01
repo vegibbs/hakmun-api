@@ -58,7 +58,10 @@ app.use(require("./routes/handles"));
 
 app.use(require("./routes/admin"));
 app.use(require("./routes/library"));
-app.use(require("./routes/reading"));
+
+// Canonical content item API (replaces reading-owned objects)
+app.use(require("./routes/content_items"));
+
 app.use(require("./routes/generate"));
 app.use(require("./routes/dictionary_pins"));
 app.use(require("./routes/dictionary_pins_write"));

@@ -1,13 +1,17 @@
-// FILE: hakmun-api/routes/reading.js
-// End-state: Reading view over canonical content_items (content_type='sentence').
-// DB (Postico 063+064):
-// - content_items(content_item_id, content_type, text, language, notes, ...)
-// - content_items_coverage(content_item_id, content_type, ...)
-// - no reading_items tables remain
+// FILE: hakmun-api/routes/content_items.js
+// PURPOSE: Canonical Content Items API (no module-owned objects)
+// ENDPOINTS:
+//   GET  /v1/content/items?content_type=sentence
+//   POST /v1/content/items
+//   GET  /v1/content/items/coverage?content_type=sentence
 //
-// API contract (end-state):
-// - identifiers use content_item_id
-// - no reading_item_id anywhere
+// Canonical identifiers:
+// - content_item_id (UUID)
+// - content_type: sentence | paragraph | passage | pattern (pattern later)
+//
+// Registry:
+// - library_registry_items content_type matches content_items.content_type
+// - audience/global_state/operational_status live in registry
 
 const express = require("express");
 const router = express.Router();
@@ -25,11 +29,20 @@ function dbQuery(sql, params) {
   throw new Error("db/pool export does not provide query()");
 }
 
-// GET /v1/reading/items
-router.get("/v1/reading/items", requireSession, async (req, res) => {
+function normalizeContentType(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return null;
+  if (["sentence", "paragraph", "passage", "pattern"].includes(s)) return s;
+  return null;
+}
+
+// GET /v1/content/items?content_type=sentence
+router.get("/v1/content/items", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const contentType = normalizeContentType(req.query?.content_type) || "sentence";
 
     const sql = `
       SELECT
@@ -48,28 +61,30 @@ router.get("/v1/reading/items", requireSession, async (req, res) => {
         lri.owner_user_id      AS registry_owner_user_id
       FROM content_items ci
       JOIN library_registry_items lri
-        ON lri.content_type = 'sentence'
+        ON lri.content_type = ci.content_type
        AND lri.content_id   = ci.content_item_id
       WHERE ci.owner_user_id = $1::uuid
-        AND ci.content_type = 'sentence'
+        AND ci.content_type = $2::text
         AND lri.audience = 'personal'
       ORDER BY ci.created_at DESC
       LIMIT 2000
     `;
 
-    const { rows } = await dbQuery(sql, [userId]);
+    const { rows } = await dbQuery(sql, [userId, contentType]);
     return res.json({ ok: true, items: rows || [] });
   } catch (err) {
-    console.error("reading list failed:", err);
+    console.error("content items list failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
 
-// POST /v1/reading/items
-router.post("/v1/reading/items", requireSession, async (req, res) => {
+// POST /v1/content/items
+// Body: { content_type: "sentence", text: "..." }
+router.post("/v1/content/items", requireSession, async (req, res) => {
   const userId = getUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
+  const contentType = normalizeContentType(req.body?.content_type) || "sentence";
   const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
   if (!text) return res.status(400).json({ ok: false, error: "TEXT_REQUIRED" });
 
@@ -82,20 +97,20 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
     const ins = await q(
       `
       INSERT INTO content_items (owner_user_id, content_type, text, language, notes)
-      VALUES ($1::uuid, 'sentence', $2::text, 'ko', NULL)
+      VALUES ($1::uuid, $2::text, $3::text, 'ko', NULL)
       RETURNING content_item_id, content_type, text, language, notes, created_at, updated_at
       `,
-      [userId, text]
+      [userId, contentType, text]
     );
     const item = ins.rows[0];
 
     const reg = await q(
       `
       INSERT INTO library_registry_items (content_type, content_id, owner_user_id, audience, global_state, operational_status)
-      VALUES ('sentence', $1::uuid, $2::uuid, 'personal', NULL, 'active')
+      VALUES ($1::text, $2::uuid, $3::uuid, 'personal', NULL, 'active')
       RETURNING id, audience, global_state, operational_status
       `,
-      [item.content_item_id, userId]
+      [item.content_type, item.content_item_id, userId]
     );
     const registry = reg.rows[0];
 
@@ -121,18 +136,20 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
     if (client) {
       try { await client.query("ROLLBACK"); } catch (_) {}
     }
-    console.error("reading create failed:", err);
+    console.error("content items create failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   } finally {
     if (client) client.release();
   }
 });
 
-// GET /v1/reading-items/coverage
-router.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
+// GET /v1/content/items/coverage?content_type=sentence
+router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const contentType = normalizeContentType(req.query?.content_type) || "sentence";
 
     const sql = `
       SELECT
@@ -154,15 +171,15 @@ router.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
         cic.variants_count
       FROM content_items_coverage cic
       WHERE cic.owner_user_id = $1::uuid
-        AND cic.content_type = 'sentence'
+        AND cic.content_type = $2::text
       ORDER BY cic.created_at DESC
       LIMIT 2000
     `;
 
-    const { rows } = await dbQuery(sql, [userId]);
+    const { rows } = await dbQuery(sql, [userId, contentType]);
     return res.json({ ok: true, items: rows || [] });
   } catch (err) {
-    console.error("reading coverage failed:", err);
+    console.error("content items coverage failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
