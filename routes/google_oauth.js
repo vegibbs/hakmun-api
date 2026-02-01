@@ -1,19 +1,12 @@
 // FILE: hakmun-api/routes/google_oauth.js
-// PURPOSE: D2.2 — Google OAuth connect (per-user) for Google Docs import
+// PURPOSE: D2.2 — Google OAuth connect (per-user) for Google Docs import/view
 // ENDPOINTS:
-//   GET /v1/auth/google/start        (API mode: returns auth_url JSON)
-//   GET /v1/auth/google/callback     (Google redirects here; stores tokens)
+//   GET /v1/auth/google/start        (returns auth_url JSON)
+//   GET /v1/auth/google/callback     (stores tokens)
 //
-// Scope policy (locked): drive.readonly
-//
-// ENV REQUIRED:
-//   GOOGLE_OAUTH_CLIENT_ID
-//   GOOGLE_OAUTH_CLIENT_SECRET
-//   GOOGLE_OAUTH_REDIRECT_URI      (must match Google console; e.g. https://.../v1/auth/google/callback)
-//   GOOGLE_OAUTH_STATE_SECRET      (random secret for signing state)
-//
-// DB:
-//   google_oauth_connections (migration 062)
+// Scopes (locked):
+// - drive.readonly (file access + export metadata)
+// - documents.readonly (Docs API read-only viewer)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -77,8 +70,6 @@ function verifyState(state, secret) {
 }
 
 // GET /v1/auth/google/start
-// Auth required (Bearer token).
-// Returns JSON with auth_url for the client to open in a browser.
 router.get("/v1/auth/google/start", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -88,13 +79,13 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
     const redirectUri = mustEnv("GOOGLE_OAUTH_REDIRECT_URI");
     const stateSecret = mustEnv("GOOGLE_OAUTH_STATE_SECRET");
 
-    const scope = "https://www.googleapis.com/auth/drive.readonly";
-    const nonce = crypto.randomBytes(16).toString("hex");
+    const scope = [
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/documents.readonly"
+    ].join(" ");
 
-    const state = signState(
-      { uid: userId, nonce, ts: Date.now() },
-      stateSecret
-    );
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const state = signState({ uid: userId, nonce, ts: Date.now() }, stateSecret);
 
     const params = new URLSearchParams({
       client_id: clientId,
@@ -104,7 +95,7 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "true",
-      state,
+      state
     });
 
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
@@ -139,13 +130,13 @@ router.get("/v1/auth/google/callback", async (req, res) => {
       client_id: clientId,
       client_secret: clientSecret,
       redirect_uri: redirectUri,
-      grant_type: "authorization_code",
+      grant_type: "authorization_code"
     });
 
     const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: tokenParams.toString(),
+      body: tokenParams.toString()
     });
 
     const tokenJson = await tokenResp.json().catch(() => ({}));
@@ -157,7 +148,8 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     const accessToken = tokenJson.access_token || null;
     const refreshToken = tokenJson.refresh_token || null;
     const expiresIn = tokenJson.expires_in || null;
-    const scopeStr = tokenJson.scope || "https://www.googleapis.com/auth/drive.readonly";
+    const scopeStr = tokenJson.scope || "";
+
     const expiresAt = expiresIn ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString() : null;
 
     const existing = await dbQuery(
