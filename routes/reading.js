@@ -1,15 +1,19 @@
 // FILE: hakmun-api/routes/reading.js
-// PURPOSE: Reading module routes (personal reading items + coverage)
-// REFRACTOR: Registry content_type renamed from 'reading_item' -> 'sentence' (migration 056)
-// NOTE:
-// - Payload table remains reading_items.
-// - We only change registry semantics + joins to use content_type='sentence'.
-// - Response shapes remain compatible with existing clients/smoke.
+// PURPOSE: Reading module routes (personal items + coverage)
+// NOTE (Postico 063):
+// - reading_items renamed -> content_items
+// - reading_items_coverage renamed -> content_items_coverage
+// - PK column reading_item_id renamed -> content_item_id
+// - audio variants table renamed -> content_item_audio_variants (used only by the view)
 //
-// ENDPOINTS:
-// - GET  /v1/reading/items
-// - POST /v1/reading/items
-// - GET  /v1/reading-items/coverage
+// Registry semantics (Postico 056):
+// - library_registry_items.content_type = 'sentence' for sentence content
+//
+// IMPORTANT:
+// - Reading is a module view over canonical content items.
+// - We keep response keys compatible with existing clients for now:
+//   * still return reading_item_id in JSON, mapped from content_item_id
+//   * still return { reading_item, registry_item } on create
 
 const express = require("express");
 const router = express.Router();
@@ -35,28 +39,28 @@ router.get("/v1/reading/items", requireSession, async (req, res) => {
 
     const sql = `
       SELECT
-        ri.reading_item_id,
-        ri.unit_type,
-        ri.text,
-        ri.language,
-        ri.notes,
-        ri.created_at,
-        ri.updated_at,
+        ci.content_item_id AS reading_item_id,
+        ci.unit_type,
+        ci.text,
+        ci.language,
+        ci.notes,
+        ci.created_at,
+        ci.updated_at,
 
-        lri.id              AS registry_item_id,
-        lri.audience        AS audience,
-        lri.global_state    AS global_state,
+        lri.id                 AS registry_item_id,
+        lri.audience           AS audience,
+        lri.global_state       AS global_state,
         lri.operational_status AS operational_status,
-        lri.owner_user_id   AS owner_user_id
+        lri.owner_user_id      AS owner_user_id
 
-      FROM reading_items ri
+      FROM content_items ci
       JOIN library_registry_items lri
         ON lri.content_type = 'sentence'
-       AND lri.content_id   = ri.reading_item_id
-      WHERE ri.owner_user_id = $1::uuid
+       AND lri.content_id   = ci.content_item_id
+      WHERE ci.owner_user_id = $1::uuid
         AND lri.audience = 'personal'
         AND lri.owner_user_id = $1::uuid
-      ORDER BY ri.created_at DESC
+      ORDER BY ci.created_at DESC
       LIMIT 2000
     `;
 
@@ -69,7 +73,7 @@ router.get("/v1/reading/items", requireSession, async (req, res) => {
 });
 
 // POST /v1/reading/items
-// Body: { text: string }  (client currently only sends text)
+// Body: { text: string }
 router.post("/v1/reading/items", requireSession, async (req, res) => {
   const userId = getUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -83,9 +87,9 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
   try {
     if (client) await q("BEGIN", []);
 
-    // Insert payload row (sentence unit for now)
-    const insertReadingSql = `
-      INSERT INTO reading_items (
+    // Insert canonical content item (unit_type remains legacy column name)
+    const insertContentSql = `
+      INSERT INTO content_items (
         owner_user_id,
         unit_type,
         text,
@@ -100,7 +104,7 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
         NULL
       )
       RETURNING
-        reading_item_id,
+        content_item_id,
         unit_type,
         text,
         language,
@@ -108,10 +112,10 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
         created_at,
         updated_at
     `;
-    const ins = await q(insertReadingSql, [userId, text]);
-    const readingItem = ins.rows[0];
+    const ins = await q(insertContentSql, [userId, text]);
+    const item = ins.rows[0];
 
-    // Insert registry row with NEW canonical content_type='sentence'
+    // Insert registry row (content_type='sentence')
     const insertRegistrySql = `
       INSERT INTO library_registry_items (
         content_type,
@@ -140,34 +144,33 @@ router.post("/v1/reading/items", requireSession, async (req, res) => {
         created_at,
         updated_at
     `;
-    const reg = await q(insertRegistrySql, [readingItem.reading_item_id, userId]);
+    const reg = await q(insertRegistrySql, [item.content_item_id, userId]);
     const registryItem = reg.rows[0];
 
     if (client) await q("COMMIT", []);
 
-    // Response shape kept compatible with existing clients/smoke:
-    // { reading_item: {...}, registry_item: {...} }
+    // Response shape compatible with existing iOS client
     return res.status(201).json({
       reading_item: {
-        reading_item_id: readingItem.reading_item_id,
-        unit_type: readingItem.unit_type,
-        text: readingItem.text,
-        language: readingItem.language,
-        notes: readingItem.notes,
-        created_at: readingItem.created_at,
-        updated_at: readingItem.updated_at,
+        reading_item_id: item.content_item_id,
+        unit_type: item.unit_type,
+        text: item.text,
+        language: item.language,
+        notes: item.notes,
+        created_at: item.created_at,
+        updated_at: item.updated_at
       },
       registry_item: {
         registry_item_id: registryItem.id,
-        content_type: registryItem.content_type, // now 'sentence'
+        content_type: registryItem.content_type, // 'sentence'
         content_id: registryItem.content_id,
         owner_user_id: registryItem.owner_user_id,
         audience: registryItem.audience,
         global_state: registryItem.global_state,
         operational_status: registryItem.operational_status,
         created_at: registryItem.created_at,
-        updated_at: registryItem.updated_at,
-      },
+        updated_at: registryItem.updated_at
+      }
     });
   } catch (err) {
     if (client) {
@@ -188,36 +191,37 @@ router.get("/v1/reading-items/coverage", requireSession, async (req, res) => {
 
     const sql = `
       SELECT
-        ric.reading_item_id,
-        ric.owner_user_id,
-        ric.unit_type,
-        ric.text,
-        ric.language,
-        ric.notes,
-        ric.created_at,
-        ric.updated_at,
+        cic.content_item_id AS reading_item_id,
+        cic.owner_user_id,
+        cic.unit_type,
+        cic.text,
+        cic.language,
+        cic.notes,
+        cic.created_at,
+        cic.updated_at,
 
-        ric.female_slow_asset_id,
-        ric.female_moderate_asset_id,
-        ric.female_native_asset_id,
-        ric.male_slow_asset_id,
-        ric.male_moderate_asset_id,
-        ric.male_native_asset_id,
-        ric.variants_count,
+        cic.female_slow_asset_id,
+        cic.female_moderate_asset_id,
+        cic.female_native_asset_id,
+        cic.male_slow_asset_id,
+        cic.male_moderate_asset_id,
+        cic.male_native_asset_id,
+        cic.variants_count,
 
-        lri.id               AS registry_item_id,
-        lri.audience         AS audience,
-        lri.global_state     AS global_state,
+        lri.id                 AS registry_item_id,
+        lri.audience           AS audience,
+        lri.global_state       AS global_state,
         lri.operational_status AS operational_status,
-        lri.owner_user_id    AS registry_owner_user_id
-      FROM reading_items_coverage ric
+        lri.owner_user_id      AS registry_owner_user_id
+
+      FROM content_items_coverage cic
       JOIN library_registry_items lri
         ON lri.content_type = 'sentence'
-       AND lri.content_id   = ric.reading_item_id
-      WHERE ric.owner_user_id = $1::uuid
+       AND lri.content_id   = cic.content_item_id
+      WHERE cic.owner_user_id = $1::uuid
         AND lri.audience = 'personal'
         AND lri.owner_user_id = $1::uuid
-      ORDER BY ric.created_at DESC
+      ORDER BY cic.created_at DESC
       LIMIT 2000
     `;
 
