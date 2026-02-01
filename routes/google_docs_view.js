@@ -1,0 +1,230 @@
+// FILE: hakmun-api/routes/google_docs_view.js
+// PURPOSE: D2.3a — Read-only Google Doc viewer (Docs API)
+// ENDPOINT:
+//   GET /v1/documents/google/view?google_doc_url=...
+//
+// Behavior:
+// - Requires user session (Bearer)
+// - Uses per-user google_oauth_connections
+// - Refreshes access token as needed
+// - Fetches doc via Google Docs API
+// - Returns a bounded, renderable block list + headings for navigation
+//
+// Notes:
+// - This does NOT export DOCX.
+// - This is read-only and works for very large docs by returning a partial view.
+
+const express = require("express");
+const { requireSession } = require("../auth/session");
+const { pool } = require("../db/pool");
+const { logger } = require("../util/log");
+const { withTimeout } = require("../util/time");
+
+const router = express.Router();
+
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) throw new Error(`Missing env var: ${name}`);
+  return String(v).trim();
+}
+
+function getUserId(req) {
+  return req.user?.userID || req.userID || req.user?.user_id || null;
+}
+
+function extractGoogleDocFileId(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+
+  const m1 = s.match(/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/);
+  if (m1 && m1[1]) return m1[1];
+
+  const m2 = s.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/);
+  if (m2 && m2[1]) return m2[1];
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  return null;
+}
+
+async function refreshAccessToken(refreshToken) {
+  const clientId = mustEnv("GOOGLE_OAUTH_CLIENT_ID");
+  const clientSecret = mustEnv("GOOGLE_OAUTH_CLIENT_SECRET");
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: "refresh_token"
+  });
+
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString()
+  });
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`google_refresh_failed:${JSON.stringify(json).slice(0, 500)}`);
+  }
+
+  return {
+    access_token: json.access_token,
+    expires_in: Number(json.expires_in || 0),
+    scope: json.scope || null
+  };
+}
+
+function paragraphText(paragraph) {
+  const elems = paragraph?.elements || [];
+  let out = "";
+  for (const el of elems) {
+    const tr = el?.textRun;
+    const content = tr?.content;
+    if (typeof content === "string") out += content;
+  }
+  return out;
+}
+
+router.get("/v1/documents/google/view", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const url = typeof req.query?.google_doc_url === "string" ? req.query.google_doc_url.trim() : "";
+    if (!url) return res.status(400).json({ ok: false, error: "GOOGLE_DOC_URL_REQUIRED" });
+
+    const fileId = extractGoogleDocFileId(url);
+    if (!fileId) return res.status(400).json({ ok: false, error: "INVALID_GOOGLE_DOC_LINK" });
+
+    // Load OAuth connection
+    const connR = await withTimeout(
+      pool.query(
+        `SELECT refresh_token, access_token, access_token_expires_at, scopes
+         FROM google_oauth_connections
+         WHERE user_id = $1::uuid
+         LIMIT 1`,
+        [userId]
+      ),
+      8000,
+      "db-get-google-conn"
+    );
+
+    const conn = connR.rows?.[0];
+    if (!conn?.refresh_token) {
+      return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
+    }
+
+    // Access token validity check
+    let accessToken = conn.access_token || null;
+    const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
+    const now = Date.now();
+    const stillValid = accessToken && expiresAt && (expiresAt - now > 60_000);
+
+    if (!stillValid) {
+      const refreshed = await refreshAccessToken(conn.refresh_token);
+      accessToken = refreshed.access_token;
+
+      const expiresIso = new Date(Date.now() + (refreshed.expires_in || 3600) * 1000).toISOString();
+      await withTimeout(
+        pool.query(
+          `UPDATE google_oauth_connections
+             SET access_token = $2,
+                 access_token_expires_at = $3::timestamptz,
+                 scopes = COALESCE($4, scopes),
+                 updated_at = now()
+           WHERE user_id = $1::uuid`,
+          [userId, accessToken, expiresIso, refreshed.scope]
+        ),
+        8000,
+        "db-update-google-token"
+      );
+    }
+
+    // Fetch doc structure via Google Docs API
+    const docsUrl = `https://docs.googleapis.com/v1/documents/${encodeURIComponent(fileId)}`;
+    const docsResp = await fetch(docsUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+
+    const docsJson = await docsResp.json().catch(() => ({}));
+    if (!docsResp.ok) {
+      logger.error("[google-view] docs api failed", {
+        fileId,
+        status: docsResp.status,
+        body: JSON.stringify(docsJson).slice(0, 500)
+      });
+      return res.status(403).json({ ok: false, error: "GOOGLE_DOCS_GET_FAILED" });
+    }
+
+    const title = docsJson?.title || "Google Doc";
+
+    // Build a bounded list of display blocks + headings for navigation
+    const MAX_BLOCKS = 5000;
+    const MAX_CHARS = 200000; // view budget (not parse budget)
+    let chars = 0;
+
+    const blocks = [];
+    const headings = [];
+
+    const body = docsJson?.body?.content || [];
+    for (const c of body) {
+      if (blocks.length >= MAX_BLOCKS) break;
+
+      const p = c?.paragraph;
+      if (!p) continue;
+
+      let text = paragraphText(p).replace(/\r/g, "");
+      text = text.trimEnd();
+
+      if (!text.trim()) continue;
+
+      const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
+      const isHeading = typeof style === "string" && style.startsWith("HEADING_");
+
+      // Budget
+      if (chars + text.length > MAX_CHARS) {
+        const remaining = MAX_CHARS - chars;
+        if (remaining <= 0) break;
+        text = text.slice(0, remaining);
+      }
+
+      const block = {
+        block_index: blocks.length,
+        style,
+        text
+      };
+      blocks.push(block);
+      chars += text.length;
+
+      if (isHeading) {
+        headings.push({
+          block_index: block.block_index,
+          style,
+          text: text.slice(0, 140)
+        });
+      }
+
+      if (chars >= MAX_CHARS) break;
+    }
+
+    const truncated = (blocks.length >= MAX_BLOCKS) || (chars >= MAX_CHARS);
+
+    return res.json({
+      ok: true,
+      file_id: fileId,
+      google_doc_url: url,
+      title,
+      truncated,
+      blocks,
+      headings
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[google-view] failed", { err: msg });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+module.exports = router;
