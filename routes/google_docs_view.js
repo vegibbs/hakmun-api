@@ -10,6 +10,10 @@
 // - Fetches doc via Google Docs API
 // - Returns a bounded, renderable block list + headings for navigation
 //
+// Added (session segmentation):
+// - Derives sessions from HEADING_1 blocks whose text starts with YYYY.MM.DD
+// - Returns sessions[] with block ranges for each session
+//
 // Notes:
 // - This does NOT export DOCX.
 // - This is read-only and works for very large docs by returning a partial view.
@@ -84,6 +88,47 @@ function paragraphText(paragraph) {
     if (typeof content === "string") out += content;
   }
   return out;
+}
+
+function isSessionHeading(style, text) {
+  if (typeof style !== "string") return false;
+  if (style !== "HEADING_1") return false;
+  const t = String(text || "").trim();
+  // Session marker: starts with YYYY.MM.DD
+  return /^\d{4}\.\d{2}\.\d{2}\b/.test(t);
+}
+
+function buildSessionsFromBlocks(blocks) {
+  // sessions are ranges starting at a qualifying HEADING_1 date header
+  // until the next qualifying HEADING_1 date header (exclusive)
+  const sessionHeaders = [];
+  for (const b of blocks) {
+    if (isSessionHeading(b?.style, b?.text)) {
+      sessionHeaders.push({
+        heading_block_index: b.block_index,
+        heading_text: String(b.text || "").trim().slice(0, 140)
+      });
+    }
+  }
+
+  const sessions = [];
+  for (let i = 0; i < sessionHeaders.length; i++) {
+    const cur = sessionHeaders[i];
+    const next = sessionHeaders[i + 1] || null;
+
+    const start = cur.heading_block_index;
+    const end = next ? (next.heading_block_index - 1) : (blocks.length - 1);
+
+    sessions.push({
+      session_index: i,
+      heading_block_index: cur.heading_block_index,
+      heading_text: cur.heading_text,
+      start_block_index: start,
+      end_block_index: Math.max(start, end)
+    });
+  }
+
+  return sessions;
 }
 
 router.get("/v1/documents/google/view", requireSession, async (req, res) => {
@@ -211,6 +256,9 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
 
     const truncated = (blocks.length >= MAX_BLOCKS) || (chars >= MAX_CHARS);
 
+    // Derived sessions (only meaningful if not truncated, but safe either way)
+    const sessions = buildSessionsFromBlocks(blocks);
+
     return res.json({
       ok: true,
       file_id: fileId,
@@ -218,7 +266,8 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
       title,
       truncated,
       blocks,
-      headings
+      headings,
+      sessions
     });
   } catch (err) {
     const msg = String(err?.message || err);
