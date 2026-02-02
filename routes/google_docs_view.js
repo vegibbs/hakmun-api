@@ -90,6 +90,12 @@ function paragraphText(paragraph) {
   return out;
 }
 
+function extractSessionDate(text) {
+  const m = String(text || "").trim().match(/^(\d{4})\.(\d{2})\.(\d{2})\b/);
+  if (!m) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
 function isSessionHeading(style, text) {
   if (typeof style !== "string") return false;
   if (style !== "HEADING_1") return false;
@@ -119,13 +125,14 @@ function buildSessionsFromBlocks(blocks) {
     const start = cur.heading_block_index;
     const end = next ? (next.heading_block_index - 1) : (blocks.length - 1);
 
-    sessions.push({
-      session_index: i,
-      heading_block_index: cur.heading_block_index,
-      heading_text: cur.heading_text,
-      start_block_index: start,
-      end_block_index: Math.max(start, end)
-    });
+  sessions.push({
+    session_index: i,
+    session_date: extractSessionDate(cur.heading_text),
+    heading_block_index: cur.heading_block_index,
+    heading_text: cur.heading_text,
+    start_block_index: start,
+    end_block_index: Math.max(start, end)
+  });
   }
 
   return sessions;
