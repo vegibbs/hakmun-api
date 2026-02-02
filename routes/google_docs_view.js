@@ -11,8 +11,8 @@
 // - Returns a bounded, renderable block list + headings for navigation
 //
 // Sessions:
-// - Derives sessions from HEADING_1 blocks whose text starts with YYYY.MM.DD
-// - Adds session_date (YYYY-MM-DD) for each session
+// - Derives sessions from HEADING_1 blocks whose text starts with YYYY.M.D or YYYY.MM.DD
+// - Adds session_date (YYYY-MM-DD) for each session (zero-padded)
 // - Supports filtering sessions via query params:
 //
 //   session_date=YYYY-MM-DD         (single day)
@@ -102,18 +102,27 @@ function paragraphText(paragraph) {
   return out;
 }
 
+function zeroPad2(n) {
+  const x = String(n || "").trim();
+  return x.length === 1 ? `0${x}` : x;
+}
+
 function extractSessionDate(text) {
-  const m = String(text || "").trim().match(/^(\d{4})\.(\d{2})\.(\d{2})\b/);
+  // Accept YYYY.M.D or YYYY.MM.DD
+  const m = String(text || "").trim().match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})\b/);
   if (!m) return null;
-  return `${m[1]}-${m[2]}-${m[3]}`;
+  const yyyy = m[1];
+  const mm = zeroPad2(m[2]);
+  const dd = zeroPad2(m[3]);
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function isSessionHeading(style, text) {
   if (typeof style !== "string") return false;
   if (style !== "HEADING_1") return false;
   const t = String(text || "").trim();
-  // Session marker: starts with YYYY.MM.DD
-  return /^\d{4}\.\d{2}\.\d{2}\b/.test(t);
+  // Session marker: starts with YYYY.M.D or YYYY.MM.DD
+  return /^\d{4}\.\d{1,2}\.\d{1,2}\b/.test(t);
 }
 
 function buildSessionsFromBlocks(blocks) {
