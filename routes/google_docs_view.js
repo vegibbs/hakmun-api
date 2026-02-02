@@ -10,9 +10,21 @@
 // - Fetches doc via Google Docs API
 // - Returns a bounded, renderable block list + headings for navigation
 //
-// Added (session segmentation):
+// Sessions:
 // - Derives sessions from HEADING_1 blocks whose text starts with YYYY.MM.DD
-// - Returns sessions[] with block ranges for each session
+// - Adds session_date (YYYY-MM-DD) for each session
+// - Supports filtering sessions via query params:
+//
+//   session_date=YYYY-MM-DD         (single day)
+//   session_start=YYYY-MM-DD        (range start, inclusive)
+//   session_end=YYYY-MM-DD          (range end, inclusive)
+//   last_n_weeks=N                  (integer)
+//
+// Precedence:
+// 1) session_date
+// 2) session_start/session_end
+// 3) last_n_weeks
+// 4) none (all)
 //
 // Notes:
 // - This does NOT export DOCX.
@@ -105,14 +117,14 @@ function isSessionHeading(style, text) {
 }
 
 function buildSessionsFromBlocks(blocks) {
-  // sessions are ranges starting at a qualifying HEADING_1 date header
-  // until the next qualifying HEADING_1 date header (exclusive)
   const sessionHeaders = [];
   for (const b of blocks) {
     if (isSessionHeading(b?.style, b?.text)) {
+      const headingText = String(b.text || "").trim();
       sessionHeaders.push({
         heading_block_index: b.block_index,
-        heading_text: String(b.text || "").trim().slice(0, 140)
+        heading_text: headingText.slice(0, 140),
+        session_date: extractSessionDate(headingText)
       });
     }
   }
@@ -125,16 +137,65 @@ function buildSessionsFromBlocks(blocks) {
     const start = cur.heading_block_index;
     const end = next ? (next.heading_block_index - 1) : (blocks.length - 1);
 
-  sessions.push({
-    session_index: i,
-    session_date: extractSessionDate(cur.heading_text),
-    heading_block_index: cur.heading_block_index,
-    heading_text: cur.heading_text,
-    start_block_index: start,
-    end_block_index: Math.max(start, end)
-  });
+    sessions.push({
+      session_index: i,
+      session_date: cur.session_date,
+      heading_block_index: cur.heading_block_index,
+      heading_text: cur.heading_text,
+      start_block_index: start,
+      end_block_index: Math.max(start, end)
+    });
   }
 
+  return sessions;
+}
+
+function parseIsoDate(s) {
+  const t = String(s || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return null;
+  const d = new Date(`${t}T00:00:00.000Z`);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function toIsoDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+function addDaysUtc(dateObj, days) {
+  const ms = dateObj.getTime() + (days * 24 * 60 * 60 * 1000);
+  return new Date(ms);
+}
+
+function filterSessions({ sessions, sessionDate, sessionStart, sessionEnd, lastNWeeks }) {
+  if (!Array.isArray(sessions) || sessions.length === 0) return [];
+
+  // 1) single date
+  if (sessionDate) {
+    return sessions.filter(s => s.session_date === sessionDate);
+  }
+
+  // 2) date range
+  if (sessionStart || sessionEnd) {
+    return sessions.filter(s => {
+      const sd = s.session_date;
+      if (!sd) return false;
+      if (sessionStart && sd < sessionStart) return false;
+      if (sessionEnd && sd > sessionEnd) return false;
+      return true;
+    });
+  }
+
+  // 3) last N weeks
+  if (Number.isFinite(lastNWeeks) && lastNWeeks > 0) {
+    const today = new Date();
+    const todayUtcMidnight = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+    const cutoff = addDaysUtc(todayUtcMidnight, -(lastNWeeks * 7));
+    const cutoffIso = toIsoDate(cutoff);
+
+    return sessions.filter(s => (s.session_date || "") >= cutoffIso);
+  }
+
+  // 4) no filter
   return sessions;
 }
 
@@ -263,8 +324,28 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
 
     const truncated = (blocks.length >= MAX_BLOCKS) || (chars >= MAX_CHARS);
 
-    // Derived sessions (only meaningful if not truncated, but safe either way)
+    // Derived sessions
     const sessions = buildSessionsFromBlocks(blocks);
+
+    // Optional session filters (server-side)
+    const sessionDate = parseIsoDate(req.query?.session_date) ? String(req.query.session_date).trim() : null;
+
+    const sessionStart = parseIsoDate(req.query?.session_start) ? String(req.query.session_start).trim() : null;
+    const sessionEnd = parseIsoDate(req.query?.session_end) ? String(req.query.session_end).trim() : null;
+
+    const lastNWeeksRaw = req.query?.last_n_weeks;
+    const lastNWeeks =
+      (lastNWeeksRaw !== undefined && lastNWeeksRaw !== null && String(lastNWeeksRaw).trim() !== "")
+        ? Math.floor(Number(lastNWeeksRaw))
+        : null;
+
+    const sessionsFiltered = filterSessions({
+      sessions,
+      sessionDate,
+      sessionStart,
+      sessionEnd,
+      lastNWeeks
+    });
 
     return res.json({
       ok: true,
@@ -274,7 +355,7 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
       truncated,
       blocks,
       headings,
-      sessions
+      sessions: sessionsFiltered
     });
   } catch (err) {
     const msg = String(err?.message || err);
