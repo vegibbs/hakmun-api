@@ -4,6 +4,7 @@
 //   GET  /v1/content/items?content_type=sentence
 //   POST /v1/content/items
 //   GET  /v1/content/items/coverage?content_type=sentence
+//   GET  /v1/library/global/items?content_type=sentence&global_state=approved
 //
 // Canonical identifiers:
 // - content_item_id (UUID)
@@ -36,8 +37,16 @@ function normalizeContentType(v) {
   return null;
 }
 
+function normalizeGlobalState(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return null;
+  if (["preliminary", "approved", "rejected"].includes(s)) return s;
+  return null;
+}
+
 // ------------------------------------------------------------------
 // GET /v1/content/items?content_type=sentence
+// Personal-only canonical list (owner-scoped).
 // ------------------------------------------------------------------
 router.get("/v1/content/items", requireSession, async (req, res) => {
   try {
@@ -81,8 +90,62 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
 });
 
 // ------------------------------------------------------------------
+// GET /v1/library/global/items?content_type=sentence&global_state=approved
+// Global library list (approved by default).
+//
+// NOTE:
+// - This endpoint is intentionally separate from /v1/content/items.
+// - It returns the same row shape as /v1/content/items so the frontend can decode
+//   using ContentItemDTO without introducing new client models.
+// - Access control for preliminary/rejected can be added later (teacher-only).
+// ------------------------------------------------------------------
+router.get("/v1/library/global/items", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const contentType = normalizeContentType(req.query?.content_type) || "sentence";
+    const globalState = normalizeGlobalState(req.query?.global_state) || "approved";
+
+    const sql = `
+      SELECT
+        ci.content_item_id,
+        ci.content_type,
+        ci.text,
+        ci.language,
+        ci.notes,
+        ci.created_at,
+        ci.updated_at,
+
+        lri.id                 AS registry_item_id,
+        lri.audience,
+        lri.global_state,
+        lri.operational_status,
+        lri.owner_user_id      AS registry_owner_user_id
+      FROM content_items ci
+      JOIN library_registry_items lri
+        ON lri.content_type = ci.content_type
+       AND lri.content_id   = ci.content_item_id
+      WHERE ci.content_type = $1::text
+        AND lri.audience = 'global'
+        AND lri.global_state = $2::text
+        AND lri.operational_status = 'active'
+      ORDER BY ci.created_at DESC
+      LIMIT 500
+    `;
+
+    const { rows } = await dbQuery(sql, [contentType, globalState]);
+    return res.json({ ok: true, items: rows || [] });
+  } catch (err) {
+    console.error("global items list failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // POST /v1/content/items
 // Body: { content_type: "sentence", text: "..." }
+// Creates PERSONAL content + PERSONAL registry row.
 // ------------------------------------------------------------------
 router.post("/v1/content/items", requireSession, async (req, res) => {
   const userId = getUserId(req);
@@ -135,12 +198,14 @@ router.post("/v1/content/items", requireSession, async (req, res) => {
         registry_item_id: registry.id,
         audience: registry.audience,
         global_state: registry.global_state,
-        operational_status: registry.operational_status
-      }
+        operational_status: registry.operational_status,
+      },
     });
   } catch (err) {
     if (client) {
-      try { await client.query("ROLLBACK"); } catch (_) {}
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
     }
     console.error("content items create failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
