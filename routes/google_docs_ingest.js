@@ -162,77 +162,106 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
     const importAsRaw = typeof req.body?.import_as === "string" ? req.body.import_as.trim() : "all";
     const importAs = ["all", "vocab", "sentences", "patterns"].includes(importAsRaw) ? importAsRaw : "all";
 
-    const startIdx = Number(req.body?.start_block_index);
-    const endIdx = Number(req.body?.end_block_index);
+    const scopeModeRaw = req.body?.scope?.mode;
+    const scopeMode = (typeof scopeModeRaw === "string" && scopeModeRaw.trim()) ? scopeModeRaw.trim() : "blocks";
 
-    if (!Number.isFinite(startIdx) || !Number.isFinite(endIdx)) {
-      return res.status(400).json({ ok: false, error: "BLOCK_RANGE_REQUIRED" });
-    }
-    const s = Math.max(0, Math.floor(startIdx));
-    const e = Math.max(0, Math.floor(endIdx));
-    if (e < s) return res.status(400).json({ ok: false, error: "INVALID_BLOCK_RANGE" });
+    // Common selection output
+    const MAX_SELECTION_CHARS = 500000; // same order as parse budget
+    let selectionTextBounded = "";
+    let docTitle = "Google Doc";
+    let blocksTotal = null;
+    let s = null;
+    let endClamped = null;
+    let scopeObj = { mode: scopeMode };
 
-    // OAuth connection
-    const connR = await withTimeout(
-      pool.query(
-        `SELECT refresh_token, access_token, access_token_expires_at, scopes
-         FROM google_oauth_connections
-         WHERE user_id = $1::uuid
-         LIMIT 1`,
-        [userId]
-      ),
-      8000,
-      "db-get-google-conn"
-    );
-    const conn = connR.rows?.[0];
-    if (!conn?.refresh_token) return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
+    if (scopeMode === "highlight") {
+      const selectedText = (typeof req.body?.selected_text === "string") ? req.body.selected_text.trim() : "";
+      if (!selectedText) {
+        return res.status(400).json({ ok: false, error: "SELECTION_REQUIRED" });
+      }
 
-    // Ensure access token
-    let accessToken = conn.access_token || null;
-    const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
-    const now = Date.now();
-    const stillValid = accessToken && expiresAt && (expiresAt - now > 60_000);
+      selectionTextBounded = selectedText.length > MAX_SELECTION_CHARS
+        ? selectedText.slice(0, MAX_SELECTION_CHARS)
+        : selectedText;
 
-    if (!stillValid) {
-      const refreshed = await refreshAccessToken(conn.refresh_token);
-      accessToken = refreshed.access_token;
+      scopeObj = { mode: "highlight" };
+      // NOTE: In highlight mode we DO NOT fetch doc blocks and DO NOT require Google OAuth.
+    } else {
+      const startIdx = Number(req.body?.start_block_index);
+      const endIdx = Number(req.body?.end_block_index);
 
-      const expiresIso = new Date(Date.now() + (refreshed.expires_in || 3600) * 1000).toISOString();
-      await withTimeout(
+      if (!Number.isFinite(startIdx) || !Number.isFinite(endIdx)) {
+        return res.status(400).json({ ok: false, error: "BLOCK_RANGE_REQUIRED" });
+      }
+      s = Math.max(0, Math.floor(startIdx));
+      const e = Math.max(0, Math.floor(endIdx));
+      if (e < s) return res.status(400).json({ ok: false, error: "INVALID_BLOCK_RANGE" });
+
+      // OAuth connection
+      const connR = await withTimeout(
         pool.query(
-          `UPDATE google_oauth_connections
-             SET access_token = $2,
-                 access_token_expires_at = $3::timestamptz,
-                 scopes = COALESCE($4, scopes),
-                 updated_at = now()
-           WHERE user_id = $1::uuid`,
-          [userId, accessToken, expiresIso, refreshed.scope]
+          `SELECT refresh_token, access_token, access_token_expires_at, scopes
+           FROM google_oauth_connections
+           WHERE user_id = $1::uuid
+           LIMIT 1`,
+          [userId]
         ),
         8000,
-        "db-update-google-token"
+        "db-get-google-conn"
       );
+      const conn = connR.rows?.[0];
+      if (!conn?.refresh_token) return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
+
+      // Ensure access token
+      let accessToken = conn.access_token || null;
+      const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
+      const now = Date.now();
+      const stillValid = accessToken && expiresAt && (expiresAt - now > 60_000);
+
+      if (!stillValid) {
+        const refreshed = await refreshAccessToken(conn.refresh_token);
+        accessToken = refreshed.access_token;
+
+        const expiresIso = new Date(Date.now() + (refreshed.expires_in || 3600) * 1000).toISOString();
+        await withTimeout(
+          pool.query(
+            `UPDATE google_oauth_connections
+               SET access_token = $2,
+                   access_token_expires_at = $3::timestamptz,
+                   scopes = COALESCE($4, scopes),
+                   updated_at = now()
+             WHERE user_id = $1::uuid`,
+            [userId, accessToken, expiresIso, refreshed.scope]
+          ),
+          8000,
+          "db-update-google-token"
+        );
+      }
+
+      // Fetch blocks
+      const fetched = await fetchDocBlocks(fileId, accessToken);
+      docTitle = fetched.title;
+      const blocks = fetched.blocks;
+      blocksTotal = blocks.length;
+
+      if (s >= blocks.length) {
+        return res.status(400).json({ ok: false, error: "START_OUT_OF_RANGE", blocks: blocks.length });
+      }
+      endClamped = Math.min(e, blocks.length - 1);
+
+      const slice = blocks.slice(s, endClamped + 1);
+      const selectionText = slice.map(b => b.text).join("\n").trim();
+
+      if (!selectionText) {
+        return res.status(400).json({ ok: false, error: "EMPTY_SELECTION" });
+      }
+
+      selectionTextBounded = selectionText.length > MAX_SELECTION_CHARS
+        ? selectionText.slice(0, MAX_SELECTION_CHARS)
+        : selectionText;
+
+      scopeObj = { mode: "blocks", start_block_index: s, end_block_index: endClamped };
     }
-
-    // Fetch blocks
-    const { title: docTitle, blocks } = await fetchDocBlocks(fileId, accessToken);
-
-    if (s >= blocks.length) {
-      return res.status(400).json({ ok: false, error: "START_OUT_OF_RANGE", blocks: blocks.length });
-    }
-    const endClamped = Math.min(e, blocks.length - 1);
-
-    const slice = blocks.slice(s, endClamped + 1);
-    const selectionText = slice.map(b => b.text).join("\n").trim();
-
-    if (!selectionText) {
-      return res.status(400).json({ ok: false, error: "EMPTY_SELECTION" });
-    }
-
-    // Protect DB/job payload size
-    const MAX_SELECTION_CHARS = 500000; // same order as parse budget
-    const selectionTextBounded = selectionText.length > MAX_SELECTION_CHARS
-      ? selectionText.slice(0, MAX_SELECTION_CHARS)
-      : selectionText;
 
     // Store selection text as evidence asset (text/plain)
     const assetId = crypto.randomUUID();
@@ -259,7 +288,10 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
     const title =
       (typeof req.body?.title === "string" && req.body.title.trim())
         ? String(req.body.title).trim().slice(0, 140)
-        : `${docTitle} [blocks ${s}-${endClamped}]`.slice(0, 140);
+        : (scopeMode === "highlight"
+            ? `${docTitle} [highlight]`
+            : `${docTitle} [blocks ${s}-${endClamped}]`
+          ).slice(0, 140);
 
     await withTimeout(
       pool.query(
@@ -298,7 +330,7 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
     const jobId = crypto.randomUUID();
     const payload = {
       import_as: importAs,
-      scope: { mode: "blocks", start_block_index: s, end_block_index: endClamped },
+      scope: scopeObj,
       source: { kind: "google_doc", file_id: fileId, google_doc_url: googleDocUrl, title: docTitle },
       text: selectionTextBounded,
       budgets: { max_words: 3000, max_sentences: 1000, max_patterns: 1000, max_chars: 500000 }
@@ -314,17 +346,23 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
       "db-insert-docparse-job"
     );
 
-    return res.status(201).json({
+    const resp = {
       ok: true,
       document_id: documentId,
       asset_id: assetId,
       parse_run_id: parseRunId,
       job_id: jobId,
-      blocks_total: blocks.length,
-      start_block_index: s,
-      end_block_index: endClamped,
-      selection_chars: selectionTextBounded.length
-    });
+      selection_chars: selectionTextBounded.length,
+      scope: scopeObj
+    };
+
+    if (scopeMode !== "highlight") {
+      resp.blocks_total = blocksTotal;
+      resp.start_block_index = s;
+      resp.end_block_index = endClamped;
+    }
+
+    return res.status(201).json(resp);
   } catch (err) {
     const msg = String(err?.message || err);
     logger.error("[google-ingest] failed", { rid: req._rid, err: msg });

@@ -266,6 +266,29 @@ print("✅ pins do not include headword after delete")
 PY
 rm -f "$PINS_FILE2"
 
+
+print_section "D2.2 Generic chunked text ingest (highlight text)"
+
+CHUNK_TEXT="This is a smoke-test paragraph one. It has a few sentences.\n\nThis is paragraph two, which should end up in a second chunk if the limit is low enough."
+
+CHUNK_BODY="$(python3 - <<PY
+import json
+print(json.dumps({
+  "source_kind": "google_doc",
+  "source_uri": "smoke://google-doc-highlight",
+  "import_as": "sentences",
+  "scope": {"mode": "highlight"},
+  "selected_text": "$CHUNK_TEXT",
+  "chunk_max_chars": 60
+}))
+PY
+)"
+
+post_json_expect "ingest-text-chunked (highlight) -> POST /v1/documents/ingest-text-chunked" \
+  "$HAKMUN_API_BASE_URL/v1/documents/ingest-text-chunked" \
+  "$CHUNK_BODY" \
+  201
+
 print_section "D2.1 Google Doc link parsing"
 
 GOOGLE_DOC_TEST_URL="https://docs.google.com/document/d/1FrIT9TNohI9zQfZJkkmqfSyggjqIkMZWuUpIchhso2k/edit?tab=t.0#heading=h.54h6p8qdtiql"

@@ -73,7 +73,8 @@ app.use(require("./routes/google_oauth"));
 app.use(require("./routes/google_docs_import"));
 app.use(require("./routes/google_docs_view"));
 app.use(require("./routes/google_docs_ingest"));
-app.use(require("./routes/google_docs_ingest_chunked"));
+// Generic chunked text ingest (highlight / large selections)
+app.use(require("./routes/ingest_text_chunked"));
 app.use(require("./routes/document_sources"));
 
 // ------------------------------------------------------------------
