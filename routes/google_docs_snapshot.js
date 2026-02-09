@@ -176,12 +176,17 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
 
     // Export via Drive API (HTML)
     const exportUrl =
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent("text/html")}`;
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export` +
+      `?mimeType=${encodeURIComponent("text/html")}&supportsAllDrives=true`;
 
-    const driveResp = await fetch(exportUrl, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const driveResp = await withTimeout(
+      fetch(exportUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}` }
+      }),
+      15000,
+      "google-drive-export"
+    );
 
     if (!driveResp.ok) {
       const errTxt = await driveResp.text().catch(() => "");
@@ -201,7 +206,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       return res.status(403).json({ ok: false, error: "GOOGLE_DRIVE_EXPORT_FAILED" });
     }
 
-    const buf = Buffer.from(await driveResp.arrayBuffer());
+    const ab = await withTimeout(driveResp.arrayBuffer(), 15000, "google-drive-export-body");
+    const buf = Buffer.from(ab);
     const sizeBytes = buf.length;
 
     // Simple server-side guardrail (HTML snapshots should not be huge)
@@ -277,6 +283,9 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
         error: "GOOGLE_RECONNECT_REQUIRED",
         reconnect_hint: "/v1/auth/google/start"
       });
+    }
+    if (msg.startsWith("timeout:google-drive-export") || msg.startsWith("timeout:google-drive-export-body")) {
+      return res.status(503).json({ ok: false, error: "GOOGLE_DRIVE_TIMEOUT" });
     }
 
     if (msg.startsWith("timeout:s3-put-google-html")) {

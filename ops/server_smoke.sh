@@ -367,6 +367,75 @@ PY
 
 rm -f "$VIEW_FILE"
 
+print_section "D2.4 Google Docs HTML snapshot (Drive export -> stored HTML -> signed viewer_url)"
+
+SNAPSHOT_BODY="$(python3 - <<PY
+import json
+print(json.dumps({"google_doc_url": "$GOOGLE_DOC_TEST_URL"}))
+PY
+)"
+
+SNAPSHOT_FILE="$(mktemp)"
+SNAPSHOT_CODE="$(curl -sS -o "$SNAPSHOT_FILE" -w "%{http_code}" -X POST "$HAKMUN_API_BASE_URL/v1/documents/google/snapshot" \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  --data-binary "$SNAPSHOT_BODY")"
+
+echo "[$SNAPSHOT_CODE] google snapshot -> POST /v1/documents/google/snapshot"
+
+echo -n "  Body: "
+cat "$SNAPSHOT_FILE" | body_prefix
+echo ""
+
+if [[ "$SNAPSHOT_CODE" != "201" ]]; then
+  echo "  Expected 201"
+
+  # If Google reconnect is required, print a reconnect URL (same pattern as D2.3).
+  if [[ "$SNAPSHOT_CODE" == "401" ]]; then
+    echo "  Attempting to fetch Google reconnect URL..."
+    RECONNECT_FILE="$(mktemp)"
+    RECONNECT_CODE="$(curl -sS -o "$RECONNECT_FILE" -w "%{http_code}" "$HAKMUN_API_BASE_URL/v1/auth/google/start" -H "$AUTH_HEADER")"
+    echo "  [$RECONNECT_CODE] GET /v1/auth/google/start"
+    if [[ "$RECONNECT_CODE" == "200" ]]; then
+      python3 - <<'PY' "$RECONNECT_FILE"
+import json,sys
+path=sys.argv[1]
+with open(path,'r',encoding='utf-8') as f:
+    d=json.load(f)
+url=d.get('auth_url')
+if url:
+    print("  🔗 Open this to reconnect Google:\n  " + url)
+else:
+    print("  (No auth_url returned)")
+PY
+    else
+      echo -n "  Reconnect body: "
+      cat "$RECONNECT_FILE" | body_prefix
+      echo ""
+    fi
+    rm -f "$RECONNECT_FILE"
+  fi
+
+  rm -f "$SNAPSHOT_FILE"
+  die "Google Docs snapshot failed"
+fi
+
+python3 - <<'PY' "$SNAPSHOT_FILE"
+import json,sys,re
+path=sys.argv[1]
+with open(path,'r',encoding='utf-8') as f:
+    d=json.load(f)
+
+assert d.get('ok') is True, d
+viewer=d.get('viewer_url') or ''
+asset=d.get('asset_id') or ''
+assert isinstance(viewer,str) and viewer.startswith('http'), d
+assert re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$', asset), d
+print('✅ google snapshot returned signed viewer_url + asset_id')
+PY
+
+rm -f "$SNAPSHOT_FILE"
+
 print_section "D2.1 Google Doc link parsing"
 
 GOOD_BODY="$(python3 - <<PY
