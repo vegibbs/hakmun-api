@@ -410,6 +410,17 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
     });
   } catch (err) {
     const msg = String(err?.message || err);
+
+    // Explicit Google OAuth refresh failure (Testing-mode churn or revoked access)
+    if (msg.startsWith("google_refresh_failed:")) {
+      logger.warn("[google-view] refresh failed; reconnect required", { err: msg });
+      return res.status(401).json({
+        ok: false,
+        error: "GOOGLE_RECONNECT_REQUIRED",
+        reconnect_hint: "/v1/auth/google/start"
+      });
+    }
+
     logger.error("[google-view] failed", { err: msg });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }

@@ -267,6 +267,10 @@ PY
 rm -f "$PINS_FILE2"
 
 
+
+# Google Doc used for Google-view/parse-link smoke tests
+GOOGLE_DOC_TEST_URL="${GOOGLE_DOC_TEST_URL:-https://docs.google.com/document/d/1FrIT9TNohI9zQfZJkkmqfSyggjqIkMZWuUpIchhso2k/edit?tab=t.0#heading=h.54h6p8qdtiql}"
+
 print_section "D2.2 Generic chunked text ingest (highlight text)"
 
 CHUNK_TEXT="This is a smoke-test paragraph one. It has a few sentences.\n\nThis is paragraph two, which should end up in a second chunk if the limit is low enough."
@@ -289,9 +293,81 @@ post_json_expect "ingest-text-chunked (highlight) -> POST /v1/documents/ingest-t
   "$CHUNK_BODY" \
   201
 
-print_section "D2.1 Google Doc link parsing"
+print_section "D2.3 Google Docs view (sessions + global block indices)"
 
-GOOGLE_DOC_TEST_URL="https://docs.google.com/document/d/1FrIT9TNohI9zQfZJkkmqfSyggjqIkMZWuUpIchhso2k/edit?tab=t.0#heading=h.54h6p8qdtiql"
+# NOTE: This test assumes the doc has session-style headings (dates in headings).
+# It validates that sessions are derived from the FULL doc and blocks use global indices.
+
+GOOGLE_VIEW_URL="$HAKMUN_API_BASE_URL/v1/documents/google/view?google_doc_url=$GOOGLE_DOC_TEST_URL&last_n_weeks=4"
+
+VIEW_FILE="$(mktemp)"
+VIEW_CODE="$(curl -sS -o "$VIEW_FILE" -w "%{http_code}" "$GOOGLE_VIEW_URL" -H "$AUTH_HEADER")"
+
+echo "[$VIEW_CODE] google view -> GET /v1/documents/google/view?last_n_weeks=4"
+
+if [[ "$VIEW_CODE" != "200" ]]; then
+  echo "  Body:"
+  cat "$VIEW_FILE" | body_prefix
+  echo ""
+
+  echo "  Attempting to fetch Google reconnect URL..."
+  RECONNECT_FILE="$(mktemp)"
+  RECONNECT_CODE="$(curl -sS -o "$RECONNECT_FILE" -w "%{http_code}" "$HAKMUN_API_BASE_URL/v1/auth/google/start" -H "$AUTH_HEADER")"
+  echo "  [$RECONNECT_CODE] GET /v1/auth/google/start"
+  if [[ "$RECONNECT_CODE" == "200" ]]; then
+    python3 - <<'PY' "$RECONNECT_FILE"
+import json,sys
+path=sys.argv[1]
+with open(path,'r',encoding='utf-8') as f:
+    d=json.load(f)
+url=d.get('auth_url')
+if url:
+    print("  🔗 Open this to reconnect Google:\n  " + url)
+else:
+    print("  (No auth_url returned)")
+PY
+  else
+    echo -n "  Reconnect body: "
+    cat "$RECONNECT_FILE" | body_prefix
+    echo ""
+  fi
+  rm -f "$RECONNECT_FILE"
+
+  rm -f "$VIEW_FILE"
+  die "Google Docs view failed"
+fi
+
+echo -n "  OK: "
+cat "$VIEW_FILE" | body_prefix
+echo ""
+
+python3 - <<'PY' "$VIEW_FILE"
+import json,sys
+path=sys.argv[1]
+with open(path,'r',encoding='utf-8') as f:
+    d=json.load(f)
+
+assert d.get('ok') is True, d
+sessions_total=d.get('sessions_total')
+sessions=d.get('sessions') or []
+blocks=d.get('blocks') or []
+
+assert isinstance(sessions_total,int) and sessions_total>=len(sessions), d
+
+# Validate global block indices (monotonic, non-local)
+idxs=[b.get('block_index') for b in blocks if 'block_index' in b]
+assert idxs==sorted(idxs), idxs
+
+# Validate sessions have global ranges
+for s in sessions:
+    assert s.get('start_block_index')<=s.get('end_block_index'), s
+
+print("✅ google view sessions + global indices look sane")
+PY
+
+rm -f "$VIEW_FILE"
+
+print_section "D2.1 Google Doc link parsing"
 
 GOOD_BODY="$(python3 - <<PY
 import json
