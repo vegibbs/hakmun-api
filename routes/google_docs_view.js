@@ -125,13 +125,25 @@ function isSessionHeading(style, text) {
   return /^\d{4}\.\d{1,2}\.\d{1,2}\b/.test(t);
 }
 
-function buildSessionsFromBlocks(blocks) {
+function buildSessionsFromDocBody(bodyContent) {
   const sessionHeaders = [];
-  for (const b of blocks) {
-    if (isSessionHeading(b?.style, b?.text)) {
-      const headingText = String(b.text || "").trim();
+  let globalIdx = -1;
+
+  for (const c of (Array.isArray(bodyContent) ? bodyContent : [])) {
+    const p = c?.paragraph;
+    if (!p) continue;
+
+    let text = paragraphText(p).replace(/\r/g, "");
+    text = text.trimEnd();
+    if (!text.trim()) continue;
+
+    globalIdx += 1;
+
+    const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
+    if (isSessionHeading(style, text)) {
+      const headingText = String(text || "").trim();
       sessionHeaders.push({
-        heading_block_index: b.block_index,
+        heading_block_index: globalIdx,
         heading_text: headingText.slice(0, 140),
         session_date: extractSessionDate(headingText)
       });
@@ -144,7 +156,7 @@ function buildSessionsFromBlocks(blocks) {
     const next = sessionHeaders[i + 1] || null;
 
     const start = cur.heading_block_index;
-    const end = next ? (next.heading_block_index - 1) : (blocks.length - 1);
+    const end = next ? (next.heading_block_index - 1) : globalIdx;
 
     sessions.push({
       session_index: i,
@@ -282,59 +294,9 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
 
     const title = docsJson?.title || "Google Doc";
 
-    // Build a bounded list of display blocks + headings for navigation
-    const MAX_BLOCKS = 5000;
-    const MAX_CHARS = 200000; // view budget (not parse budget)
-    let chars = 0;
-
-    const blocks = [];
-    const headings = [];
-
+    // Build sessions from the FULL document structure using global block indices
     const body = docsJson?.body?.content || [];
-    for (const c of body) {
-      if (blocks.length >= MAX_BLOCKS) break;
-
-      const p = c?.paragraph;
-      if (!p) continue;
-
-      let text = paragraphText(p).replace(/\r/g, "");
-      text = text.trimEnd();
-
-      if (!text.trim()) continue;
-
-      const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
-      const isHeading = typeof style === "string" && style.startsWith("HEADING_");
-
-      // Budget
-      if (chars + text.length > MAX_CHARS) {
-        const remaining = MAX_CHARS - chars;
-        if (remaining <= 0) break;
-        text = text.slice(0, remaining);
-      }
-
-      const block = {
-        block_index: blocks.length,
-        style,
-        text
-      };
-      blocks.push(block);
-      chars += text.length;
-
-      if (isHeading) {
-        headings.push({
-          block_index: block.block_index,
-          style,
-          text: text.slice(0, 140)
-        });
-      }
-
-      if (chars >= MAX_CHARS) break;
-    }
-
-    const truncated = (blocks.length >= MAX_BLOCKS) || (chars >= MAX_CHARS);
-
-    // Derived sessions
-    const sessions = buildSessionsFromBlocks(blocks);
+    const sessionsAll = buildSessionsFromDocBody(body);
 
     // Optional session filters (server-side)
     const sessionDate = parseIsoDate(req.query?.session_date) ? String(req.query.session_date).trim() : null;
@@ -349,12 +311,91 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
         : null;
 
     const sessionsFiltered = filterSessions({
-      sessions,
+      sessions: sessionsAll,
       sessionDate,
       sessionStart,
       sessionEnd,
       lastNWeeks
     });
+
+    // Decide which global block ranges to include in the view.
+    // If no session filters are provided, we return the first bounded window from the doc start.
+    const hasSessionFilter = Boolean(sessionDate || sessionStart || sessionEnd || (Number.isFinite(lastNWeeks) && lastNWeeks > 0));
+    const includeRanges = hasSessionFilter
+      ? sessionsFiltered.map(s => ({ start: s.start_block_index, end: s.end_block_index }))
+      : [];
+
+    function inIncludedRanges(globalIdx) {
+      if (!hasSessionFilter) return true;
+      for (const r of includeRanges) {
+        if (globalIdx >= r.start && globalIdx <= r.end) return true;
+      }
+      return false;
+    }
+
+    // Build a bounded list of display blocks + headings for navigation (global indices)
+    const MAX_BLOCKS = 5000;
+    const MAX_CHARS = 200000; // view budget (not parse budget)
+    let chars = 0;
+
+    const blocks = [];
+    const headings = [];
+
+    let globalIdx = -1;
+    let truncated = false;
+
+    for (const c of body) {
+      const p = c?.paragraph;
+      if (!p) continue;
+
+      let text = paragraphText(p).replace(/\r/g, "");
+      text = text.trimEnd();
+      if (!text.trim()) continue;
+
+      globalIdx += 1;
+
+      if (!inIncludedRanges(globalIdx)) continue;
+
+      if (blocks.length >= MAX_BLOCKS) {
+        truncated = true;
+        break;
+      }
+
+      const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
+      const isHeading = typeof style === "string" && style.startsWith("HEADING_");
+
+      // Budget
+      if (chars + text.length > MAX_CHARS) {
+        const remaining = MAX_CHARS - chars;
+        if (remaining <= 0) {
+          truncated = true;
+          break;
+        }
+        text = text.slice(0, remaining);
+        truncated = true;
+      }
+
+      const block = {
+        block_index: globalIdx,
+        style,
+        text
+      };
+      blocks.push(block);
+      chars += text.length;
+
+      if (isHeading) {
+        headings.push({
+          block_index: block.block_index,
+          style,
+          text: text.slice(0, 140)
+        });
+      }
+
+      if (chars >= MAX_CHARS) {
+        truncated = true;
+        break;
+      }
+    }
 
     return res.json({
       ok: true,
@@ -364,6 +405,7 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
       truncated,
       blocks,
       headings,
+      sessions_total: sessionsAll.length,
       sessions: sessionsFiltered
     });
   } catch (err) {
