@@ -1,5 +1,5 @@
 // FILE: hakmun-api/routes/google_docs_snapshot.js
-// PURPOSE: D2.x — Export Google Doc as HTML snapshot (Drive API) + store as asset + signed viewer URL
+// PURPOSE: D2.x — Google Doc HTML snapshot (Docs API -> last 90 days sessions -> store as asset -> signed viewer URL)
 // ENDPOINT:
 //   POST /v1/documents/google/snapshot
 //
@@ -7,7 +7,10 @@
 // - Requires user session (Bearer)
 // - Uses per-user google_oauth_connections
 // - Refreshes access token as needed
-// - Exports doc as HTML via Drive API (files.export)
+// - Fetches doc via Google Docs API (bounded fields)
+// - Builds sessions from HEADING_1 dated headers (YYYY.M.D or YYYY.MM.DD)
+// - Includes only sessions in the last 90 days
+// - Generates HTML from the included blocks and stores it
 // - Stores HTML in object storage (private bucket)
 // - Inserts media_assets row (mime_type=text/html)
 // - Returns signed viewer_url for WKWebView
@@ -114,6 +117,129 @@ async function refreshAccessToken(refreshToken) {
   };
 }
 
+/* -------------------- helpers for session slicing and HTML -------------------- */
+
+function paragraphText(paragraph) {
+  const elems = paragraph?.elements || [];
+  let out = "";
+  for (const el of elems) {
+    const tr = el?.textRun;
+    const content = tr?.content;
+    if (typeof content === "string") out += content;
+  }
+  return out;
+}
+
+function zeroPad2(n) {
+  const x = String(n || "").trim();
+  return x.length === 1 ? `0${x}` : x;
+}
+
+function extractSessionDate(text) {
+  // Accept YYYY.M.D or YYYY.MM.DD
+  const m = String(text || "").trim().match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})\b/);
+  if (!m) return null;
+  const yyyy = m[1];
+  const mm = zeroPad2(m[2]);
+  const dd = zeroPad2(m[3]);
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function isSessionHeading(style, text) {
+  if (typeof style !== "string") return false;
+  if (style !== "HEADING_1") return false;
+  const t = String(text || "").trim();
+  return /^\d{4}\.\d{1,2}\.\d{1,2}\b/.test(t);
+}
+
+function buildSessionsFromDocBody(bodyContent) {
+  const sessionHeaders = [];
+  let globalIdx = -1;
+
+  for (const c of (Array.isArray(bodyContent) ? bodyContent : [])) {
+    const p = c?.paragraph;
+    if (!p) continue;
+
+    let text = paragraphText(p).replace(/\r/g, "");
+    text = text.trimEnd();
+    if (!text.trim()) continue;
+
+    globalIdx += 1;
+
+    const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
+    if (isSessionHeading(style, text)) {
+      const headingText = String(text || "").trim();
+      sessionHeaders.push({
+        heading_block_index: globalIdx,
+        heading_text: headingText.slice(0, 140),
+        session_date: extractSessionDate(headingText)
+      });
+    }
+  }
+
+  const sessions = [];
+  for (let i = 0; i < sessionHeaders.length; i++) {
+    const cur = sessionHeaders[i];
+    const next = sessionHeaders[i + 1] || null;
+
+    const start = cur.heading_block_index;
+    const end = next ? (next.heading_block_index - 1) : globalIdx;
+
+    sessions.push({
+      session_index: i,
+      session_date: cur.session_date,
+      heading_block_index: cur.heading_block_index,
+      heading_text: cur.heading_text,
+      start_block_index: start,
+      end_block_index: Math.max(start, end)
+    });
+  }
+
+  return sessions;
+}
+
+function toIsoDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+function addDaysUtc(dateObj, days) {
+  const ms = dateObj.getTime() + (days * 24 * 60 * 60 * 1000);
+  return new Date(ms);
+}
+
+function filterSessionsLastNDays(sessions, days) {
+  if (!Array.isArray(sessions) || sessions.length === 0) return [];
+  const today = new Date();
+  const todayUtcMidnight = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const cutoff = addDaysUtc(todayUtcMidnight, -Math.max(1, Number(days) || 90));
+  const cutoffIso = toIsoDate(cutoff);
+  return sessions.filter(s => (s.session_date || "") >= cutoffIso);
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function htmlForBlock(style, text) {
+  const t = escapeHtml(String(text || "").replace(/\r/g, "").trimEnd());
+  if (!t.trim()) return "";
+  const withBr = t.replace(/\n/g, "<br/>");
+
+  const s = String(style || "NORMAL_TEXT");
+  if (s === "HEADING_1") return `<h1>${withBr}</h1>`;
+  if (s === "HEADING_2") return `<h2>${withBr}</h2>`;
+  if (s === "HEADING_3") return `<h3>${withBr}</h3>`;
+  if (s === "HEADING_4") return `<h4>${withBr}</h4>`;
+  if (s === "HEADING_5") return `<h5>${withBr}</h5>`;
+  if (s === "HEADING_6") return `<h6>${withBr}</h6>`;
+  return `<div class=\"p\">${withBr}</div>`;
+}
+
 /* -------------------- route -------------------- */
 
 router.post("/v1/documents/google/snapshot", requireSession, async (req, res) => {
@@ -174,46 +300,132 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       );
     }
 
-    // Export via Drive API (HTML)
-    const exportUrl =
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export` +
-      `?mimeType=${encodeURIComponent("text/html")}&supportsAllDrives=true`;
+    // Fetch doc via Google Docs API (bounded fields)
+    const fields = [
+      "title",
+      "body(content(paragraph(paragraphStyle(namedStyleType),elements(textRun(content)))))"
+    ].join(",");
 
-    const driveResp = await withTimeout(
-      fetch(exportUrl, {
+    const docsUrl =
+      `https://docs.googleapis.com/v1/documents/${encodeURIComponent(fileId)}?fields=${encodeURIComponent(fields)}`;
+
+    const docsResp = await withTimeout(
+      fetch(docsUrl, {
         method: "GET",
         headers: { Authorization: `Bearer ${accessToken}` }
       }),
-      15000,
-      "google-drive-export"
+      20000,
+      "google-docs-get"
     );
 
-    if (!driveResp.ok) {
-      const errTxt = await driveResp.text().catch(() => "");
-      logger.error("[google-snapshot] drive export failed", {
+    const docsJson = await withTimeout(docsResp.json().catch(() => ({})), 20000, "google-docs-get-body");
+
+    if (!docsResp.ok) {
+      logger.error("[google-snapshot] docs api failed", {
         fileId,
-        status: driveResp.status,
-        body: String(errTxt || "").slice(0, 500)
+        status: docsResp.status,
+        body: JSON.stringify(docsJson).slice(0, 500)
       });
-      // If scope is missing or token invalid, treat as reconnect-required for UX.
-      if (driveResp.status === 401 || driveResp.status === 403) {
+
+      if (docsResp.status === 401 || docsResp.status === 403) {
         return res.status(401).json({
           ok: false,
           error: "GOOGLE_RECONNECT_REQUIRED",
           reconnect_hint: "/v1/auth/google/start"
         });
       }
-      return res.status(403).json({ ok: false, error: "GOOGLE_DRIVE_EXPORT_FAILED" });
+
+      return res.status(403).json({ ok: false, error: "GOOGLE_DOCS_GET_FAILED" });
     }
 
-    const ab = await withTimeout(driveResp.arrayBuffer(), 15000, "google-drive-export-body");
-    const buf = Buffer.from(ab);
+    const title = String(docsJson?.title || "Google Doc").slice(0, 140);
+    const body = docsJson?.body?.content || [];
+
+    // Sessions derived from full doc structure (HEADING_1 dated headers)
+    const sessionsAll = buildSessionsFromDocBody(body);
+    if (!Array.isArray(sessionsAll) || sessionsAll.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "GOOGLE_DOC_FORMAT_REQUIRED",
+        detail: "No dated HEADING_1 sessions found (expected YYYY.M.D or YYYY.MM.DD)."
+      });
+    }
+
+    // Keep only the last 90 days of sessions
+    const sessions = filterSessionsLastNDays(sessionsAll, 90);
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "NO_RECENT_SESSIONS",
+        detail: "No sessions found in the last 90 days."
+      });
+    }
+
+    // Include ranges for the selected sessions
+    const includeRanges = sessions.map(s => ({ start: s.start_block_index, end: s.end_block_index }));
+
+    function inIncludedRanges(globalIdx) {
+      for (const r of includeRanges) {
+        if (globalIdx >= r.start && globalIdx <= r.end) return true;
+      }
+      return false;
+    }
+
+    // Build HTML from included blocks with a strict budget
+    const MAX_CHARS = 1_200_000; // snapshot text budget for 90-day window
+    const MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
+
+    let globalIdx = -1;
+    let chars = 0;
+    const parts = [];
+
+    for (const c of (Array.isArray(body) ? body : [])) {
+      const p = c?.paragraph;
+      if (!p) continue;
+
+      let text = paragraphText(p).replace(/\r/g, "");
+      text = text.trimEnd();
+      if (!text.trim()) continue;
+
+      globalIdx += 1;
+      if (!inIncludedRanges(globalIdx)) continue;
+
+      const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
+
+      // Budget: limit by text chars
+      if (chars + text.length > MAX_CHARS) {
+        const remaining = MAX_CHARS - chars;
+        if (remaining <= 0) break;
+        text = text.slice(0, remaining);
+      }
+
+      const html = htmlForBlock(style, text);
+      if (html) parts.push(html);
+      chars += Math.min(text.length, Math.max(0, MAX_CHARS - chars));
+
+      if (chars >= MAX_CHARS) break;
+    }
+
+    const htmlDoc =
+      "<!doctype html>" +
+      "<html><head><meta charset=\"utf-8\"/>" +
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>" +
+      "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.45;padding:16px;}h1{font-size:20px;margin:18px 0 10px;}h2{font-size:18px;margin:16px 0 8px;}h3{font-size:16px;margin:14px 0 6px;}.p{margin:6px 0;white-space:normal;}</style>" +
+      "</head><body>" +
+      parts.join("\n") +
+      "</body></html>";
+
+    const buf = Buffer.from(htmlDoc, "utf8");
     const sizeBytes = buf.length;
 
-    // Simple server-side guardrail (HTML snapshots should not be huge)
-    const MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
     if (sizeBytes > MAX_HTML_BYTES) {
-      return res.status(413).json({ ok: false, error: "SNAPSHOT_TOO_LARGE", size_bytes: sizeBytes });
+      return res.status(413).json({
+        ok: false,
+        error: "SNAPSHOT_TOO_LARGE_FOR_GOOGLE_DOC",
+        detail: "The last 90 days slice is too large. Download as DOCX and upload to HakMun.",
+        size_bytes: sizeBytes,
+        max_bytes: MAX_HTML_BYTES
+      });
     }
 
     // Write to object storage + insert media_assets
@@ -270,9 +482,12 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       ok: true,
       file_id: fileId,
       google_doc_url: url,
+      title,
       asset_id: assetID,
       viewer_url: viewerUrl,
-      expiresIn: 900
+      expiresIn: 900,
+      sessions_included: sessions.length,
+      days_window: 90
     });
   } catch (err) {
     const msg = String(err?.message || err);
@@ -284,8 +499,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
         reconnect_hint: "/v1/auth/google/start"
       });
     }
-    if (msg.startsWith("timeout:google-drive-export") || msg.startsWith("timeout:google-drive-export-body")) {
-      return res.status(503).json({ ok: false, error: "GOOGLE_DRIVE_TIMEOUT" });
+    if (msg.startsWith("timeout:google-docs-get") || msg.startsWith("timeout:google-docs-get-body")) {
+      return res.status(503).json({ ok: false, error: "GOOGLE_DOCS_TIMEOUT" });
     }
 
     if (msg.startsWith("timeout:s3-put-google-html")) {
