@@ -82,21 +82,27 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
     if (!parsed) return res.status(400).json({ ok: false, error: "INVALID_SET_ID" });
 
     if (parsed.kind === "teaching_all") {
-      const sql = `
-        SELECT
-          tvs.vocab_sense_key AS id,
-          tvs.vocab_id,
-          tvs.sense_index,
-          tvs.lemma,
-          tvs.part_of_speech,
-          tvs.pos_code,
-          tvs.pos_label,
-          tvs.gloss_en
-        FROM teaching_vocab_split tvs
-        WHERE tvs.status IS DISTINCT FROM 'archived'
-        ORDER BY tvs.lemma, tvs.sense_index
-        LIMIT 50000
-      `;
+    const sql = `
+      SELECT
+        tvn.vocab_sense_key AS id,
+        tvn.vocab_id,
+        tvn.sense_index,
+        tvn.lemma,
+        tvn.part_of_speech,
+        tvn.pos_code,
+        tvn.pos_label,
+        tvn.gloss_en,
+    
+        tvn.nikl_target_code,
+        tvn.nikl_sense_no,
+        tvn.nikl_definition_ko,
+        tvn.nikl_trans_word_en,
+        tvn.nikl_trans_definition_en
+      FROM teaching_vocab_split_nikl tvn
+      WHERE tvn.status IS DISTINCT FROM 'archived'
+      ORDER BY tvn.lemma, tvn.sense_index
+      LIMIT 50000
+    `;
       const { rows } = await dbQuery(sql, []);
       return res.json({ ok: true, set_id: setId, kind: "teaching", items: rows || [] });
     }
