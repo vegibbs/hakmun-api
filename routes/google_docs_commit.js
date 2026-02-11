@@ -1,5 +1,3 @@
-
-
 // FILE: hakmun-api/routes/google_docs_commit.js
 // PURPOSE: D2.x — Commit reviewed highlight-import items into user library tables.
 // ENDPOINT:
@@ -143,10 +141,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                owner_user_id,
                content_type,
                text,
-               audience,
-               operational_status
+               language,
+               notes
              )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'personal', 'active')
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL)
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
             [contentItemId, userId, "sentence", ko]
@@ -169,6 +167,19 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
             ),
             8000,
             "db-link-doc-content-sentence"
+          );
+
+          await withTimeout(
+            client.query(
+              `INSERT INTO library_registry_items
+                 (id, content_type, content_id, owner_user_id, audience, global_state, operational_status)
+               VALUES
+                 ($1::uuid, $2::text, $3::uuid, $4::uuid, 'personal', NULL, 'active')
+               ON CONFLICT (content_type, content_id) DO NOTHING`,
+              [crypto.randomUUID(), 'sentence', insertedId, userId]
+            ),
+            8000,
+            "db-insert-registry-sentence"
           );
         }
       }
@@ -194,10 +205,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                owner_user_id,
                content_type,
                text,
-               audience,
-               operational_status
+               language,
+               notes
              )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'personal', 'active')
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL)
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
             [contentItemId, userId, "pattern", text]
@@ -219,6 +230,19 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
             ),
             8000,
             "db-link-doc-content-pattern"
+          );
+
+          await withTimeout(
+            client.query(
+              `INSERT INTO library_registry_items
+                 (id, content_type, content_id, owner_user_id, audience, global_state, operational_status)
+               VALUES
+                 ($1::uuid, $2::text, $3::uuid, $4::uuid, 'personal', NULL, 'active')
+               ON CONFLICT (content_type, content_id) DO NOTHING`,
+              [crypto.randomUUID(), 'pattern', insertedId, userId]
+            ),
+            8000,
+            "db-insert-registry-pattern"
           );
         }
 
