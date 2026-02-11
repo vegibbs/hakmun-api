@@ -84,18 +84,17 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
     if (parsed.kind === "teaching_all") {
       const sql = `
         SELECT
-          tv.id AS vocab_id,
-          tv.lemma,
-          tv.part_of_speech,
-          tv.pos_code,
-          tv.pos_label,
-          vg.text AS gloss_en
-        FROM teaching_vocab tv
-        LEFT JOIN vocab_glosses vg
-          ON vg.vocab_id = tv.id
-         AND vg.language = 'en'
-         AND vg.is_primary = true
-        ORDER BY tv.lemma
+          tvs.vocab_sense_key AS id,
+          tvs.vocab_id,
+          tvs.sense_index,
+          tvs.lemma,
+          tvs.part_of_speech,
+          tvs.pos_code,
+          tvs.pos_label,
+          tvs.gloss_en
+        FROM teaching_vocab_split tvs
+        WHERE tvs.status IS DISTINCT FROM 'archived'
+        ORDER BY tvs.lemma, tvs.sense_index
         LIMIT 50000
       `;
       const { rows } = await dbQuery(sql, []);
