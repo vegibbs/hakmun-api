@@ -333,7 +333,17 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       return res.status(500).json({ ok: false, error: "MISSING_TABLE", table: "document_vocab_links" });
     }
 
-    logger.error("[google-commit] failed", { err: msg });
+    logger.error("[google-commit] failed", {
+      message: err?.message,
+      code: err?.code,
+      detail: err?.detail,
+      constraint: err?.constraint,
+      table: err?.table,
+      schema: err?.schema,
+      column: err?.column,
+      where: err?.where,
+      stack: err?.stack
+    });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
