@@ -138,8 +138,15 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
         const ins = await withTimeout(
           client.query(
-            `INSERT INTO content_items (content_item_id, owner_user_id, content_type, text)
-             VALUES ($1::uuid, $2::uuid, $3, $4)
+            `INSERT INTO content_items (
+               content_item_id,
+               owner_user_id,
+               content_type,
+               text,
+               audience,
+               operational_status
+             )
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'personal', 'active')
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
             [contentItemId, userId, "sentence", ko]
@@ -182,8 +189,15 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
         const ins = await withTimeout(
           client.query(
-            `INSERT INTO content_items (content_item_id, owner_user_id, content_type, text)
-             VALUES ($1::uuid, $2::uuid, $3, $4)
+            `INSERT INTO content_items (
+               content_item_id,
+               owner_user_id,
+               content_type,
+               text,
+               audience,
+               operational_status
+             )
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'personal', 'active')
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
             [contentItemId, userId, "pattern", text]

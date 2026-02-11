@@ -64,6 +64,12 @@ SMOKE_TEST_SECRET="$(trim_quotes "$SMOKE_TEST_SECRET")"
 
 HAKMUN_API_BASE_URL="${HAKMUN_API_BASE_URL%/}"
 
+# -------------------------------------------------------------------
+# Optional: disable write tests that create content_items (to avoid spam)
+# Set SMOKE_CREATE_CONTENT_ITEMS=1 to enable.
+# -------------------------------------------------------------------
+SMOKE_CREATE_CONTENT_ITEMS="${SMOKE_CREATE_CONTENT_ITEMS:-0}"
+
 print_section "1) Mint smoke access token"
 
 TOKEN_BODY="$(curl -sS -X POST "$HAKMUN_API_BASE_URL/v1/dev/smoke-token" -H "X-Smoke-Secret: $SMOKE_TEST_SECRET")"
@@ -178,8 +184,9 @@ hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
 hit "content items (sentences) -> /v1/content/items?content_type=sentence" \
   "$HAKMUN_API_BASE_URL/v1/content/items?content_type=sentence"
 
-CONTENT_TEXT="Smoke test sentence $(date +%Y-%m-%dT%H:%M:%S)"
-CONTENT_BODY="$(python3 - <<PY
+if [[ "$SMOKE_CREATE_CONTENT_ITEMS" == "1" ]]; then
+  CONTENT_TEXT="Smoke test sentence $(date +%Y-%m-%dT%H:%M:%S)"
+  CONTENT_BODY="$(python3 - <<PY
 import json
 print(json.dumps({
   "content_type": "sentence",
@@ -188,13 +195,16 @@ print(json.dumps({
 PY
 )"
 
-post_json_expect "content item create -> POST /v1/content/items" \
-  "$HAKMUN_API_BASE_URL/v1/content/items" \
-  "$CONTENT_BODY" \
-  201
+  post_json_expect "content item create -> POST /v1/content/items" \
+    "$HAKMUN_API_BASE_URL/v1/content/items" \
+    "$CONTENT_BODY" \
+    201
 
-hit "content items (sentences) after create -> /v1/content/items?content_type=sentence" \
-  "$HAKMUN_API_BASE_URL/v1/content/items?content_type=sentence"
+  hit "content items (sentences) after create -> /v1/content/items?content_type=sentence" \
+    "$HAKMUN_API_BASE_URL/v1/content/items?content_type=sentence"
+else
+  echo "[SKIP] content item create -> POST /v1/content/items (set SMOKE_CREATE_CONTENT_ITEMS=1 to enable)"
+fi
 
 hit "content coverage (sentences) -> /v1/content/items/coverage?content_type=sentence" \
   "$HAKMUN_API_BASE_URL/v1/content/items/coverage?content_type=sentence"
