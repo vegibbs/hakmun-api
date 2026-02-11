@@ -31,6 +31,8 @@ const { withTimeout } = require("../util/time");
 
 const router = express.Router();
 
+const { analyzeTextForImport } = require("../util/openai");
+
 function mustEnv(name) {
   const v = process.env[name];
   if (!v || !String(v).trim()) throw new Error(`Missing env var: ${name}`);
@@ -185,7 +187,30 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
         : selectedText;
 
       scopeObj = { mode: "highlight" };
-      // NOTE: In highlight mode we DO NOT fetch doc blocks and DO NOT require Google OAuth.
+
+      // -----------------------------
+      // SYNCHRONOUS HIGHLIGHT IMPORT
+      // -----------------------------
+
+      // Analyze text immediately via OpenAI using doc_import profile (preview-only, no DB writes)
+      const analysis = await analyzeTextForImport({
+        text: selectionTextBounded,
+        importAs,
+        profile: "doc_import",
+        glossLang: null
+      });
+
+      return res.status(200).json({
+        ok: true,
+        scope: scopeObj,
+        selection_chars: selectionTextBounded.length,
+        preview: {
+          vocabulary: analysis.vocabulary || [],
+          sentences: analysis.sentences || [],
+          patterns: analysis.patterns || [],
+          gloss_lang: analysis.gloss_lang || null
+        }
+      });
     } else {
       const startIdx = Number(req.body?.start_block_index);
       const endIdx = Number(req.body?.end_block_index);
