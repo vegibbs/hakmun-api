@@ -247,8 +247,12 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         }
 
         // Also stage for later promotion if needed (best-effort; table may not exist yet)
-        // We do NOT fail commit if staging table is missing.
+        // IMPORTANT: This must NOT abort the surrounding transaction.
+        // We use a SAVEPOINT so any staging failure can be rolled back without poisoning BEGIN/COMMIT.
+        const spName = "sp_unmatched_grammar";
         try {
+          await client.query(`SAVEPOINT ${spName}`);
+
           const norm = surface.replace(/[\s\t\n\r]/g, "");
           await client.query(
             `INSERT INTO unmatched_grammar_patterns (unmatched_id, owner_user_id, document_id, surface_form, alias_norm, context_span, count, first_seen_at, last_seen_at)
@@ -257,8 +261,14 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
              DO UPDATE SET last_seen_at = now(), count = unmatched_grammar_patterns.count + 1`,
             [crypto.randomUUID(), userId, documentId, surface, norm, context || null]
           );
+
+          await client.query(`RELEASE SAVEPOINT ${spName}`);
         } catch (e) {
-          // ignore (staging not yet installed)
+          try {
+            await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+            await client.query(`RELEASE SAVEPOINT ${spName}`);
+          } catch (_) {}
+          // ignore (staging not yet installed or other non-fatal staging error)
         }
       }
 
