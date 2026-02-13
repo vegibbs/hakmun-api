@@ -88,16 +88,27 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
         tvn.vocab_id,
         tvn.sense_index,
         tvn.lemma,
-        tvn.part_of_speech,
-        tvn.pos_code,
-        tvn.pos_label,
-        tvn.gloss_en,
-    
+
+        -- POS (KO + localized EN)
+        tvn.pos_ko,
+        tvn.pos_en,
+
+        -- Teaching label + definitions
+        tvn.label_en,
+        tvn.definition_en,
+        tvn.definition_ko,
+
+        -- NIKL linkage + raw EN translation fields
         tvn.nikl_target_code,
         tvn.nikl_sense_no,
-        tvn.nikl_definition_ko,
         tvn.nikl_trans_word_en,
-        tvn.nikl_trans_definition_en
+        tvn.nikl_trans_definition_en,
+
+        -- Overrides (exposed for admin tooling)
+        tvn.label_override_en,
+        tvn.word_override_en,
+        tvn.pos_override_en,
+        tvn.definition_override_en
       FROM teaching_vocab_split_nikl tvn
       WHERE tvn.status IS DISTINCT FROM 'archived'
       ORDER BY tvn.lemma, tvn.sense_index
