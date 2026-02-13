@@ -68,6 +68,8 @@ app.use(require("./routes/dictionary_pins_write"));
 app.use(require("./routes/dictionary_pins_delete"));
 app.use(require("./routes/my_vocab"));
 app.use(require("./routes/dictionary_sets"));
+app.use(require("./routes/nikl_search"));
+app.use(require("./routes/teaching_vocab_admin"));
 app.use(require("./routes/google_docs"));
 app.use(require("./routes/google_oauth"));
 app.use(require("./routes/google_docs_import"));
