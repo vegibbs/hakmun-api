@@ -70,22 +70,22 @@ router.get("/v1/nikl/search", requireSession, async (req, res) => {
     // Group senses by entry
     const sensesByCode = {};
     for (const s of senseRows) {
-      const key = s.provider_target_code;
+      const key = Number(s.provider_target_code);
       if (!sensesByCode[key]) sensesByCode[key] = [];
       sensesByCode[key].push({
-        sense_no: s.sense_no,
+        sense_no: Number(s.sense_no),
         definition_ko: s.definition_ko || "",
         trans_word_en: s.trans_word_en || null,
         trans_definition_en: s.trans_definition_en || null,
-        provider_target_code: s.provider_target_code,
+        provider_target_code: Number(s.provider_target_code),
       });
     }
 
     const entries = entryRows.map((e) => ({
-      provider_target_code: e.provider_target_code,
+      provider_target_code: Number(e.provider_target_code),
       headword: e.headword,
       pos_ko: e.pos_ko || null,
-      senses: sensesByCode[e.provider_target_code] || [],
+      senses: sensesByCode[Number(e.provider_target_code)] || [],
     }));
 
     return res.json({ ok: true, entries });
