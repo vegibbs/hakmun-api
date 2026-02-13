@@ -22,7 +22,7 @@ function looksLikeUUID(s) {
 // PATCH /v1/admin/teaching_vocab/:vocab_id/:sense_index
 function requireTeacherOrAdmin(req, res, next) {
   const ents = req.user?.entitlements || [];
-  const allowed = ents.includes("teacher:tools") || ents.includes("admin:*");
+  const allowed = ents.includes("teacher:tools") || ents.includes("flag:is_root_admin");
   if (!allowed) return res.status(403).json({ error: "insufficient entitlement" });
   return next();
 }
