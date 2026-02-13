@@ -84,34 +84,56 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
     if (parsed.kind === "teaching_all") {
     const sql = `
       SELECT
-        tvn.vocab_sense_key AS id,
-        tvn.vocab_id,
-        tvn.sense_index,
-        tvn.lemma,
+        (tv.id::text || ':' || ap.sense_index::text) AS id,
+        tv.id AS vocab_id,
+        ap.sense_index,
 
-        -- POS (KO + localized EN)
-        tvn.pos_ko,
-        tvn.pos_en,
+        -- Canonical (NIKL)
+        tv.lemma,
+        ne.pos_ko AS nikl_pos_ko,
+        ns.definition_ko AS nikl_definition_ko,
+        st.trans_word AS nikl_trans_word_en,
+        st.trans_definition AS nikl_trans_definition_en,
 
-        -- Teaching label + definitions
-        tvn.label_en,
-        tvn.definition_en,
-        tvn.definition_ko,
+        -- TV override columns (editable)
+        ov_en.word_override AS tv_override_nikl_trans_word_en,
+        ov_en.definition_override AS tv_override_nikl_trans_definition_en,
+        ov_en.pos_override AS tv_override_en_lookup_from_nikl_pos_ko,
 
-        -- NIKL linkage + raw EN translation fields
-        tvn.nikl_target_code,
-        tvn.nikl_sense_no,
-        tvn.nikl_trans_word_en,
-        tvn.nikl_trans_definition_en,
+        -- Legacy reference (temporary)
+        ap.gloss_en AS legacy_gloss_en,
 
-        -- Overrides (exposed for admin tooling)
-        tvn.label_override_en,
-        tvn.word_override_en,
-        tvn.pos_override_en,
-        tvn.definition_override_en
-      FROM teaching_vocab_split_nikl tvn
-      WHERE tvn.status IS DISTINCT FROM 'archived'
-      ORDER BY tvn.lemma, tvn.sense_index
+        -- Linkage (useful for matching / editor)
+        ap.nikl_target_code,
+        ap.nikl_sense_no
+
+      FROM teaching_vocab_split_apply_plan ap
+      JOIN teaching_vocab tv
+        ON tv.id = ap.vocab_id
+
+      LEFT JOIN nikl_entries ne
+        ON ne.provider = 'krdict'
+       AND ne.provider_target_code = ap.nikl_target_code
+
+      LEFT JOIN nikl_senses ns
+        ON ns.provider = 'krdict'
+       AND ns.provider_target_code = ap.nikl_target_code
+       AND ns.sense_no = ap.nikl_sense_no
+
+      LEFT JOIN nikl_sense_translations st
+        ON st.provider = 'krdict'
+       AND st.provider_target_code = ap.nikl_target_code
+       AND st.sense_no = ap.nikl_sense_no
+       AND st.lang = 'en'
+       AND st.idx = 1
+
+      LEFT JOIN teaching_vocab_localized_overrides ov_en
+        ON ov_en.vocab_id = ap.vocab_id
+       AND ov_en.sense_index = ap.sense_index
+       AND ov_en.lang = 'en'
+
+      WHERE tv.status IS DISTINCT FROM 'archived'
+      ORDER BY tv.lemma, ap.sense_index
       LIMIT 50000
     `;
       const { rows } = await dbQuery(sql, []);
