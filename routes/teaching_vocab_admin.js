@@ -80,8 +80,7 @@ router.patch(
         UPDATE teaching_vocab_split_apply_plan
         SET
           nikl_target_code = COALESCE($3, nikl_target_code),
-          nikl_sense_no = COALESCE($4, nikl_sense_no),
-          updated_at = NOW()
+          nikl_sense_no = COALESCE($4, nikl_sense_no)
         WHERE vocab_id = $1::uuid AND sense_index = $2
       `;
       await dbQuery(updateSql, [vocabId, senseIndex, nikl_target_code, nikl_sense_no]);
