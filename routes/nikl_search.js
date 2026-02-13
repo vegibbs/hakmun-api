@@ -44,7 +44,7 @@ router.get("/v1/nikl/search", requireSession, async (req, res) => {
       return res.json({ ok: true, entries: [] });
     }
 
-    const targetCodes = entryRows.map((r) => r.provider_target_code);
+    const targetCodes = entryRows.map((r) => Number(r.provider_target_code));
 
     // Fetch all senses for these entries
     const sensesSql = `
@@ -62,7 +62,7 @@ router.get("/v1/nikl/search", requireSession, async (req, res) => {
        AND st.lang = 'en'
        AND st.idx = 1
       WHERE ns.provider = 'krdict'
-        AND ns.provider_target_code = ANY($1::int[])
+        AND ns.provider_target_code = ANY($1)
       ORDER BY ns.provider_target_code, ns.sense_no
     `;
     const { rows: senseRows } = await dbQuery(sensesSql, [targetCodes]);
