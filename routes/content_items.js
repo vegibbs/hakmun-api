@@ -275,7 +275,20 @@ router.delete("/v1/content/items", requireSession, async (req, res) => {
   try {
     if (client) await q("BEGIN", []);
 
-    // Delete registry rows first (FK-safe)
+    // Delete document_registry_links that reference these registry items
+    await q(
+      `
+      DELETE FROM document_registry_links
+      WHERE registry_item_id IN (
+        SELECT id FROM library_registry_items
+        WHERE content_id = ANY($1::uuid[])
+          AND owner_user_id = $2::uuid
+      )
+      `,
+      [ids, userId]
+    );
+
+    // Delete registry rows (FK-safe now that links are gone)
     await q(
       `
       DELETE FROM library_registry_items
