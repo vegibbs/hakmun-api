@@ -160,11 +160,16 @@ router.get("/v1/documents/sources", requireSession, async (req, res) => {
            sds.title,
            sds.created_at,
            sds.updated_at,
-           d.document_id
+           ld.document_id
          FROM saved_document_sources sds
-         LEFT JOIN documents d
-           ON d.owner_user_id = sds.owner_user_id
-          AND d.source_uri = sds.source_uri
+         LEFT JOIN LATERAL (
+           SELECT d.document_id
+             FROM documents d
+            WHERE d.owner_user_id = sds.owner_user_id
+              AND d.source_uri = sds.source_uri
+            ORDER BY d.created_at DESC
+            LIMIT 1
+         ) ld ON true
          WHERE sds.owner_user_id = $1::uuid
          ORDER BY sds.updated_at DESC, sds.created_at DESC`,
         [userId]
