@@ -65,6 +65,8 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
         ci.cefr_level,
         ci.topic,
         ci.naturalness_score,
+        ci.politeness,
+        ci.tense,
         ci.created_at,
         ci.updated_at,
 
@@ -120,6 +122,8 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         ci.cefr_level,
         ci.topic,
         ci.naturalness_score,
+        ci.politeness,
+        ci.tense,
         ci.created_at,
         ci.updated_at,
 

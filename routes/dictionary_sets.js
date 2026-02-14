@@ -105,7 +105,12 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
 
         -- Linkage (useful for matching / editor)
         ap.nikl_target_code,
-        ap.nikl_sense_no
+        ap.nikl_sense_no,
+
+        -- CEFR classification
+        tv.cefr_level,
+        tv.cefr_confidence,
+        tv.cefr_authority
 
       FROM teaching_vocab_split_apply_plan ap
       JOIN teaching_vocab tv
