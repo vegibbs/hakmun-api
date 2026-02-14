@@ -80,6 +80,7 @@ app.use(require("./routes/ingest_text_chunked"));
 app.use(require("./routes/document_sources"));
 app.use(require("./routes/google_docs_snapshot"));
 app.use(require("./routes/google_docs_commit"));
+app.use(require("./routes/practice_events"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
