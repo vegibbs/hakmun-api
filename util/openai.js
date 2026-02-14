@@ -21,7 +21,7 @@ if (!OPENAI_API_KEY) {
 const OPENAI_MODEL = "gpt-4.1-mini";
 
 // Hard limits to protect the server
-const REQUEST_TIMEOUT_MS = 25_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_RETRIES = 1;
 
 function sleep(ms) {
