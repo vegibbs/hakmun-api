@@ -175,10 +175,51 @@ delete_json_expect() {
 }
 
 # Baseline endpoints
+
 hit "whoami -> /v1/session/whoami" "$HAKMUN_API_BASE_URL/v1/session/whoami"
 hit "library/global -> /v1/library/global" "$HAKMUN_API_BASE_URL/v1/library/global"
 hit "library/review-inbox -> /v1/library/review-inbox" "$HAKMUN_API_BASE_URL/v1/library/review-inbox"
 hit "assets list -> /v1/assets" "$HAKMUN_API_BASE_URL/v1/assets"
+
+# -------------------------------------------------------------------
+# 2.1) Teaching vocab set (teaching:ALL)
+# -------------------------------------------------------------------
+
+print_section "2.1) Teaching vocab set (teaching:ALL)"
+
+TEACHING_SET_URL="$HAKMUN_API_BASE_URL/v1/dictionary/sets/teaching:ALL/items"
+
+TEACHING_FILE="$(mktemp)"
+TEACHING_CODE="$(curl -sS -o "$TEACHING_FILE" -w "%{http_code}" "$TEACHING_SET_URL" -H "$AUTH_HEADER")"
+
+echo "[$TEACHING_CODE] teaching vocab items -> GET /v1/dictionary/sets/teaching:ALL/items"
+
+echo -n "  OK: "
+cat "$TEACHING_FILE" | body_prefix
+echo ""
+
+if [[ "$TEACHING_CODE" != "200" ]]; then
+  rm -f "$TEACHING_FILE"
+  die "Teaching vocab set items failed"
+fi
+
+python3 - <<'PY' "$TEACHING_FILE"
+import json,sys
+path=sys.argv[1]
+with open(path,'r',encoding='utf-8') as f:
+    d=json.load(f)
+assert d.get('ok') is True, d
+items=d.get('items') or []
+assert isinstance(items,list), d
+if items:
+    it=items[0]
+    # Required fields for new teaching vocab shape
+    for k in ['lemma','pos_ko','pos_en','label_en','definition_en','definition_ko']:
+        assert k in it, f"missing {k} in first item: {it.keys()}"
+print('✅ teaching vocab items include pos_ko/pos_en + label_en/definition_en/definition_ko')
+PY
+
+rm -f "$TEACHING_FILE"
 
 # Canonical content items (sentences)
 hit "content items (sentences) -> /v1/content/items?content_type=sentence" \
