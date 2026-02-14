@@ -19,14 +19,24 @@ function dbQuery(sql, params) {
   throw new Error("db/pool export does not provide query()");
 }
 
+const NATURALNESS_THRESHOLD = 0.7;
+
+const TOPIC_ENUM = [
+  "daily_life", "food", "weather", "travel", "work", "school",
+  "shopping", "health", "hobbies", "relationships", "directions",
+  "time", "emotions", "family", "transportation", "housing",
+  "clothing", "nature", "culture", "technology",
+];
+
 const TIER_CEFR = {
-  beginner: { label: "A1-A2 (beginner)", cefr: "A2" },
-  intermediate: { label: "B1-B2 (intermediate)", cefr: "B1" },
-  advanced: { label: "C1-C2 (advanced)", cefr: "C1" },
+  beginner: { label: "A1-A2 (beginner)", cefrRange: "A1 or A2" },
+  intermediate: { label: "B1-B2 (intermediate)", cefrRange: "B1 or B2" },
+  advanced: { label: "C1-C2 (advanced)", cefrRange: "C1 or C2" },
 };
 
 function buildGenerationPrompt(tier, count) {
   const info = TIER_CEFR[tier] || TIER_CEFR.beginner;
+  const topicsCsv = TOPIC_ENUM.join(", ");
 
   return `You are a Korean language teaching assistant creating practice sentences for students.
 
@@ -37,17 +47,27 @@ Rules:
 - Each sentence must be a complete, natural, standalone Korean sentence.
 - Use everyday vocabulary appropriate for the level.
 - Vary the grammar patterns: mix past, present, and future tenses.
-- Vary the topics: daily life, food, weather, hobbies, travel, school, work, etc.
 - Do NOT repeat the same sentence structure. Each sentence should feel different.
 - Do NOT include English words mixed into Korean.
 - Each sentence should be 5-20 syllables long.
+
+For each sentence, also provide:
+- cefr_level: your best estimate of the CEFR level (${info.cefrRange}).
+- topic: pick ONE from this list: ${topicsCsv}
+- naturalness_score: how confident are you (0.0 to 1.0) that a native Korean speaker would actually say this sentence in everyday life? Be honest — penalize textbook-sounding or unnatural phrasing.
 
 Return ONLY valid JSON. No markdown. No explanations.
 
 Output schema:
 {
   "sentences": [
-    { "ko": "Korean sentence here", "en": "English translation here" }
+    {
+      "ko": "Korean sentence here",
+      "en": "English translation here",
+      "cefr_level": "A2",
+      "topic": "daily_life",
+      "naturalness_score": 0.95
+    }
   ]
 }`;
 }
@@ -83,13 +103,24 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
       return res.status(502).json({ ok: false, error: "OPENAI_EMPTY_RESPONSE" });
     }
 
-    // 2. Filter and normalize
+    // 2. Filter, normalize, and apply naturalness threshold
     const validSentences = parsed.sentences
       .filter((s) => s && typeof s.ko === "string" && s.ko.trim().length >= 5)
-      .map((s) => ({
-        ko: s.ko.trim(),
-        en: typeof s.en === "string" ? s.en.trim() : null,
-      }));
+      .map((s) => {
+        const score = typeof s.naturalness_score === "number" && Number.isFinite(s.naturalness_score)
+          ? s.naturalness_score : null;
+        const cefr = typeof s.cefr_level === "string" ? s.cefr_level.trim() : null;
+        let topic = typeof s.topic === "string" ? s.topic.trim() : null;
+        if (topic && !TOPIC_ENUM.includes(topic)) topic = null;
+        return {
+          ko: s.ko.trim(),
+          en: typeof s.en === "string" ? s.en.trim() : null,
+          cefr_level: cefr || null,
+          topic,
+          naturalness_score: score,
+        };
+      })
+      .filter((s) => s.naturalness_score === null || s.naturalness_score >= NATURALNESS_THRESHOLD);
 
     if (validSentences.length === 0) {
       return res.status(502).json({ ok: false, error: "OPENAI_NO_VALID_SENTENCES" });
@@ -107,11 +138,14 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
       for (const s of validSentences) {
         const ins = await q(
           `
-          INSERT INTO content_items (owner_user_id, content_type, text, language, notes)
-          VALUES ($1::uuid, 'sentence', $2::text, 'ko', $3::text)
-          RETURNING content_item_id, content_type, text, language, notes, created_at, updated_at
+          INSERT INTO content_items
+            (owner_user_id, content_type, text, language, notes,
+             cefr_level, topic, naturalness_score)
+          VALUES ($1::uuid, 'sentence', $2::text, 'ko', $3::text, $4, $5, $6)
+          RETURNING content_item_id, content_type, text, language, notes,
+                    cefr_level, topic, naturalness_score, created_at, updated_at
           `,
-          [userId, s.ko, s.en]
+          [userId, s.ko, s.en, s.cefr_level, s.topic, s.naturalness_score]
         );
         const item = ins.rows[0];
 
@@ -133,6 +167,9 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
           text: item.text,
           language: item.language,
           notes: item.notes,
+          cefr_level: item.cefr_level,
+          topic: item.topic,
+          naturalness_score: item.naturalness_score,
           created_at: item.created_at,
           updated_at: item.updated_at,
           registry_item_id: registry.id,
