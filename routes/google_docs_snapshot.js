@@ -225,13 +225,16 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
-function htmlForBlock(style, text) {
+function htmlForBlock(style, text, sessionDate) {
   const t = escapeHtml(String(text || "").replace(/\r/g, "").trimEnd());
   if (!t.trim()) return "";
   const withBr = t.replace(/\n/g, "<br/>");
 
   const s = String(style || "NORMAL_TEXT");
-  if (s === "HEADING_1") return `<h1>${withBr}</h1>`;
+  if (s === "HEADING_1") {
+    const attr = sessionDate ? ` data-session-date="${escapeHtml(sessionDate)}"` : "";
+    return `<h1${attr}>${withBr}</h1>`;
+  }
   if (s === "HEADING_2") return `<h2>${withBr}</h2>`;
   if (s === "HEADING_3") return `<h3>${withBr}</h3>`;
   if (s === "HEADING_4") return `<h4>${withBr}</h4>`;
@@ -392,6 +395,12 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
 
       const style = p?.paragraphStyle?.namedStyleType || "NORMAL_TEXT";
 
+      // Track session date for h1 headings
+      let blockSessionDate = null;
+      if (isSessionHeading(style, text)) {
+        blockSessionDate = extractSessionDate(text.trim());
+      }
+
       // Budget: limit by text chars
       if (chars + text.length > MAX_CHARS) {
         const remaining = MAX_CHARS - chars;
@@ -399,7 +408,7 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
         text = text.slice(0, remaining);
       }
 
-      const html = htmlForBlock(style, text);
+      const html = htmlForBlock(style, text, blockSessionDate);
       if (html) parts.push(html);
       chars += Math.min(text.length, Math.max(0, MAX_CHARS - chars));
 

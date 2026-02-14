@@ -93,6 +93,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
     const snapshotAssetId = cleanString(req.body?.asset_id, 80);
     const documentTitle = cleanString(req.body?.title, 140);
 
+    // Session date from the HEADING_1 the highlighted text falls under (YYYY-MM-DD or null)
+    const rawSessionDate = cleanString(req.body?.session_date, 10);
+    const sessionDate = /^\d{4}-\d{2}-\d{2}$/.test(rawSessionDate) ? rawSessionDate : null;
+
     if (!googleDocUrl) {
       return res.status(400).json({ ok: false, error: "GOOGLE_DOC_URL_REQUIRED" });
     }
@@ -175,10 +179,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           // Link to document for scoping (requires table to exist)
           await withTimeout(
             client.query(
-              `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind)
-               VALUES ($1::uuid, $2::uuid, 'sentence')
+              `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind, session_date)
+               VALUES ($1::uuid, $2::uuid, 'sentence', $3::date)
                ON CONFLICT DO NOTHING`,
-              [documentId, insertedId]
+              [documentId, insertedId, sessionDate]
             ),
             8000,
             "db-link-doc-content-sentence"
@@ -251,10 +255,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
           await withTimeout(
             client.query(
-              `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind)
-               VALUES ($1::uuid, $2::uuid, 'pattern')
+              `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind, session_date)
+               VALUES ($1::uuid, $2::uuid, 'pattern', $3::date)
                ON CONFLICT DO NOTHING`,
-              [documentId, insertedId]
+              [documentId, insertedId, sessionDate]
             ),
             8000,
             "db-link-doc-content-pattern"
@@ -346,10 +350,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         // Link vocab to document for later scoping (requires table to exist)
         await withTimeout(
           client.query(
-            `INSERT INTO document_vocab_links (document_id, user_id, lemma)
-             VALUES ($1::uuid, $2::uuid, $3)
+            `INSERT INTO document_vocab_links (document_id, user_id, lemma, session_date)
+             VALUES ($1::uuid, $2::uuid, $3, $4::date)
              ON CONFLICT DO NOTHING`,
-            [documentId, userId, lemma]
+            [documentId, userId, lemma, sessionDate]
           ),
           8000,
           "db-link-doc-vocab"
