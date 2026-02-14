@@ -419,7 +419,7 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       "<!doctype html>" +
       "<html><head><meta charset=\"utf-8\"/>" +
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>" +
-      "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.45;padding:16px;}h1{font-size:20px;margin:18px 0 10px;}h2{font-size:18px;margin:16px 0 8px;}h3{font-size:16px;margin:14px 0 6px;}.p{margin:6px 0;white-space:normal;}</style>" +
+      "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.45;padding:16px;color:#1d1d1f;background:#fff;}h1{font-size:20px;margin:18px 0 10px;}h2{font-size:18px;margin:16px 0 8px;}h3{font-size:16px;margin:14px 0 6px;}.p{margin:6px 0;white-space:normal;}@media(prefers-color-scheme:dark){body{color:#f5f5f7;background:#1d1d1f;}}</style>" +
       "</head><body>" +
       parts.join("\n") +
       "</body></html>";
