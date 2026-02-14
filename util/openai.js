@@ -287,5 +287,6 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
 }
 
 module.exports = {
-  analyzeTextForImport
+  analyzeTextForImport,
+  callOpenAIOnce
 };
