@@ -200,16 +200,29 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       }
 
       // -----------------------------
-      // Patterns -> content_items (unlinked patterns are allowed)
+      // Patterns -> content_items (dedupe on owner + text)
       // -----------------------------
       for (const p of patterns) {
         const surface = cleanString(p?.surface_form, 200);
         const context = cleanString(p?.context_span, 400);
         if (!surface) continue;
 
-        // Store a readable pattern item for the user.
-        // Authoritative matching to global pattern IDs happens later in the pipeline.
         const text = context ? `${surface}\n${context}` : surface;
+
+        // Check for existing pattern with same text for this user
+        const existingPattern = await withTimeout(
+          client.query(
+            `SELECT content_item_id FROM content_items
+             WHERE owner_user_id = $1::uuid
+               AND content_type = 'pattern'
+               AND text = $2
+             LIMIT 1`,
+            [userId, text]
+          ),
+          8000,
+          "db-check-dup-pattern"
+        );
+        if (existingPattern.rows.length > 0) continue;
 
         const contentItemId = crypto.randomUUID();
 
@@ -294,9 +307,25 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         const lemma = cleanString(v?.lemma_ko, 200);
         if (!lemma) continue;
 
-        // Optional global dictionary link if provided by later NIKL match step
-        const vocabId = cleanString(v?.vocab_id, 80);
-        const vocabIdUuid = looksLikeUUID(vocabId) ? vocabId : null;
+        // Link to teaching_vocab by lemma if not already provided
+        let vocabIdUuid = null;
+        const providedVocabId = cleanString(v?.vocab_id, 80);
+        if (looksLikeUUID(providedVocabId)) {
+          vocabIdUuid = providedVocabId;
+        } else {
+          // Look up lemma in teaching_vocab
+          const tvMatch = await withTimeout(
+            client.query(
+              `SELECT id FROM teaching_vocab WHERE lemma = $1 LIMIT 1`,
+              [lemma]
+            ),
+            8000,
+            "db-match-teaching-vocab"
+          );
+          if (tvMatch.rows.length > 0) {
+            vocabIdUuid = tvMatch.rows[0].id;
+          }
+        }
 
         await withTimeout(
           client.query(
