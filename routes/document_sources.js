@@ -151,10 +151,22 @@ router.get("/v1/documents/sources", requireSession, async (req, res) => {
 
     const r = await withTimeout(
       pool.query(
-        `SELECT saved_source_id, owner_user_id, source_kind, source_key, source_uri, title, created_at, updated_at
-           FROM saved_document_sources
-          WHERE owner_user_id = $1::uuid
-          ORDER BY updated_at DESC, created_at DESC`,
+        `SELECT
+           sds.saved_source_id,
+           sds.owner_user_id,
+           sds.source_kind,
+           sds.source_key,
+           sds.source_uri,
+           sds.title,
+           sds.created_at,
+           sds.updated_at,
+           d.document_id
+         FROM saved_document_sources sds
+         LEFT JOIN documents d
+           ON d.owner_user_id = sds.owner_user_id
+          AND d.source_uri = sds.source_uri
+         WHERE sds.owner_user_id = $1::uuid
+         ORDER BY sds.updated_at DESC, sds.created_at DESC`,
         [userId]
       ),
       8000,

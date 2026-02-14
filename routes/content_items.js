@@ -335,6 +335,105 @@ router.delete("/v1/content/items", requireSession, async (req, res) => {
 });
 
 // ------------------------------------------------------------------
+// GET /v1/documents/:documentId/content-items
+// Returns content items linked to a specific document (owner-scoped).
+// Optional query params: content_type (default "sentence"),
+//   session_date_from, session_date_to
+// ------------------------------------------------------------------
+router.get("/v1/documents/:documentId/content-items", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const documentId = req.params.documentId;
+    if (!documentId) return res.status(400).json({ ok: false, error: "DOCUMENT_ID_REQUIRED" });
+
+    const contentType = normalizeContentType(req.query?.content_type) || "sentence";
+    const sessionDateFrom = req.query?.session_date_from || null;
+    const sessionDateTo = req.query?.session_date_to || null;
+
+    const params = [documentId, userId, contentType];
+    let dateFilter = "";
+
+    if (sessionDateFrom) {
+      params.push(sessionDateFrom);
+      dateFilter += ` AND dcil.session_date >= $${params.length}::date`;
+    }
+    if (sessionDateTo) {
+      params.push(sessionDateTo);
+      dateFilter += ` AND dcil.session_date <= $${params.length}::date`;
+    }
+
+    const sql = `
+      SELECT
+        ci.content_item_id,
+        ci.content_type,
+        ci.text,
+        ci.language,
+        ci.notes,
+        ci.cefr_level,
+        ci.topic,
+        ci.naturalness_score,
+        ci.politeness,
+        ci.politeness_en,
+        ci.tense,
+        ci.created_at,
+        ci.updated_at,
+        dcil.session_date
+      FROM document_content_item_links dcil
+      JOIN content_items ci ON ci.content_item_id = dcil.content_item_id
+      JOIN documents d ON d.document_id = dcil.document_id
+      WHERE dcil.document_id = $1::uuid
+        AND d.owner_user_id = $2::uuid
+        AND dcil.link_kind = $3::text
+        ${dateFilter}
+      ORDER BY dcil.session_date DESC NULLS LAST, ci.created_at DESC
+      LIMIT 2000
+    `;
+
+    const { rows } = await dbQuery(sql, params);
+    return res.json({ ok: true, items: rows || [] });
+  } catch (err) {
+    console.error("document content items list failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
+// GET /v1/documents/:documentId/sessions
+// Returns distinct non-null session_date values with item counts
+// for a document (owner-scoped).
+// ------------------------------------------------------------------
+router.get("/v1/documents/:documentId/sessions", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const documentId = req.params.documentId;
+    if (!documentId) return res.status(400).json({ ok: false, error: "DOCUMENT_ID_REQUIRED" });
+
+    const sql = `
+      SELECT
+        dcil.session_date,
+        COUNT(*)::int AS item_count
+      FROM document_content_item_links dcil
+      JOIN documents d ON d.document_id = dcil.document_id
+      WHERE dcil.document_id = $1::uuid
+        AND d.owner_user_id = $2::uuid
+        AND dcil.session_date IS NOT NULL
+      GROUP BY dcil.session_date
+      ORDER BY dcil.session_date DESC
+    `;
+
+    const { rows } = await dbQuery(sql, [documentId, userId]);
+    return res.json({ ok: true, sessions: rows || [] });
+  } catch (err) {
+    console.error("document sessions list failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // GET /v1/grammar-patterns
 // Returns all active grammar patterns from the canonical grammar_patterns table.
 // ------------------------------------------------------------------
