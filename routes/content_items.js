@@ -255,4 +255,58 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------------
+// DELETE /v1/content/items
+// Body: { content_item_ids: ["uuid", ...] }
+// Deletes content items and their registry rows (owner-scoped).
+// ------------------------------------------------------------------
+router.delete("/v1/content/items", requireSession, async (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const ids = req.body?.content_item_ids;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ ok: false, error: "CONTENT_ITEM_IDS_REQUIRED" });
+  }
+
+  const client = db && typeof db.connect === "function" ? await db.connect() : null;
+  const q = client ? client.query.bind(client) : dbQuery;
+
+  try {
+    if (client) await q("BEGIN", []);
+
+    // Delete registry rows first (FK-safe)
+    await q(
+      `
+      DELETE FROM library_registry_items
+      WHERE content_id = ANY($1::uuid[])
+        AND owner_user_id = $2::uuid
+      `,
+      [ids, userId]
+    );
+
+    // Delete content items
+    const result = await q(
+      `
+      DELETE FROM content_items
+      WHERE content_item_id = ANY($1::uuid[])
+        AND owner_user_id = $2::uuid
+      `,
+      [ids, userId]
+    );
+
+    if (client) await q("COMMIT", []);
+
+    return res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch (_) {}
+    }
+    console.error("content items delete failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 module.exports = router;
