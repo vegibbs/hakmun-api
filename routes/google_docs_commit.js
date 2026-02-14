@@ -177,11 +177,13 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           sentencesCreated += 1;
 
           // Link to document for scoping (requires table to exist)
+          // On re-import, update session_date to the most recent session
           await withTimeout(
             client.query(
               `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind, session_date)
                VALUES ($1::uuid, $2::uuid, 'sentence', $3::date)
-               ON CONFLICT DO NOTHING`,
+               ON CONFLICT (document_id, content_item_id, link_kind)
+               DO UPDATE SET session_date = GREATEST(EXCLUDED.session_date, document_content_item_links.session_date)`,
               [documentId, insertedId, sessionDate]
             ),
             8000,
@@ -257,7 +259,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
             client.query(
               `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind, session_date)
                VALUES ($1::uuid, $2::uuid, 'pattern', $3::date)
-               ON CONFLICT DO NOTHING`,
+               ON CONFLICT (document_id, content_item_id, link_kind)
+               DO UPDATE SET session_date = GREATEST(EXCLUDED.session_date, document_content_item_links.session_date)`,
               [documentId, insertedId, sessionDate]
             ),
             8000,
@@ -348,11 +351,13 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         vocabTouched += 1;
 
         // Link vocab to document for later scoping (requires table to exist)
+        // On re-import, update session_date to the most recent session
         await withTimeout(
           client.query(
             `INSERT INTO document_vocab_links (document_id, user_id, lemma, session_date)
              VALUES ($1::uuid, $2::uuid, $3, $4::date)
-             ON CONFLICT DO NOTHING`,
+             ON CONFLICT (document_id, user_id, lemma)
+             DO UPDATE SET session_date = GREATEST(EXCLUDED.session_date, document_vocab_links.session_date)`,
             [documentId, userId, lemma, sessionDate]
           ),
           8000,
