@@ -126,11 +126,26 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       let vocabTouched = 0;
 
       // -----------------------------
-      // Sentences -> content_items
+      // Sentences -> content_items (dedupe on owner + text)
       // -----------------------------
       for (const s of sentences) {
         const ko = cleanString(s?.ko, 4000);
         if (!ko) continue;
+
+        // Check for existing sentence with same text for this user
+        const existing = await withTimeout(
+          client.query(
+            `SELECT content_item_id FROM content_items
+             WHERE owner_user_id = $1::uuid
+               AND content_type = 'sentence'
+               AND text = $2
+             LIMIT 1`,
+            [userId, ko]
+          ),
+          8000,
+          "db-check-dup-sentence"
+        );
+        if (existing.rows.length > 0) continue;
 
         const contentItemId = crypto.randomUUID();
 
