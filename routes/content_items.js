@@ -328,4 +328,44 @@ router.delete("/v1/content/items", requireSession, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------------
+// GET /v1/grammar-patterns
+// Returns all active grammar patterns from the canonical grammar_patterns table.
+// ------------------------------------------------------------------
+router.get("/v1/grammar-patterns", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const sql = `
+      SELECT
+        id,
+        code,
+        display_name,
+        explanation,
+        level,
+        tags,
+        canonical_form_ko,
+        pattern_group,
+        slot_type,
+        cefr_min,
+        cefr_max,
+        meaning_ko_short,
+        meaning_en_short,
+        rule_family,
+        created_at,
+        updated_at
+      FROM grammar_patterns
+      WHERE active = true
+      ORDER BY level, display_name
+    `;
+
+    const { rows } = await dbQuery(sql, []);
+    return res.json({ ok: true, items: rows || [] });
+  } catch (err) {
+    console.error("grammar patterns list failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
 module.exports = router;
