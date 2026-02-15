@@ -109,7 +109,7 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
 
         -- CEFR classification
         tv.cefr_level,
-        tv.cefr_confidence,
+        tv.cefr_confidence::float AS cefr_confidence,
         tv.cefr_authority
 
       FROM teaching_vocab_split_apply_plan ap
