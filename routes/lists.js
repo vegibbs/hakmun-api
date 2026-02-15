@@ -81,11 +81,37 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
 
     const itemsR = await withTimeout(
       pool.query(
-        `SELECT id, list_id, item_type, item_id, position, added_at
-           FROM list_items
-          WHERE list_id = $1::uuid
-          ORDER BY position ASC, added_at ASC`,
-        [listId]
+        `SELECT
+           li.id,
+           li.list_id,
+           li.item_type,
+           li.item_id,
+           li.position,
+           li.added_at,
+           ci.content_item_id,
+           ci.content_type,
+           ci.text,
+           ci.language,
+           ci.notes,
+           ci.cefr_level,
+           ci.topic,
+           ci.politeness,
+           ci.tense,
+           ci.created_at AS content_created_at,
+           lri.audience,
+           lri.global_state,
+           lri.operational_status
+         FROM list_items li
+         LEFT JOIN content_items ci
+           ON li.item_id = ci.content_item_id
+          AND li.item_type IN ('sentence', 'pattern')
+         LEFT JOIN library_registry_items lri
+           ON lri.content_item_id = ci.content_item_id
+          AND lri.content_type = ci.content_type
+          AND lri.owner_user_id = $2::uuid
+         WHERE li.list_id = $1::uuid
+         ORDER BY li.position ASC, li.added_at ASC`,
+        [listId, userId]
       ),
       8000,
       "db-get-list-items"
