@@ -106,7 +106,7 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
            ON li.item_id = ci.content_item_id
           AND li.item_type IN ('sentence', 'pattern')
          LEFT JOIN library_registry_items lri
-           ON lri.content_item_id = ci.content_item_id
+           ON lri.content_id = ci.content_item_id
           AND lri.content_type = ci.content_type
           AND lri.owner_user_id = $2::uuid
          WHERE li.list_id = $1::uuid
