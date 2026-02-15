@@ -135,6 +135,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       for (const s of sentences) {
         const ko = cleanString(s?.ko, 4000);
         if (!ko) continue;
+        const gloss = cleanString(s?.gloss, 4000) || null;
 
         // Check for existing sentence with same text for this user
         const existing = await withTimeout(
@@ -163,10 +164,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                language,
                notes
              )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL)
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', $5)
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
-            [contentItemId, userId, "sentence", ko]
+            [contentItemId, userId, "sentence", ko, gloss]
           ),
           8000,
           "db-insert-content-sentence"
