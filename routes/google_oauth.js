@@ -80,7 +80,7 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
     const stateSecret = mustEnv("GOOGLE_OAUTH_STATE_SECRET");
 
     const scope = [
-      "https://www.googleapis.com/auth/drive.readonly",
+
       "https://www.googleapis.com/auth/documents.readonly"
     ].join(" ");
 
