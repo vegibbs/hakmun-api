@@ -1,7 +1,7 @@
 -- 225_create_lists.sql
 -- Lists: named, ordered collections of mixed content items for practice.
 
-CREATE TABLE lists (
+CREATE TABLE IF NOT EXISTS lists (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE lists (
 CREATE INDEX idx_lists_user_id ON lists(user_id);
 CREATE INDEX idx_lists_user_active ON lists(user_id, is_active);
 
-CREATE TABLE list_items (
+CREATE TABLE IF NOT EXISTS list_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     list_id UUID NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
     item_type VARCHAR(20) NOT NULL CHECK (item_type IN ('sentence', 'pattern', 'vocabulary')),
