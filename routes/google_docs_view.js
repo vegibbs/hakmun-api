@@ -397,6 +397,24 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
       }
     }
 
+    // Fetch previously imported texts for this document
+    let imported_texts = [];
+    try {
+      const itR = await pool.query(
+        `SELECT DISTINCT ci.text
+         FROM documents d
+         JOIN document_content_item_links dcil ON dcil.document_id = d.document_id
+         JOIN content_items ci ON ci.content_item_id = dcil.content_item_id
+         WHERE d.owner_user_id = $1::uuid
+           AND d.source_kind = 'google_doc'
+           AND d.source_uri = $2`,
+        [userId, url]
+      );
+      imported_texts = itR.rows.map(r => r.text);
+    } catch (e) {
+      logger.warn("[google-view] imported_texts query failed", { err: String(e.message || e) });
+    }
+
     return res.json({
       ok: true,
       file_id: fileId,
@@ -406,7 +424,8 @@ router.get("/v1/documents/google/view", requireSession, async (req, res) => {
       blocks,
       headings,
       sessions_total: sessionsAll.length,
-      sessions: sessionsFiltered
+      sessions: sessionsFiltered,
+      imported_texts
     });
   } catch (err) {
     const msg = String(err?.message || err);
