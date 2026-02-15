@@ -487,7 +487,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       "sign-google-html-url"
     );
 
-    // Fetch previously imported texts for this document
+    // Fetch previously imported texts for this document (match on file_id substring
+    // since source_uri can vary with query params and hash fragments)
     let imported_texts = [];
     try {
       const itR = await pool.query(
@@ -497,8 +498,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
          JOIN content_items ci ON ci.content_item_id = dcil.content_item_id
          WHERE d.owner_user_id = $1::uuid
            AND d.source_kind = 'google_doc'
-           AND d.source_uri = $2`,
-        [userId, url]
+           AND d.source_uri LIKE '%' || $2 || '%'`,
+        [userId, fileId]
       );
       imported_texts = itR.rows.map(r => r.text);
     } catch (e) {

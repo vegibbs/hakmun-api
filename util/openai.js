@@ -59,7 +59,9 @@ VOCABULARY RULES:
 
 SENTENCE RULES:
 - Return only well-formed natural Korean sentences.
+- Always include sentence-ending punctuation (period, question mark, exclamation mark).
 - Remove inline English glue words if they are not part of Korean.
+- Always provide a gloss (translation) in ${lang} for each sentence.
 
 PATTERN RULES (surface-form only):
 - Do NOT invent grammar labels or explanations.
@@ -81,10 +83,10 @@ Return JSON using this schema exactly:
 {
   "gloss_lang": "${lang}",
   "vocabulary": [
-    { "lemma_ko": "...", "pos_ko": "명사|동사|형용사|부사|기타", "surface_ko": null, "gloss": null }
+    { "lemma_ko": "...", "pos_ko": "명사|동사|형용사|부사|기타", "surface_ko": "conjugated form or null", "gloss": "${lang} meaning" }
   ],
   "sentences": [
-    { "ko": "...", "gloss": null }
+    { "ko": "Korean sentence with punctuation.", "gloss": "${lang} translation" }
   ],
   "patterns": [
     { "surface_form": "...", "context_span": "...", "confidence": 0.0, "kind": "ENDING|CONNECTOR|PARTICLE|DISCOURSE|AUX|OTHER" }
