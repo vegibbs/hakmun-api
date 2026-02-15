@@ -243,4 +243,36 @@ router.post("/v1/documents/sources", requireSession, async (req, res) => {
   }
 });
 
+// DELETE /v1/documents/sources/:saved_source_id
+router.delete("/v1/documents/sources/:saved_source_id", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const savedSourceId = req.params.saved_source_id;
+    if (!savedSourceId) return res.status(400).json({ ok: false, error: "MISSING_ID" });
+
+    const r = await withTimeout(
+      pool.query(
+        `DELETE FROM saved_document_sources
+          WHERE saved_source_id = $1::uuid
+            AND owner_user_id = $2::uuid`,
+        [savedSourceId, userId]
+      ),
+      8000,
+      "db-delete-saved-source"
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[document-sources] delete failed", { err: msg });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
 module.exports = router;
