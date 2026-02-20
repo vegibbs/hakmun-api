@@ -412,6 +412,43 @@ router.get("/v1/documents/:documentId/content-items", requireSession, async (req
 });
 
 // ------------------------------------------------------------------
+// DELETE /v1/documents/:documentId/content-items
+// Body: { content_item_ids: ["uuid", ...] }
+// Unlinks content items from a document (removes document_content_item_links rows).
+// Does NOT delete the content items themselves — they remain in My Content.
+// ------------------------------------------------------------------
+router.delete("/v1/documents/:documentId/content-items", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const documentId = req.params.documentId;
+    if (!documentId) return res.status(400).json({ ok: false, error: "DOCUMENT_ID_REQUIRED" });
+
+    const ids = req.body?.content_item_ids;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ ok: false, error: "CONTENT_ITEM_IDS_REQUIRED" });
+    }
+
+    const r = await dbQuery(
+      `DELETE FROM document_content_item_links
+       WHERE document_id = $1::uuid
+         AND content_item_id = ANY($2::uuid[])
+         AND document_id IN (
+           SELECT document_id FROM documents
+           WHERE document_id = $1::uuid AND owner_user_id = $3::uuid
+         )`,
+      [documentId, ids, userId]
+    );
+
+    return res.json({ ok: true, unlinked: r.rowCount });
+  } catch (err) {
+    console.error("document content items unlink failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // GET /v1/documents/:documentId/sessions
 // Returns distinct non-null session_date values with item counts
 // for a document (owner-scoped).
