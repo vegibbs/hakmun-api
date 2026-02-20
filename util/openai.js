@@ -93,6 +93,9 @@ SENTENCE RULES:
   Example: "딸한테 밥을 사 오라고 (말)했어요." is a valid sentence — extract it as-is.
 - Remove inline English glue words if they are not part of Korean.
 - Always provide a gloss (translation) in ${lang} for each sentence.
+- REJECT pattern templates and scaffolds: if a line contains a dash-placeholder for a grammar slot
+  (e.g., "어떻게 -는지 모르겠어요", "V-고 싶다"), it is a pattern example, NOT a sentence.
+  Do not put these in sentences. They belong in patterns (if atomic) or fragments (if scaffolds).
 
 PATTERN RULES (atomic surface-form only):
 - Do NOT invent grammar labels or explanations.
@@ -121,6 +124,11 @@ FRAGMENT RULES:
 - Do NOT duplicate material already captured as a sentence or pattern.
 - Fragments preserve the original formatting (newlines, bullets, arrows) from the source text.
 - If nothing qualifies as a fragment, return an empty array.
+- IMPORTANT: Before finalizing a fragment, scan each line within it. If any line is a complete
+  natural Korean sentence (subject+predicate, ends with a verb/adjective ending), extract that
+  line as a sentence instead. Do not bury sentences inside fragment blobs.
+  Example: a vocab list followed by "한번도 못(몬) 만났어요." — the vocab list is a fragment,
+  but that last line is a sentence and must go into the sentences array.
 
 Input text:
 """
