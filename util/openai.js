@@ -94,7 +94,7 @@ SENTENCE RULES:
 - Remove inline English glue words if they are not part of Korean.
 - Always provide a gloss (translation) in ${lang} for each sentence.
 
-PATTERN RULES (surface-form only):
+PATTERN RULES (atomic surface-form only):
 - Do NOT invent grammar labels or explanations.
 - Output patterns as matchable surface forms found in the text.
 - For endings, return the attachable ending pattern (not the full conjugated word).
@@ -102,6 +102,14 @@ PATTERN RULES (surface-form only):
 - For pragmatic endings/contractions, output exactly as written: 죠, 잖아요, 거든요, 군요, 더라고요, etc.
 - Strip punctuation from surface_form (keep punctuation in context_span only).
 - If a pattern does not match any known canonical form, set "unmatched": true on that pattern.
+- DECOMPOSITION (critical): Each pattern entry MUST be a single atomic grammar point.
+  Decompose compound endings into their individual component patterns.
+  Never return a compound ending as a single surface form.
+  Example: "밝아질 거예요" contains TWO patterns — return them separately:
+    1. surface_form: "-아/어지다" (passive/become), context_span: "밝아질 거예요"
+    2. surface_form: "-(으)ㄹ 거예요" (future tense), context_span: "밝아질 거예요"
+  Both entries share the same context_span (the sentence where they appear).
+  If a surface form is a stack of multiple grammar points, split it into one entry per atomic pattern.
 ${patternRefBlock}
 FRAGMENT RULES:
 - Fragments capture teaching material that is NOT a complete sentence or a pluggable grammar pattern.

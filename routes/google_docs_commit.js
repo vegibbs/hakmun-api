@@ -131,6 +131,12 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       let patternsCreated = 0;
       let vocabTouched = 0;
 
+      // Track committed sentences and patterns for cross-linking
+      // sentenceMap: normalized sentence text -> content_item_id
+      // patternLinks: array of { contentItemId, grammarPatternId, contextSpan }
+      const sentenceMap = new Map();
+      const patternLinks = [];
+
       // -----------------------------
       // Sentences -> content_items (dedupe on owner + text)
       // -----------------------------
@@ -178,6 +184,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         const insertedId = ins.rows?.[0]?.content_item_id || null;
         if (insertedId) {
           sentencesCreated += 1;
+          sentenceMap.set(ko, insertedId);
 
           // Link to document for scoping (requires table to exist)
           // On re-import, update session_date to the most recent session
@@ -306,6 +313,21 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
             8000,
             "db-insert-registry-pattern"
           );
+
+          // Write to join table (primary link)
+          if (matchedPatternId) {
+            await withTimeout(
+              client.query(
+                `INSERT INTO content_item_grammar_links (content_item_id, grammar_pattern_id, role)
+                 VALUES ($1::uuid, $2::uuid, 'primary')
+                 ON CONFLICT DO NOTHING`,
+                [insertedId, matchedPatternId]
+              ),
+              8000,
+              "db-insert-grammar-link-primary"
+            );
+            patternLinks.push({ contentItemId: insertedId, grammarPatternId: matchedPatternId, contextSpan: context });
+          }
         }
 
         // Log unmatched surface forms for later alias seeding
@@ -329,6 +351,26 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
               await client.query(`RELEASE SAVEPOINT ${spName}`);
             } catch (_) {}
           }
+        }
+      }
+
+      // -----------------------------
+      // Cross-link: sentences ↔ grammar patterns (component links)
+      // A sentence links to each grammar pattern whose context_span matches the sentence text.
+      // -----------------------------
+      for (const pl of patternLinks) {
+        const sentenceItemId = sentenceMap.get(pl.contextSpan);
+        if (sentenceItemId) {
+          await withTimeout(
+            client.query(
+              `INSERT INTO content_item_grammar_links (content_item_id, grammar_pattern_id, role)
+               VALUES ($1::uuid, $2::uuid, 'component')
+               ON CONFLICT DO NOTHING`,
+              [sentenceItemId, pl.grammarPatternId]
+            ),
+            8000,
+            "db-insert-grammar-link-component"
+          );
         }
       }
 

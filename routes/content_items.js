@@ -75,11 +75,23 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
         lri.audience,
         lri.global_state,
         lri.operational_status,
-        lri.owner_user_id      AS registry_owner_user_id
+        lri.owner_user_id      AS registry_owner_user_id,
+
+        gl.grammar_links
       FROM content_items ci
       JOIN library_registry_items lri
         ON lri.content_type = ci.content_type
        AND lri.content_id   = ci.content_item_id
+      LEFT JOIN LATERAL (
+        SELECT json_agg(json_build_object(
+          'code', gp.code,
+          'display_name', gp.display_name,
+          'role', cigl.role
+        )) AS grammar_links
+        FROM content_item_grammar_links cigl
+        JOIN grammar_patterns gp ON gp.id = cigl.grammar_pattern_id
+        WHERE cigl.content_item_id = ci.content_item_id
+      ) gl ON true
       WHERE ci.owner_user_id = $1::uuid
         AND ci.content_type = $2::text
         AND lri.audience = 'personal'
