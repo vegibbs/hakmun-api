@@ -37,6 +37,15 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+function ensureEndingPunctuation(s) {
+  if (!s) return s;
+  const last = s[s.length - 1];
+  if (last === "." || last === "?" || last === "!" || last === "。" || last === "？" || last === "！") {
+    return s;
+  }
+  return s + ".";
+}
+
 function buildDocImportPrompt({ text, importAs, glossLang }) {
   const lang = (glossLang || "en").trim() || "en";
 
@@ -59,7 +68,8 @@ VOCABULARY RULES:
 
 SENTENCE RULES:
 - Return only well-formed natural Korean sentences.
-- Always include sentence-ending punctuation (period, question mark, exclamation mark).
+- MANDATORY: Every Korean sentence MUST end with punctuation (. or ? or !). No exceptions.
+  If the source text lacks punctuation, add a period. Check each sentence before returning.
 - Remove inline English glue words if they are not part of Korean.
 - Always provide a gloss (translation) in ${lang} for each sentence.
 
@@ -226,7 +236,7 @@ function parseAndValidate(jsonText, profile) {
     parsed.sentences = parsed.sentences
       .filter(x => x && typeof x === "object")
       .map(x => ({
-        ko: typeof x.ko === "string" ? x.ko.trim() : "",
+        ko: ensureEndingPunctuation(typeof x.ko === "string" ? x.ko.trim() : ""),
         gloss: (x.gloss === null || x.gloss === undefined) ? null : String(x.gloss).trim()
       }))
       .filter(x => x.ko);
