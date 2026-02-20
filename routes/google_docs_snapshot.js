@@ -506,6 +506,23 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       logger.warn("[google-snapshot] imported_texts query failed", { err: String(e.message || e) });
     }
 
+    // Fetch previously imported fragment texts for this document
+    let imported_fragment_texts = [];
+    try {
+      const fR = await pool.query(
+        `SELECT DISTINCT df.text
+         FROM documents d
+         JOIN document_fragments df ON df.document_id = d.document_id
+         WHERE d.owner_user_id = $1::uuid
+           AND d.source_kind = 'google_doc'
+           AND d.source_uri LIKE '%' || $2 || '%'`,
+        [userId, fileId]
+      );
+      imported_fragment_texts = fR.rows.map(r => r.text);
+    } catch (e) {
+      logger.warn("[google-snapshot] imported_fragment_texts query failed", { err: String(e.message || e) });
+    }
+
     return res.status(201).json({
       ok: true,
       file_id: fileId,
@@ -516,7 +533,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       expiresIn: 900,
       sessions_included: sessions.length,
       days_window: 90,
-      imported_texts
+      imported_texts,
+      imported_fragment_texts
     });
   } catch (err) {
     const msg = String(err?.message || err);
