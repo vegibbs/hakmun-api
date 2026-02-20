@@ -208,11 +208,31 @@ router.post("/v1/admin/patterns/aliases", requireSession, async (req, res) => {
         "db-insert-alias"
       );
 
+      // Resolve the pattern_id: either from the just-inserted alias, or by looking up the existing one
+      let patternId = null;
       if (ins.rows.length > 0) {
         added++;
-        const patternId = ins.rows[0].grammar_pattern_id;
+        patternId = ins.rows[0].grammar_pattern_id;
+      } else {
+        // Alias already exists — look up the pattern_id it points to
+        const existing = await withTimeout(
+          pool.query(`
+            SELECT gpa.grammar_pattern_id
+            FROM grammar_pattern_aliases gpa
+            JOIN grammar_patterns gp ON gp.id = gpa.grammar_pattern_id
+            WHERE gp.code = $1 AND gpa.alias_norm = $2
+            LIMIT 1
+          `, [code, norm]),
+          8000,
+          "db-lookup-existing-alias"
+        );
+        if (existing.rows.length > 0) {
+          patternId = existing.rows[0].grammar_pattern_id;
+        }
+      }
 
-        // Backfill orphaned content_items that match this new alias
+      if (patternId) {
+        // Backfill orphaned content_items that match this alias
         const bf = await withTimeout(
           pool.query(`
             UPDATE content_items
