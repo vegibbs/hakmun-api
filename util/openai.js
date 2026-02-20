@@ -70,6 +70,9 @@ SENTENCE RULES:
 - Return only well-formed natural Korean sentences.
 - MANDATORY: Every Korean sentence MUST end with punctuation (. or ? or !). No exceptions.
   If the source text lacks punctuation, add a period. Check each sentence before returning.
+- Parenthetical annotations like (말), (딸한테) are common in teaching notes.
+  Include the sentence WITH the parenthetical — do not skip it.
+  Example: "딸한테 밥을 사 오라고 (말)했어요." is a valid sentence — extract it as-is.
 - Remove inline English glue words if they are not part of Korean.
 - Always provide a gloss (translation) in ${lang} for each sentence.
 
