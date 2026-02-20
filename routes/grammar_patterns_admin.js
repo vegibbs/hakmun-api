@@ -2,6 +2,7 @@
 // PURPOSE: Admin endpoints for managing grammar pattern aliases.
 // ENDPOINTS:
 //   GET  /v1/admin/patterns/unmatched  — review unmatched surface forms
+//   GET  /v1/admin/patterns/suggest    — suggest canonical patterns for a surface form
 //   POST /v1/admin/patterns/aliases    — add new aliases
 
 const express = require("express");
@@ -35,6 +36,110 @@ router.get("/v1/admin/patterns/unmatched", requireSession, async (req, res) => {
     );
 
     return res.json({ ok: true, unmatched: r.rows });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// GET /v1/admin/patterns/suggest?surface=-해요
+// Returns canonical grammar patterns ranked by similarity to the given surface form.
+// Each result includes the pattern's code, display_name, kind, and existing aliases.
+router.get("/v1/admin/patterns/suggest", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const surface = typeof req.query?.surface === "string" ? req.query.surface.trim() : "";
+    if (!surface) return res.status(400).json({ ok: false, error: "SURFACE_REQUIRED" });
+
+    // Normalize: strip dashes, whitespace
+    const norm = surface.replace(/[-\s\t\n\r]/g, "");
+
+    // Fetch all active patterns with their aliases in one query
+    const r = await withTimeout(
+      pool.query(`
+        SELECT gp.id, gp.code, gp.display_name, gp.kind,
+               json_agg(json_build_object(
+                 'alias_raw', gpa.alias_raw,
+                 'alias_norm', gpa.alias_norm
+               ) ORDER BY gpa.alias_raw) FILTER (WHERE gpa.id IS NOT NULL) AS aliases
+        FROM grammar_patterns gp
+        LEFT JOIN grammar_pattern_aliases gpa ON gpa.grammar_pattern_id = gp.id
+        WHERE gp.active = true
+        GROUP BY gp.id, gp.code, gp.display_name, gp.kind
+        ORDER BY gp.display_name
+      `),
+      8000,
+      "db-suggest-patterns"
+    );
+
+    // Score each pattern by how well its aliases match the surface form
+    const scored = r.rows.map(row => {
+      const aliases = row.aliases || [];
+      let bestScore = 0;
+      let bestAlias = null;
+
+      for (const a of aliases) {
+        const aNorm = (a.alias_norm || "").replace(/-/g, "");
+        if (!aNorm) continue;
+
+        let score = 0;
+
+        // Exact match (ignoring dashes)
+        if (aNorm === norm) {
+          score = 100;
+        }
+        // Surface contains alias or alias contains surface
+        else if (norm.includes(aNorm)) {
+          score = 60 + Math.min(30, Math.round(30 * aNorm.length / norm.length));
+        } else if (aNorm.includes(norm)) {
+          score = 50 + Math.min(30, Math.round(30 * norm.length / aNorm.length));
+        }
+        // Shared suffix (common for Korean endings)
+        else {
+          let shared = 0;
+          const minLen = Math.min(norm.length, aNorm.length);
+          for (let i = 1; i <= minLen; i++) {
+            if (norm[norm.length - i] === aNorm[aNorm.length - i]) shared++;
+            else break;
+          }
+          if (shared >= 2) {
+            score = 10 + Math.min(30, Math.round(30 * shared / minLen));
+          }
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestAlias = a.alias_raw;
+        }
+      }
+
+      // Also check display_name
+      const dnNorm = (row.display_name || "").replace(/[-\s]/g, "");
+      if (dnNorm === norm) {
+        bestScore = Math.max(bestScore, 95);
+      } else if (norm.includes(dnNorm) || dnNorm.includes(norm)) {
+        bestScore = Math.max(bestScore, 55);
+      }
+
+      return {
+        pattern_id: row.id,
+        code: row.code,
+        display_name: row.display_name,
+        kind: row.kind,
+        aliases: aliases.map(a => a.alias_raw).filter(Boolean),
+        score: bestScore,
+        best_alias: bestAlias
+      };
+    });
+
+    // Return patterns with score > 0, sorted by score descending, capped at 20
+    const suggestions = scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20);
+
+    return res.json({ ok: true, surface, suggestions });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
