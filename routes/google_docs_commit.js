@@ -209,7 +209,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       }
 
       // -----------------------------
-      // Patterns -> content_items (dedupe on owner + text)
+      // Patterns -> content_items (dedupe on owner + text, match against grammar_pattern_aliases)
       // -----------------------------
       for (const p of patterns) {
         const surface = cleanString(p?.surface_form, 200);
@@ -233,6 +233,29 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         );
         if (existingPattern.rows.length > 0) continue;
 
+        // Attempt alias match against grammar_pattern_aliases
+        const norm = surface.replace(/[\s\t\n\r]/g, "");
+        let matchedPatternId = null;
+
+        try {
+          const aliasMatch = await withTimeout(
+            client.query(
+              `SELECT grammar_pattern_id
+                 FROM grammar_pattern_aliases
+                WHERE alias_norm = $1
+                LIMIT 1`,
+              [norm]
+            ),
+            8000,
+            "db-match-grammar-alias"
+          );
+          if (aliasMatch.rows.length > 0) {
+            matchedPatternId = aliasMatch.rows[0].grammar_pattern_id;
+          }
+        } catch (e) {
+          logger.warn("[google-commit] alias lookup failed", { surface, norm, error: e?.message });
+        }
+
         const contentItemId = crypto.randomUUID();
 
         const ins = await withTimeout(
@@ -243,12 +266,13 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                content_type,
                text,
                language,
-               notes
+               notes,
+               grammar_pattern_id
              )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL)
+             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL, $5::uuid)
              ON CONFLICT DO NOTHING
              RETURNING content_item_id`,
-            [contentItemId, userId, "pattern", text]
+            [contentItemId, userId, "pattern", text, matchedPatternId]
           ),
           8000,
           "db-insert-content-pattern"
@@ -284,29 +308,27 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           );
         }
 
-        // Also stage for later promotion if needed (best-effort; table may not exist yet)
-        // IMPORTANT: This must NOT abort the surrounding transaction.
-        // We use a SAVEPOINT so any staging failure can be rolled back without poisoning BEGIN/COMMIT.
-        const spName = "sp_unmatched_grammar";
-        try {
-          await client.query(`SAVEPOINT ${spName}`);
-
-          const norm = surface.replace(/[\s\t\n\r]/g, "");
-          await client.query(
-            `INSERT INTO unmatched_grammar_patterns (unmatched_id, owner_user_id, document_id, surface_form, alias_norm, context_span, count, first_seen_at, last_seen_at)
-             VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 1, now(), now())
-             ON CONFLICT (owner_user_id, alias_norm)
-             DO UPDATE SET last_seen_at = now(), count = unmatched_grammar_patterns.count + 1`,
-            [crypto.randomUUID(), userId, documentId, surface, norm, context || null]
-          );
-
-          await client.query(`RELEASE SAVEPOINT ${spName}`);
-        } catch (e) {
+        // Log unmatched surface forms for later alias seeding
+        if (!matchedPatternId) {
+          const spName = "sp_unmatched_grammar";
           try {
-            await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+            await client.query(`SAVEPOINT ${spName}`);
+
+            await client.query(
+              `INSERT INTO unmatched_grammar_patterns (unmatched_id, owner_user_id, document_id, surface_form, alias_norm, context_span, count, first_seen_at, last_seen_at)
+               VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 1, now(), now())
+               ON CONFLICT (owner_user_id, alias_norm)
+               DO UPDATE SET last_seen_at = now(), count = unmatched_grammar_patterns.count + 1`,
+              [crypto.randomUUID(), userId, documentId, surface, norm, context || null]
+            );
+
             await client.query(`RELEASE SAVEPOINT ${spName}`);
-          } catch (_) {}
-          // ignore (staging not yet installed or other non-fatal staging error)
+          } catch (e) {
+            try {
+              await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+              await client.query(`RELEASE SAVEPOINT ${spName}`);
+            } catch (_) {}
+          }
         }
       }
 
