@@ -82,6 +82,7 @@ app.use(require("./routes/google_docs_snapshot"));
 app.use(require("./routes/google_docs_commit"));
 app.use(require("./routes/practice_events"));
 app.use(require("./routes/lists"));
+app.use(require("./routes/document_fragments"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)

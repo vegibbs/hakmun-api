@@ -18,7 +18,7 @@ if (!OPENAI_API_KEY) {
 }
 
 // Model is centralized here so it can be changed in one place later.
-const OPENAI_MODEL = "gpt-4.1-mini";
+const OPENAI_MODEL = "gpt-4.1";
 
 // Hard limits to protect the server
 const REQUEST_TIMEOUT_MS = 60_000;
