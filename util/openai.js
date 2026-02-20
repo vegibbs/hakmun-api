@@ -43,7 +43,7 @@ function buildDocImportPrompt({ text, importAs, glossLang }) {
   return `You are a Korean teaching assistant. You are analyzing highlighted classroom notes.
 
 Goal:
-- Extract three groups: vocabulary, sentences, grammar patterns.
+- Extract four groups: vocabulary, sentences, grammar patterns, and fragments.
 - This text may include inline English, arrows, stars, placeholders like OOO, and non-sentence fragments.
 
 CRITICAL OUTPUT RULES:
@@ -71,6 +71,17 @@ PATTERN RULES (surface-form only):
 - For pragmatic endings/contractions, output exactly as written: 죠, 잖아요, 거든요, 군요, 더라고요, etc.
 - Strip punctuation from surface_form (keep punctuation in context_span only).
 
+FRAGMENT RULES:
+- Fragments capture teaching material that is NOT a complete sentence or a pluggable grammar pattern.
+- Examples: grammar breakdowns, conjugation tables, example scaffolds, teacher annotations,
+  partial phrases with arrows/markers, grouped quotation endings, drill sequences.
+- Keep related lines together as a single fragment blob (do not split line-by-line).
+  Example: four indirect quotation endings listed together should be ONE fragment, not four.
+- Assign a short descriptive label to each fragment (e.g., "간접 인용 endings", "ㅂ 불규칙 conjugation chart").
+- Do NOT duplicate material already captured as a sentence or pattern.
+- Fragments preserve the original formatting (newlines, bullets, arrows) from the source text.
+- If nothing qualifies as a fragment, return an empty array.
+
 Input text:
 """
 ${text}
@@ -90,6 +101,9 @@ Return JSON using this schema exactly:
   ],
   "patterns": [
     { "surface_form": "...", "context_span": "...", "confidence": 0.0, "kind": "ENDING|CONNECTOR|PARTICLE|DISCOURSE|AUX|OTHER" }
+  ],
+  "fragments": [
+    { "text": "original text blob preserving newlines", "label": "short descriptive label" }
   ]
 }
 
@@ -227,6 +241,15 @@ function parseAndValidate(jsonText, profile) {
       }))
       .filter(x => x.surface_form);
 
+    if (!Array.isArray(parsed.fragments)) parsed.fragments = [];
+    parsed.fragments = parsed.fragments
+      .filter(x => x && typeof x === "object")
+      .map(x => ({
+        text: typeof x.text === "string" ? x.text.trim() : "",
+        label: (x.label === null || x.label === undefined) ? null : String(x.label).trim() || null
+      }))
+      .filter(x => x.text);
+
     return parsed;
   }
 
@@ -264,7 +287,7 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
 
   if (typeof text !== "string" || !text.trim()) {
     if ((profile || "legacy").trim() === "doc_import") {
-      return { gloss_lang: glossLang || null, vocabulary: [], sentences: [], patterns: [] };
+      return { gloss_lang: glossLang || null, vocabulary: [], sentences: [], patterns: [], fragments: [] };
     }
     return { sentences: [], vocab: [], patterns: [] };
   }

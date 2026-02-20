@@ -208,6 +208,7 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
           vocabulary: analysis.vocabulary || [],
           sentences: analysis.sentences || [],
           patterns: analysis.patterns || [],
+          fragments: analysis.fragments || [],
           gloss_lang: analysis.gloss_lang || null
         }
       });

@@ -5,10 +5,11 @@
 //
 // Contract:
 // - Requires user session (Bearer)
-// - Accepts user-approved items (vocabulary, sentences, patterns)
+// - Accepts user-approved items (vocabulary, sentences, patterns, fragments)
 // - Writes user-scoped items to:
 //     - content_items (sentences, patterns)
 //     - user_vocab_items (vocabulary)
+//     - document_fragments (fragments)
 // - Ensures a documents row exists for provenance (google_doc_url + snapshot asset_id)
 // - Attempts to write document linkage rows (document_vocab_links, document_content_item_links)
 //   so practice modules can scope to a document.
@@ -105,12 +106,13 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
     const vocabulary = Array.isArray(req.body?.vocabulary) ? req.body.vocabulary : [];
     const sentences = Array.isArray(req.body?.sentences) ? req.body.sentences : [];
     const patterns = Array.isArray(req.body?.patterns) ? req.body.patterns : [];
+    const fragments = Array.isArray(req.body?.fragments) ? req.body.fragments : [];
 
     // Guardrails (synchronous endpoint)
-    if (vocabulary.length + sentences.length + patterns.length === 0) {
+    if (vocabulary.length + sentences.length + patterns.length + fragments.length === 0) {
       return res.status(400).json({ ok: false, error: "NOTHING_TO_COMMIT" });
     }
-    if (vocabulary.length > 500 || sentences.length > 500 || patterns.length > 500) {
+    if (vocabulary.length > 500 || sentences.length > 500 || patterns.length > 500 || fragments.length > 200) {
       return res.status(413).json({ ok: false, error: "TOO_MANY_ITEMS" });
     }
 
@@ -366,6 +368,45 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         );
       }
 
+      // -----------------------------
+      // Fragments -> document_fragments (dedupe on document + text)
+      // -----------------------------
+      let fragmentsCreated = 0;
+
+      for (const f of fragments) {
+        const text = cleanString(f?.text, 8000);
+        if (!text) continue;
+        const label = cleanString(f?.label, 200) || null;
+
+        const existing = await withTimeout(
+          client.query(
+            `SELECT fragment_id FROM document_fragments
+             WHERE document_id = $1::uuid
+               AND text = $2
+             LIMIT 1`,
+            [documentId, text]
+          ),
+          8000,
+          "db-check-dup-fragment"
+        );
+        if (existing.rows.length > 0) continue;
+
+        await withTimeout(
+          client.query(
+            `INSERT INTO document_fragments (
+               fragment_id, document_id, owner_user_id, session_date, text, label
+             )
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::date, $5, $6)
+             ON CONFLICT DO NOTHING`,
+            [crypto.randomUUID(), documentId, userId, sessionDate, text, label]
+          ),
+          8000,
+          "db-insert-fragment"
+        );
+
+        fragmentsCreated += 1;
+      }
+
       await client.query("COMMIT");
 
       return res.status(201).json({
@@ -373,7 +414,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         document_id: documentId,
         sentences_created: sentencesCreated,
         patterns_created: patternsCreated,
-        vocab_touched: vocabTouched
+        vocab_touched: vocabTouched,
+        fragments_created: fragmentsCreated
       });
     } catch (e) {
       await client.query("ROLLBACK");
