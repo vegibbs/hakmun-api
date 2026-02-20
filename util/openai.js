@@ -46,8 +46,26 @@ function ensureEndingPunctuation(s) {
   return s + ".";
 }
 
-function buildDocImportPrompt({ text, importAs, glossLang }) {
+function buildDocImportPrompt({ text, importAs, glossLang, canonicalPatterns }) {
   const lang = (glossLang || "en").trim() || "en";
+
+  // Build canonical pattern reference block if available
+  let patternRefBlock = "";
+  if (Array.isArray(canonicalPatterns) && canonicalPatterns.length > 0) {
+    const lines = canonicalPatterns.map(p => {
+      const aliases = (p.aliases || []).filter(a => a).join(", ");
+      return aliases ? `${p.display_name} [${aliases}]` : p.display_name;
+    });
+    patternRefBlock = `
+CANONICAL PATTERN REFERENCE:
+The following is the complete list of known grammar patterns in our database.
+When you identify a grammar pattern, you MUST match it to one of these canonical forms.
+Use the display_name or any alias shown in brackets as the surface_form value.
+If no exact or close match exists, return the surface form as-is and add "unmatched": true to that pattern object.
+
+${lines.join("\n")}
+`;
+  }
 
   return `You are a Korean teaching assistant. You are analyzing highlighted classroom notes.
 
@@ -83,7 +101,8 @@ PATTERN RULES (surface-form only):
   Example: "먹었어요" -> "-았/었어요".
 - For pragmatic endings/contractions, output exactly as written: 죠, 잖아요, 거든요, 군요, 더라고요, etc.
 - Strip punctuation from surface_form (keep punctuation in context_span only).
-
+- If a pattern does not match any known canonical form, set "unmatched": true on that pattern.
+${patternRefBlock}
 FRAGMENT RULES:
 - Fragments capture teaching material that is NOT a complete sentence or a pluggable grammar pattern.
 - Examples: grammar breakdowns, conjugation tables, example scaffolds, teacher annotations,
@@ -113,7 +132,7 @@ Return JSON using this schema exactly:
     { "ko": "Korean sentence with punctuation.", "gloss": "${lang} translation" }
   ],
   "patterns": [
-    { "surface_form": "...", "context_span": "...", "confidence": 0.0, "kind": "ENDING|CONNECTOR|PARTICLE|DISCOURSE|AUX|OTHER" }
+    { "surface_form": "...", "context_span": "...", "confidence": 0.0, "kind": "ENDING|CONNECTOR|PARTICLE|DISCOURSE|AUX|OTHER", "unmatched": false }
   ],
   "fragments": [
     { "text": "original text blob preserving newlines", "label": "short descriptive label" }
@@ -159,10 +178,10 @@ Include only sections relevant to the extraction mode.
 If no valid items exist for a section, return an empty array for that section.`;
 }
 
-function buildPrompt({ text, importAs, profile, glossLang }) {
+function buildPrompt({ text, importAs, profile, glossLang, canonicalPatterns }) {
   const p = (profile || "legacy").trim() || "legacy";
   if (p === "doc_import") {
-    return buildDocImportPrompt({ text, importAs, glossLang });
+    return buildDocImportPrompt({ text, importAs, glossLang, canonicalPatterns });
   }
   return buildLegacyPrompt({ text, importAs });
 }
@@ -250,7 +269,8 @@ function parseAndValidate(jsonText, profile) {
         surface_form: typeof x.surface_form === "string" ? x.surface_form.trim() : "",
         context_span: typeof x.context_span === "string" ? x.context_span.trim() : "",
         confidence: (typeof x.confidence === "number" && Number.isFinite(x.confidence)) ? x.confidence : null,
-        kind: (x.kind === null || x.kind === undefined) ? null : String(x.kind).trim()
+        kind: (x.kind === null || x.kind === undefined) ? null : String(x.kind).trim(),
+        unmatched: x.unmatched === true
       }))
       .filter(x => x.surface_form);
 
@@ -286,11 +306,14 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
   let profile;
   let glossLang;
 
+  let canonicalPatterns;
+
   if (arg1 && typeof arg1 === "object" && typeof arg1.text === "string") {
     text = arg1.text;
     importAs = (arg1.importAs || "all");
     profile = (arg1.profile || "legacy");
     glossLang = (arg1.glossLang || null);
+    canonicalPatterns = arg1.canonicalPatterns || null;
   } else {
     text = arg1;
     importAs = arg2 || "all";
@@ -305,7 +328,7 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
     return { sentences: [], vocab: [], patterns: [] };
   }
 
-  const prompt = buildPrompt({ text: text.trim(), importAs, profile, glossLang });
+  const prompt = buildPrompt({ text: text.trim(), importAs, profile, glossLang, canonicalPatterns });
 
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

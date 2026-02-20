@@ -192,12 +192,34 @@ router.post("/v1/documents/google/ingest", requireSession, async (req, res) => {
       // SYNCHRONOUS HIGHLIGHT IMPORT
       // -----------------------------
 
+      // Fetch canonical pattern forms so the AI can match against them
+      let canonicalPatterns = null;
+      try {
+        const cpR = await withTimeout(
+          pool.query(`
+            SELECT gp.display_name,
+                   array_agg(gpa.alias_raw ORDER BY gpa.alias_raw) FILTER (WHERE gpa.alias_raw IS NOT NULL) as aliases
+            FROM grammar_patterns gp
+            LEFT JOIN grammar_pattern_aliases gpa ON gpa.grammar_pattern_id = gp.id
+            WHERE gp.active = true
+            GROUP BY gp.id, gp.display_name
+            ORDER BY gp.display_name
+          `),
+          8000,
+          "db-fetch-canonical-patterns"
+        );
+        canonicalPatterns = cpR.rows;
+      } catch (e) {
+        logger.warn("[google-ingest] canonical patterns fetch failed, proceeding without", { err: e?.message });
+      }
+
       // Analyze text immediately via OpenAI using doc_import profile (preview-only, no DB writes)
       const analysis = await analyzeTextForImport({
         text: selectionTextBounded,
         importAs,
         profile: "doc_import",
-        glossLang: null
+        glossLang: null,
+        canonicalPatterns
       });
 
       return res.status(200).json({
