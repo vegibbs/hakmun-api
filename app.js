@@ -71,6 +71,7 @@ app.use(require("./routes/dictionary_sets"));
 app.use(require("./routes/nikl_search"));
 app.use(require("./routes/nikl_api_search"));
 app.use(require("./routes/nikl_fetch_on_demand"));
+app.use(require("./routes/krdict_search"));
 app.use(require("./routes/teaching_vocab_admin"));
 app.use(require("./routes/google_docs"));
 app.use(require("./routes/google_oauth"));
