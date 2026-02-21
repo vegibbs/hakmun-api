@@ -256,6 +256,7 @@ async function getUserState(userID) {
            primary_language, gloss_language,
            customize_learning, share_progress_default, allow_teacher_adjust_default,
            location_city, location_country, share_city, share_country,
+           location_lat, location_lon,
            cefr_current, cefr_target
     from users
     where user_id = $1
@@ -363,6 +364,8 @@ async function requireSession(req, res, next) {
       allowTeacherAdjustDefault: Boolean(state.allow_teacher_adjust_default),
       locationCity: state.location_city || null,
       locationCountry: state.location_country || null,
+      locationLat: state.location_lat != null ? Number(state.location_lat) : null,
+      locationLon: state.location_lon != null ? Number(state.location_lon) : null,
       shareCity: Boolean(state.share_city),
       shareCountry: Boolean(state.share_country),
       cefrCurrent: state.cefr_current || "A1",

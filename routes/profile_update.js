@@ -42,7 +42,8 @@ async function buildProfileResponse(userID) {
     `SELECT role, is_admin, is_root_admin, is_active, display_name,
             primary_language, gloss_language,
             customize_learning, share_progress_default, allow_teacher_adjust_default,
-            location_city, location_country, share_city, share_country,
+            location_city, location_country, location_lat, location_lon,
+            share_city, share_country,
             cefr_current, cefr_target
      FROM users WHERE user_id = $1 LIMIT 1`,
     [userID]
@@ -79,6 +80,8 @@ async function buildProfileResponse(userID) {
     allowTeacherAdjustDefault: Boolean(u.allow_teacher_adjust_default),
     locationCity: u.location_city || null,
     locationCountry: u.location_country || null,
+    locationLat: u.location_lat != null ? Number(u.location_lat) : null,
+    locationLon: u.location_lon != null ? Number(u.location_lon) : null,
     shareCity: Boolean(u.share_city),
     shareCountry: Boolean(u.share_country),
     cefrCurrent: u.cefr_current || "A1",
@@ -230,6 +233,26 @@ router.patch("/v1/me/profile", requireSession, async (req, res) => {
     if ("locationCountry" in body) {
       const val = body.locationCountry == null ? null : String(body.locationCountry).trim().slice(0, 128);
       await pool.query(`UPDATE users SET location_country = $1 WHERE user_id = $2`, [val || null, userID]);
+      changed = true;
+    }
+
+    // --- Location Latitude ---
+    if ("locationLat" in body) {
+      const val = body.locationLat == null ? null : Number(body.locationLat);
+      if (val != null && (isNaN(val) || val < -90 || val > 90)) {
+        return res.status(400).json({ error: "INVALID_LAT", message: "Latitude must be between -90 and 90" });
+      }
+      await pool.query(`UPDATE users SET location_lat = $1 WHERE user_id = $2`, [val, userID]);
+      changed = true;
+    }
+
+    // --- Location Longitude ---
+    if ("locationLon" in body) {
+      const val = body.locationLon == null ? null : Number(body.locationLon);
+      if (val != null && (isNaN(val) || val < -180 || val > 180)) {
+        return res.status(400).json({ error: "INVALID_LON", message: "Longitude must be between -180 and 180" });
+      }
+      await pool.query(`UPDATE users SET location_lon = $1 WHERE user_id = $2`, [val, userID]);
       changed = true;
     }
 

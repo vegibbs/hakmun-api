@@ -96,6 +96,8 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       allowTeacherAdjustDefault: req.user.allowTeacherAdjustDefault,
       locationCity: req.user.locationCity,
       locationCountry: req.user.locationCountry,
+      locationLat: req.user.locationLat,
+      locationLon: req.user.locationLon,
       shareCity: req.user.shareCity,
       shareCountry: req.user.shareCountry,
       cefrCurrent: req.user.cefrCurrent,
