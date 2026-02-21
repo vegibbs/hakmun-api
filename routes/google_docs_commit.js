@@ -448,6 +448,43 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           8000,
           "db-link-doc-vocab"
         );
+
+        // Log unmatched vocab for later linking by approvers
+        if (!vocabIdUuid) {
+          const spName = "sp_unmatched_vocab";
+          try {
+            await client.query(`SAVEPOINT ${spName}`);
+
+            // Find a context sentence containing this lemma
+            let contextSpan = null;
+            for (const s of sentences) {
+              const sKo = cleanString(s?.ko, 4000);
+              if (sKo && sKo.includes(lemma)) {
+                contextSpan = sKo;
+                break;
+              }
+            }
+
+            await client.query(
+              `INSERT INTO unmatched_vocab
+                 (unmatched_id, owner_user_id, document_id, lemma, pos, context_span, count, first_seen_at, last_seen_at)
+               VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 1, now(), now())
+               ON CONFLICT (owner_user_id, lemma)
+               DO UPDATE SET
+                 last_seen_at = now(),
+                 count = unmatched_vocab.count + 1,
+                 context_span = COALESCE(EXCLUDED.context_span, unmatched_vocab.context_span)`,
+              [crypto.randomUUID(), userId, documentId, lemma, cleanString(v?.pos_ko, 40) || null, contextSpan]
+            );
+
+            await client.query(`RELEASE SAVEPOINT ${spName}`);
+          } catch (e) {
+            try {
+              await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+              await client.query(`RELEASE SAVEPOINT ${spName}`);
+            } catch (_) {}
+          }
+        }
       }
 
       // -----------------------------

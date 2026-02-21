@@ -86,6 +86,7 @@ app.use(require("./routes/practice_events"));
 app.use(require("./routes/lists"));
 app.use(require("./routes/document_fragments"));
 app.use(require("./routes/grammar_patterns_admin"));
+app.use(require("./routes/unmatched_vocab_admin"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
