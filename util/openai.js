@@ -67,17 +67,25 @@ ${lines.join("\n")}
 `;
   }
 
-  return `You are a Korean teaching assistant. You are analyzing highlighted classroom notes.
+  return `You are a Korean teaching assistant. You are analyzing notes from a Korean tutoring or teaching session.
+
+Context:
+- These notes were written by a Korean teacher during a lesson with a student.
+- The student needs clean, natural Korean sentences to practice from these session notes.
+- The text is messy: it contains inline English glosses, pronunciation guides, shorthand,
+  arrows, stars, placeholders, and partial phrases mixed with real sentences.
+- Your job is to extract maximum learning value from these notes.
 
 Goal:
 - Extract four groups: vocabulary, sentences, grammar patterns, and fragments.
-- This text may include inline English, arrows, stars, placeholders like OOO, and non-sentence fragments.
 
 CRITICAL OUTPUT RULES:
 - Return ONLY valid JSON. No markdown. No comments. No explanations outside JSON.
-- Be conservative with vocabulary and patterns. But be AGGRESSIVE with sentences — classroom notes
-  are full of real sentences mixed with annotations. Extract every line that contains a usable
-  Korean sentence, even if the line is messy. Clean it up rather than skip it.
+- Be conservative with vocabulary and patterns.
+- Be AGGRESSIVE with sentences: extract every line that contains or implies a usable Korean sentence.
+  If a line is messy but you can infer the teacher's intended sentence, write the clean natural
+  Korean sentence. You understand Korean well enough to reconstruct intent from teacher shorthand.
+  It is better to produce a slightly adapted but natural sentence than to lose classroom content.
 
 VOCABULARY RULES:
 - Return dictionary-form headwords suitable for linking to a global dictionary.
@@ -87,9 +95,12 @@ VOCABULARY RULES:
 - pos_ko must be one of: 명사|동사|형용사|부사|기타
 
 SENTENCE RULES:
-- Extract every usable Korean sentence. These are classroom notes — sentences are mixed with
-  teacher annotations, inline English, and shorthand. Do NOT skip a sentence just because the
-  line is messy. Clean it up and include it.
+- Extract every usable Korean sentence from the teacher's notes.
+- If a line is not a perfect sentence but clearly implies one, reconstruct the natural Korean
+  sentence the teacher intended. Keep the same context, grammar, and vocabulary — just make it
+  a complete, natural sentence a student can practice.
+  Example: "회이랑 점심도 먹고 예기도 하고 놀았어요" → "회의랑 점심도 먹고 얘기도 하고 놀았어요."
+  Example: "항상 일찍, 화요일하고 목요일에 수업을 항상 해요" → "화요일하고 목요일에 항상 수업을 해요."
 - MANDATORY: Every Korean sentence MUST end with punctuation (. or ? or !). No exceptions.
   If the source text lacks punctuation, add a period. Check each sentence before returning.
 - Parenthetical annotations like (말), (딸한테), (몬) are common in teaching notes.
