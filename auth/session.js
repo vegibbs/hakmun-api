@@ -252,7 +252,11 @@ async function getUserState(userID) {
 
   const { rows } = await pool.query(
     `
-    select role, is_admin, is_root_admin, is_active, display_name
+    select role, is_admin, is_root_admin, is_active, display_name,
+           primary_language, gloss_language,
+           customize_learning, share_progress_default, allow_teacher_adjust_default,
+           location_city, location_country, share_city, share_country,
+           cefr_current, cefr_target
     from users
     where user_id = $1
     limit 1
@@ -350,7 +354,19 @@ async function requireSession(req, res, next) {
       isRootAdmin: Boolean(state.is_root_admin),
       isActive,
       isTeacher: String(state.role || "student") === "teacher",
-      displayName: state.display_name || null
+      displayName: state.display_name || null,
+      // Preferences
+      primaryLanguage: state.primary_language || "en",
+      glossLanguage: state.gloss_language || "en",
+      customizeLearning: Boolean(state.customize_learning),
+      shareProgressDefault: Boolean(state.share_progress_default),
+      allowTeacherAdjustDefault: Boolean(state.allow_teacher_adjust_default),
+      locationCity: state.location_city || null,
+      locationCountry: state.location_country || null,
+      shareCity: Boolean(state.share_city),
+      shareCountry: Boolean(state.share_country),
+      cefrCurrent: state.cefr_current || "A1",
+      cefrTarget: state.cefr_target || null
     };
 
     const { entitlements, capabilities } = computeEntitlementsFromUser(user);

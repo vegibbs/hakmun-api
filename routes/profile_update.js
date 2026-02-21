@@ -1,5 +1,5 @@
 // routes/profile_update.js — HakMun API
-// Self-service profile updates: display name, role (student/teacher), handle.
+// Self-service profile updates: display name, role, handle, language, privacy, location, CEFR.
 // ENDPOINT: PATCH /v1/me/profile
 
 const express = require("express");
@@ -9,7 +9,10 @@ const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { requireSession, computeEntitlementsFromUser } = require("../auth/session");
 
-// ---------- Handle validation (mirrors admin.js) ----------
+// ---------- Validation ----------
+
+const VALID_LANGUAGES = ["en", "ko", "ja", "zh", "es", "vi"];
+const VALID_CEFR = ["A1", "A2", "B1", "B2", "C1", "C2"];
 
 function normalizeHandle(raw) {
   return String(raw || "").trim();
@@ -25,7 +28,7 @@ function isValidPrimaryHandle(handle) {
 
 // ---------- Build whoami-shaped response ----------
 
-async function buildProfileResponse(userID, reqUser) {
+async function buildProfileResponse(userID) {
   // Fetch primary handle
   const { rows: handleRows } = await pool.query(
     `SELECT handle FROM user_handles WHERE user_id = $1 AND kind = 'primary' LIMIT 1`,
@@ -34,9 +37,14 @@ async function buildProfileResponse(userID, reqUser) {
   const primaryHandle = handleRows?.[0]?.handle || null;
   const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
-  // Fetch fresh user state for display_name and role
+  // Fetch fresh user state
   const { rows: userRows } = await pool.query(
-    `SELECT role, is_admin, is_root_admin, is_active, display_name FROM users WHERE user_id = $1 LIMIT 1`,
+    `SELECT role, is_admin, is_root_admin, is_active, display_name,
+            primary_language, gloss_language,
+            customize_learning, share_progress_default, allow_teacher_adjust_default,
+            location_city, location_country, share_city, share_country,
+            cefr_current, cefr_target
+     FROM users WHERE user_id = $1 LIMIT 1`,
     [userID]
   );
   const u = userRows?.[0] || {};
@@ -62,7 +70,19 @@ async function buildProfileResponse(userID, reqUser) {
     profileComplete,
     primaryHandle,
     username: primaryHandle,
-    displayName: u.display_name || null
+    displayName: u.display_name || null,
+    // Preferences
+    primaryLanguage: u.primary_language || "en",
+    glossLanguage: u.gloss_language || "en",
+    customizeLearning: Boolean(u.customize_learning),
+    shareProgressDefault: Boolean(u.share_progress_default),
+    allowTeacherAdjustDefault: Boolean(u.allow_teacher_adjust_default),
+    locationCity: u.location_city || null,
+    locationCountry: u.location_country || null,
+    shareCity: Boolean(u.share_city),
+    shareCountry: Boolean(u.share_country),
+    cefrCurrent: u.cefr_current || "A1",
+    cefrTarget: u.cefr_target || null
   };
 }
 
@@ -119,13 +139,11 @@ router.patch("/v1/me/profile", requireSession, async (req, res) => {
         return res.status(409).json({ error: "HANDLE_TAKEN", message: "That username is already taken" });
       }
 
-      // Update existing handle row (user already has a primary handle if they passed the gate)
       const { rowCount } = await pool.query(
         `UPDATE user_handles SET handle = $1, primary_handle = $1 WHERE user_id = $2 AND kind = 'primary'`,
         [handle, userID]
       );
 
-      // If no row existed (edge case: first handle), insert
       if (!rowCount) {
         await pool.query(
           `INSERT INTO user_handles (user_id, kind, handle, primary_handle) VALUES ($1, 'primary', $2, $2)`,
@@ -136,12 +154,127 @@ router.patch("/v1/me/profile", requireSession, async (req, res) => {
       changed = true;
     }
 
+    // --- Primary Language ---
+    if ("primaryLanguage" in body) {
+      const val = String(body.primaryLanguage || "").trim();
+      if (!VALID_LANGUAGES.includes(val)) {
+        return res.status(400).json({ error: "INVALID_LANGUAGE", message: `Must be one of: ${VALID_LANGUAGES.join(", ")}` });
+      }
+      await pool.query(`UPDATE users SET primary_language = $1 WHERE user_id = $2`, [val, userID]);
+      changed = true;
+    }
+
+    // --- Gloss Language ---
+    if ("glossLanguage" in body) {
+      const val = String(body.glossLanguage || "").trim();
+      if (!VALID_LANGUAGES.includes(val)) {
+        return res.status(400).json({ error: "INVALID_LANGUAGE", message: `Must be one of: ${VALID_LANGUAGES.join(", ")}` });
+      }
+      await pool.query(`UPDATE users SET gloss_language = $1 WHERE user_id = $2`, [val, userID]);
+      changed = true;
+    }
+
+    // --- Privacy: Customize Learning ---
+    if ("customizeLearning" in body) {
+      const val = Boolean(body.customizeLearning);
+      await pool.query(`UPDATE users SET customize_learning = $1 WHERE user_id = $2`, [val, userID]);
+      // Cascade: turning off clears dependent switches
+      if (!val) {
+        await pool.query(
+          `UPDATE users SET share_progress_default = false, allow_teacher_adjust_default = false WHERE user_id = $1`,
+          [userID]
+        );
+      }
+      changed = true;
+    }
+
+    // --- Privacy: Share Progress Default ---
+    if ("shareProgressDefault" in body) {
+      const val = Boolean(body.shareProgressDefault);
+      await pool.query(`UPDATE users SET share_progress_default = $1 WHERE user_id = $2`, [val, userID]);
+      // Cascade: turning off clears allow_teacher_adjust_default
+      if (!val) {
+        await pool.query(`UPDATE users SET allow_teacher_adjust_default = false WHERE user_id = $1`, [userID]);
+      }
+      changed = true;
+    }
+
+    // --- Privacy: Allow Teacher Adjust Default ---
+    if ("allowTeacherAdjustDefault" in body) {
+      const val = Boolean(body.allowTeacherAdjustDefault);
+      if (val) {
+        const { rows } = await pool.query(
+          `SELECT customize_learning, share_progress_default FROM users WHERE user_id = $1`,
+          [userID]
+        );
+        const u = rows?.[0];
+        if (!u?.customize_learning || !u?.share_progress_default) {
+          return res.status(400).json({
+            error: "DEPENDENCY_NOT_MET",
+            message: "Requires both customizeLearning and shareProgressDefault to be enabled"
+          });
+        }
+      }
+      await pool.query(`UPDATE users SET allow_teacher_adjust_default = $1 WHERE user_id = $2`, [val, userID]);
+      changed = true;
+    }
+
+    // --- Location City ---
+    if ("locationCity" in body) {
+      const val = body.locationCity == null ? null : String(body.locationCity).trim().slice(0, 128);
+      await pool.query(`UPDATE users SET location_city = $1 WHERE user_id = $2`, [val || null, userID]);
+      changed = true;
+    }
+
+    // --- Location Country ---
+    if ("locationCountry" in body) {
+      const val = body.locationCountry == null ? null : String(body.locationCountry).trim().slice(0, 128);
+      await pool.query(`UPDATE users SET location_country = $1 WHERE user_id = $2`, [val || null, userID]);
+      changed = true;
+    }
+
+    // --- Share City ---
+    if ("shareCity" in body) {
+      await pool.query(`UPDATE users SET share_city = $1 WHERE user_id = $2`, [Boolean(body.shareCity), userID]);
+      changed = true;
+    }
+
+    // --- Share Country ---
+    if ("shareCountry" in body) {
+      await pool.query(`UPDATE users SET share_country = $1 WHERE user_id = $2`, [Boolean(body.shareCountry), userID]);
+      changed = true;
+    }
+
+    // --- CEFR Current ---
+    if ("cefrCurrent" in body) {
+      const val = String(body.cefrCurrent || "").trim().toUpperCase();
+      if (!VALID_CEFR.includes(val)) {
+        return res.status(400).json({ error: "INVALID_CEFR", message: `Must be one of: ${VALID_CEFR.join(", ")}` });
+      }
+      await pool.query(`UPDATE users SET cefr_current = $1 WHERE user_id = $2`, [val, userID]);
+      changed = true;
+    }
+
+    // --- CEFR Target ---
+    if ("cefrTarget" in body) {
+      if (body.cefrTarget == null) {
+        await pool.query(`UPDATE users SET cefr_target = NULL WHERE user_id = $1`, [userID]);
+      } else {
+        const val = String(body.cefrTarget).trim().toUpperCase();
+        if (!VALID_CEFR.includes(val)) {
+          return res.status(400).json({ error: "INVALID_CEFR", message: `Must be one of: ${VALID_CEFR.join(", ")}` });
+        }
+        await pool.query(`UPDATE users SET cefr_target = $1 WHERE user_id = $2`, [val, userID]);
+      }
+      changed = true;
+    }
+
     if (!changed) {
       return res.status(400).json({ error: "NO_UPDATES", message: "No fields to update" });
     }
 
     // Return fresh whoami-shaped response
-    const profile = await buildProfileResponse(userID, req.user);
+    const profile = await buildProfileResponse(userID);
 
     logger.info("[profile] self-service update", {
       rid: req._rid,

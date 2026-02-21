@@ -86,7 +86,20 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       profileComplete,
       primaryHandle,
       username: primaryHandle,
-      displayName: req.user.displayName || null
+      displayName: req.user.displayName || null,
+
+      // Preferences
+      primaryLanguage: req.user.primaryLanguage,
+      glossLanguage: req.user.glossLanguage,
+      customizeLearning: req.user.customizeLearning,
+      shareProgressDefault: req.user.shareProgressDefault,
+      allowTeacherAdjustDefault: req.user.allowTeacherAdjustDefault,
+      locationCity: req.user.locationCity,
+      locationCountry: req.user.locationCountry,
+      shareCity: req.user.shareCity,
+      shareCountry: req.user.shareCountry,
+      cefrCurrent: req.user.cefrCurrent,
+      cefrTarget: req.user.cefrTarget
     });
   } catch (err) {
     logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
