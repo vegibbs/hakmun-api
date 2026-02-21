@@ -345,7 +345,7 @@ router.delete("/v1/content/items", requireSession, async (req, res) => {
       `
       DELETE FROM list_items
       WHERE item_id = ANY($1::uuid[])
-        AND list_id IN (SELECT id FROM lists WHERE owner_user_id = $2::uuid)
+        AND list_id IN (SELECT id FROM lists WHERE user_id = $2::uuid)
       `,
       [ids, userId]
     );
