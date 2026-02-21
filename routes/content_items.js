@@ -145,17 +145,35 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         lri.audience,
         lri.global_state,
         lri.operational_status,
-        lri.owner_user_id      AS registry_owner_user_id
+        lri.owner_user_id      AS registry_owner_user_id,
+
+        gl.grammar_links,
+        vl.vocab_ids
       FROM content_items ci
       JOIN library_registry_items lri
         ON lri.content_type = ci.content_type
        AND lri.content_id   = ci.content_item_id
+      LEFT JOIN LATERAL (
+        SELECT json_agg(json_build_object(
+          'code', gp.code,
+          'display_name', gp.display_name,
+          'role', cigl.role
+        )) AS grammar_links
+        FROM content_item_grammar_links cigl
+        JOIN grammar_patterns gp ON gp.id = cigl.grammar_pattern_id
+        WHERE cigl.content_item_id = ci.content_item_id
+      ) gl ON true
+      LEFT JOIN LATERAL (
+        SELECT json_agg(svl.teaching_vocab_id) AS vocab_ids
+        FROM sentence_vocab_links svl
+        WHERE svl.sentence_content_item_id = ci.content_item_id
+      ) vl ON true
       WHERE ci.content_type = $1::text
         AND lri.audience = 'global'
         AND lri.global_state = $2::text
         AND lri.operational_status = 'active'
       ORDER BY ci.created_at DESC
-      LIMIT 500
+      LIMIT 5000
     `;
 
     const { rows } = await dbQuery(sql, [contentType, globalState]);

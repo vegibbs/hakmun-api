@@ -25,6 +25,7 @@ const { requireSession } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
+const { linkSentenceVocab } = require("../util/link_vocab_patterns");
 
 const router = express.Router();
 
@@ -377,8 +378,10 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       // -----------------------------
       // Sentence→Vocab links (per-sentence vocabulary from OpenAI)
       // Populates sentence_vocab_links so practice exposure works.
+      // Uses shared utility (util/link_vocab_patterns.js).
       // -----------------------------
       let sentenceVocabLinked = 0;
+      const q = client.query.bind(client);
       for (const s of sentences) {
         const ko = cleanString(s?.ko, 4000);
         if (!ko) continue;
@@ -386,52 +389,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         if (!contentItemId) continue;
 
         const sentenceVocab = Array.isArray(s?.vocabulary) ? s.vocabulary : [];
-        for (const v of sentenceVocab) {
-          const lemma = cleanString(v?.lemma_ko, 200);
-          if (!lemma) continue;
-          const pos = cleanString(v?.pos_ko, 40) || "기타";
-
-          // Look up or create in teaching_vocab
-          let tvId = null;
-          const tvMatch = await withTimeout(
-            client.query(
-              `SELECT id FROM teaching_vocab WHERE lemma = $1 LIMIT 1`,
-              [lemma]
-            ),
-            8000,
-            "db-match-tv-for-svl"
-          );
-          if (tvMatch.rows.length > 0) {
-            tvId = tvMatch.rows[0].id;
-          } else {
-            const tvInsert = await withTimeout(
-              client.query(
-                `INSERT INTO teaching_vocab (lemma, part_of_speech, pos_code, status)
-                 VALUES ($1, $2, $3, 'provisional')
-                 ON CONFLICT (lemma, part_of_speech) DO UPDATE SET lemma = EXCLUDED.lemma
-                 RETURNING id`,
-                [lemma, pos, pos]
-              ),
-              8000,
-              "db-create-tv-for-svl"
-            );
-            tvId = tvInsert.rows?.[0]?.id || null;
-          }
-
-          if (tvId) {
-            await withTimeout(
-              client.query(
-                `INSERT INTO sentence_vocab_links (sentence_content_item_id, teaching_vocab_id)
-                 VALUES ($1::uuid, $2::uuid)
-                 ON CONFLICT (sentence_content_item_id, teaching_vocab_id) DO NOTHING`,
-                [contentItemId, tvId]
-              ),
-              8000,
-              "db-insert-svl"
-            );
-            sentenceVocabLinked += 1;
-          }
-        }
+        sentenceVocabLinked += await linkSentenceVocab(q, contentItemId, sentenceVocab, { createProvisional: true });
       }
 
       // -----------------------------

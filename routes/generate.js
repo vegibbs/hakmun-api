@@ -7,6 +7,8 @@ const router = express.Router();
 const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
 const { callOpenAIOnce } = require("../util/openai");
+const { linkSentenceVocab, linkSentenceGrammarPatterns } = require("../util/link_vocab_patterns");
+const { logger } = require("../util/log");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
@@ -55,6 +57,13 @@ For each sentence, also provide:
 - cefr_level: your best estimate of the CEFR level (${info.cefrRange}).
 - topic: pick ONE from this list: ${topicsCsv}
 - naturalness_score: how confident are you (0.0 to 1.0) that a native Korean speaker would actually say this sentence in everyday life? Be honest — penalize textbook-sounding or unnatural phrasing.
+- vocabulary: an array of content words (nouns, verbs, adjectives, adverbs) that appear in this sentence.
+  For each word provide: { "lemma_ko": "dictionary/base form", "pos_ko": "명사|동사|형용사|부사|기타" }
+  Exclude particles and function words (이/가, 을/를, 에, 은/는, 의, 도, 와/과, 에서, 으로, etc.).
+  For conjugated forms, return the dictionary form as lemma_ko (e.g., "먹었어요" → lemma_ko "먹다").
+- grammar_patterns: an array of grammar patterns used in this sentence.
+  For each pattern provide: { "surface_form": "the attachable ending pattern, e.g. -았/었어요" }
+  Return atomic patterns only — decompose compound endings into separate entries.
 
 Return ONLY valid JSON. No markdown. No explanations.
 
@@ -66,7 +75,13 @@ Output schema:
       "en": "English translation here",
       "cefr_level": "A2",
       "topic": "daily_life",
-      "naturalness_score": 0.95
+      "naturalness_score": 0.95,
+      "vocabulary": [
+        { "lemma_ko": "날씨", "pos_ko": "명사" }
+      ],
+      "grammar_patterns": [
+        { "surface_form": "-아/어요" }
+      ]
     }
   ]
 }`;
@@ -118,6 +133,8 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
           cefr_level: cefr || null,
           topic,
           naturalness_score: score,
+          vocabulary: Array.isArray(s.vocabulary) ? s.vocabulary : [],
+          grammar_patterns: Array.isArray(s.grammar_patterns) ? s.grammar_patterns : [],
         };
       })
       .filter((s) => s.naturalness_score === null || s.naturalness_score >= NATURALNESS_THRESHOLD);
@@ -127,13 +144,15 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
     }
 
     // 3. Insert into content_items + library_registry_items as global/approved
-    const client = db && typeof db.connect === "function" ? await db.connect() : null;
-    const q = client ? client.query.bind(client) : dbQuery;
+    //    Then link vocabulary and grammar patterns.
+    const { pool } = db;
+    const client = await pool.connect();
+    const q = client.query.bind(client);
 
     const created = [];
 
     try {
-      if (client) await q("BEGIN", []);
+      await q("BEGIN", []);
 
       for (const s of validSentences) {
         const ins = await q(
@@ -161,6 +180,13 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
         );
         const registry = reg.rows[0];
 
+        // Link vocabulary and grammar patterns from OpenAI response
+        const vocabArray = Array.isArray(s.vocabulary) ? s.vocabulary : [];
+        const patternsArray = Array.isArray(s.grammar_patterns) ? s.grammar_patterns : [];
+
+        const vocabLinked = await linkSentenceVocab(q, item.content_item_id, vocabArray);
+        const patternsLinked = await linkSentenceGrammarPatterns(q, item.content_item_id, patternsArray);
+
         created.push({
           content_item_id: item.content_item_id,
           content_type: item.content_type,
@@ -176,19 +202,19 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
           audience: registry.audience,
           global_state: registry.global_state,
           operational_status: registry.operational_status,
+          vocab_linked: vocabLinked,
+          patterns_linked: patternsLinked,
         });
       }
 
-      if (client) await q("COMMIT", []);
+      await q("COMMIT", []);
     } catch (err) {
-      if (client) {
-        try {
-          await client.query("ROLLBACK");
-        } catch (_) {}
-      }
+      try {
+        await client.query("ROLLBACK");
+      } catch (_) {}
       throw err;
     } finally {
-      if (client) client.release();
+      client.release();
     }
 
     return res.status(201).json({
