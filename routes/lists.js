@@ -39,6 +39,10 @@ router.get("/v1/lists", requireSession, async (req, res) => {
            SELECT COUNT(*)::int AS item_count
              FROM list_items li
             WHERE li.list_id = l.id
+              AND (
+                li.item_type NOT IN ('sentence', 'pattern')
+                OR EXISTS (SELECT 1 FROM content_items ci WHERE ci.content_item_id = li.item_id)
+              )
          ) ic ON true
          WHERE l.user_id = $1::uuid
          ORDER BY l.created_at DESC`,
@@ -78,6 +82,23 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
     if (listR.rows.length === 0) {
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
+
+    // Clean up orphaned list_items whose content no longer exists
+    await withTimeout(
+      pool.query(
+        `DELETE FROM list_items li
+         WHERE li.list_id = $1::uuid
+           AND li.item_type IN ('sentence', 'pattern')
+           AND NOT EXISTS (
+             SELECT 1 FROM content_items ci WHERE ci.content_item_id = li.item_id
+           )`,
+        [listId]
+      ),
+      8000,
+      "db-clean-orphaned-list-items"
+    ).catch(err => {
+      logger.warn("[lists] orphan cleanup failed", { err: String(err?.message || err) });
+    });
 
     const itemsR = await withTimeout(
       pool.query(

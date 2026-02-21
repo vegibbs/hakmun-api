@@ -322,6 +322,16 @@ router.delete("/v1/content/items", requireSession, async (req, res) => {
       [ids, userId]
     );
 
+    // Remove orphaned list_items that reference these content items
+    await q(
+      `
+      DELETE FROM list_items
+      WHERE item_id = ANY($1::uuid[])
+        AND list_id IN (SELECT id FROM lists WHERE owner_user_id = $2::uuid)
+      `,
+      [ids, userId]
+    );
+
     // Delete content items
     const result = await q(
       `
