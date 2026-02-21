@@ -75,7 +75,9 @@ Goal:
 
 CRITICAL OUTPUT RULES:
 - Return ONLY valid JSON. No markdown. No comments. No explanations outside JSON.
-- Be conservative: omit uncertain items. Missing is acceptable; junk is forbidden.
+- Be conservative with vocabulary and patterns. But be AGGRESSIVE with sentences — classroom notes
+  are full of real sentences mixed with annotations. Extract every line that contains a usable
+  Korean sentence, even if the line is messy. Clean it up rather than skip it.
 
 VOCABULARY RULES:
 - Return dictionary-form headwords suitable for linking to a global dictionary.
@@ -85,17 +87,24 @@ VOCABULARY RULES:
 - pos_ko must be one of: 명사|동사|형용사|부사|기타
 
 SENTENCE RULES:
-- Return only well-formed natural Korean sentences.
+- Extract every usable Korean sentence. These are classroom notes — sentences are mixed with
+  teacher annotations, inline English, and shorthand. Do NOT skip a sentence just because the
+  line is messy. Clean it up and include it.
 - MANDATORY: Every Korean sentence MUST end with punctuation (. or ? or !). No exceptions.
   If the source text lacks punctuation, add a period. Check each sentence before returning.
-- Parenthetical annotations like (말), (딸한테) are common in teaching notes.
+- Parenthetical annotations like (말), (딸한테), (몬) are common in teaching notes.
   Include the sentence WITH the parenthetical — do not skip it.
   Example: "딸한테 밥을 사 오라고 (말)했어요." is a valid sentence — extract it as-is.
-- Remove inline English glue words if they are not part of Korean.
+  Example: "한번도 못(몬) 만났어요." is a valid sentence — extract it as-is.
+- Inline English words (e.g., "자주often", "pass by") are teacher glosses.
+  Strip the English and keep the Korean: "형이랑 자주 만나요?" not "형이랑 자주often 만나요?".
+- Alternate forms with slashes (e.g., "해요./해씀요.") — pick the standard form for the sentence.
 - Always provide a gloss (translation) in ${lang} for each sentence.
 - REJECT pattern templates and scaffolds: if a line contains a dash-placeholder for a grammar slot
   (e.g., "어떻게 -는지 모르겠어요", "V-고 싶다"), it is a pattern example, NOT a sentence.
   Do not put these in sentences. They belong in patterns (if atomic) or fragments (if scaffolds).
+- When in doubt, INCLUDE the sentence. It is better to capture a slightly rough sentence than
+  to lose real classroom content. The user can always delete it later.
 
 PATTERN RULES (atomic surface-form only):
 - Do NOT invent grammar labels or explanations.
