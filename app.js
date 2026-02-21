@@ -69,6 +69,8 @@ app.use(require("./routes/dictionary_pins_delete"));
 app.use(require("./routes/my_vocab"));
 app.use(require("./routes/dictionary_sets"));
 app.use(require("./routes/nikl_search"));
+app.use(require("./routes/nikl_api_search"));
+app.use(require("./routes/nikl_fetch_on_demand"));
 app.use(require("./routes/teaching_vocab_admin"));
 app.use(require("./routes/google_docs"));
 app.use(require("./routes/google_oauth"));
