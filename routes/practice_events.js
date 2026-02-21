@@ -70,6 +70,47 @@ router.post("/v1/practice/events", requireSession, async (req, res) => {
       "db-insert-practice-events"
     );
 
+    // --- Vocabulary exposure: when a sentence is attempted, record the vocabulary ---
+    // Filter for submitted events (actual attempts, not just views).
+    const submittedSentenceItemIds = [];
+    for (const e of valid) {
+      if (String(e.domain) === "hangulSentence" && String(e.event_type) === "submitted") {
+        const ids = Array.isArray(e.item_ids) ? e.item_ids : [];
+        for (const id of ids) {
+          if (id && typeof id === "string" && id.length > 0) {
+            submittedSentenceItemIds.push(id);
+          }
+        }
+      }
+    }
+
+    if (submittedSentenceItemIds.length > 0) {
+      try {
+        // Dedupe
+        const uniqueIds = [...new Set(submittedSentenceItemIds)];
+
+        await withTimeout(
+          pool.query(
+            `INSERT INTO user_vocab_items (user_id, lemma, vocab_id, first_seen_at, last_seen_at, seen_count)
+             SELECT $1::uuid, tv.lemma, tv.id, now(), now(), 1
+             FROM sentence_vocab_links svl
+             JOIN teaching_vocab tv ON tv.id = svl.teaching_vocab_id
+             WHERE svl.sentence_content_item_id = ANY($2::uuid[])
+             ON CONFLICT (user_id, lemma) DO UPDATE SET
+               last_seen_at = now(),
+               seen_count = user_vocab_items.seen_count + 1,
+               vocab_id = COALESCE(EXCLUDED.vocab_id, user_vocab_items.vocab_id)`,
+            [userId, uniqueIds]
+          ),
+          10000,
+          "db-upsert-vocab-exposure"
+        );
+      } catch (vocabErr) {
+        // Non-fatal: don't fail the event sync if vocab exposure fails.
+        logger.error("[practice-events] vocab exposure failed", { err: String(vocabErr?.message || vocabErr) });
+      }
+    }
+
     return res.json({ ok: true, inserted: result.rowCount || 0 });
   } catch (err) {
     const msg = String(err?.message || err);

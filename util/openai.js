@@ -116,6 +116,12 @@ SENTENCE RULES:
   Do not put these in sentences. They belong in patterns (if atomic) or fragments (if scaffolds).
 - When in doubt, INCLUDE the sentence. It is better to capture a slightly rough sentence than
   to lose real classroom content. The user can always delete it later.
+- PER-SENTENCE VOCABULARY: For each sentence, include a "vocabulary" array listing the content
+  words that appear in that sentence. Use the same format as the top-level vocabulary
+  (lemma_ko, pos_ko, surface_ko, gloss). This links vocabulary directly to the sentence so
+  students get vocabulary exposure when they practice it.
+  Exclude common function words/particles (이/가, 을/를, 에, 은/는, 의, 도, 와/과, 에서, 으로, etc.).
+  Include nouns, verbs, adjectives, and adverbs that carry meaning.
 
 PATTERN RULES (atomic surface-form only):
 - Do NOT invent grammar labels or explanations.
@@ -165,7 +171,7 @@ Return JSON using this schema exactly:
     { "lemma_ko": "...", "pos_ko": "명사|동사|형용사|부사|기타", "surface_ko": "conjugated form or null", "gloss": "${lang} meaning" }
   ],
   "sentences": [
-    { "ko": "Korean sentence with punctuation.", "gloss": "${lang} translation" }
+    { "ko": "Korean sentence with punctuation.", "gloss": "${lang} translation", "vocabulary": [{ "lemma_ko": "...", "pos_ko": "명사|동사|형용사|부사|기타", "surface_ko": "conjugated form or null", "gloss": "${lang} meaning" }] }
   ],
   "patterns": [
     { "surface_form": "...", "context_span": "...", "confidence": 0.0, "kind": "ENDING|CONNECTOR|PARTICLE|DISCOURSE|AUX|OTHER", "unmatched": false }
