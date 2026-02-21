@@ -419,4 +419,88 @@ router.post("/v1/auth/switch-profile", requireSession, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   GET /v1/auth/profiles
+   Returns all linked profiles for the current user's Apple sub.
+   Any authenticated user can call this (not admin-only).
+------------------------------------------------------------------ */
+router.get("/v1/auth/profiles", requireSession, async (req, res) => {
+  try {
+    const currentUserID = req.user.userID;
+
+    // Resolve apple_sub (same logic as switch-profile).
+    let appleSub = null;
+
+    const { rows: aiRows } = await pool.query(
+      `SELECT subject FROM auth_identities WHERE user_id = $1 AND provider = 'apple' LIMIT 1`,
+      [currentUserID]
+    );
+    if (aiRows?.length) {
+      appleSub = aiRows[0].subject;
+    } else {
+      const { rows: lpRows } = await pool.query(
+        `SELECT apple_sub FROM linked_profiles WHERE user_id = $1 LIMIT 1`,
+        [currentUserID]
+      );
+      if (lpRows?.length) appleSub = lpRows[0].apple_sub;
+    }
+
+    if (!appleSub) {
+      // No linked profiles — just return empty array.
+      return res.json({ profiles: [] });
+    }
+
+    // Primary account(s) from auth_identities.
+    const { rows: primaryRows } = await pool.query(
+      `SELECT DISTINCT ON (ai.user_id) ai.user_id, u.role, u.is_active, uh.handle AS primary_handle
+       FROM auth_identities ai
+       JOIN users u ON u.user_id = ai.user_id
+       LEFT JOIN user_handles uh ON uh.user_id = ai.user_id AND uh.kind = 'primary'
+       WHERE ai.provider = 'apple' AND ai.subject = $1`,
+      [appleSub]
+    );
+
+    // Linked profiles.
+    const { rows: linkedRows } = await pool.query(
+      `SELECT lp.user_id, lp.label, u.role, u.is_active, uh.handle AS primary_handle
+       FROM linked_profiles lp
+       JOIN users u ON u.user_id = lp.user_id
+       LEFT JOIN user_handles uh ON uh.user_id = lp.user_id AND uh.kind = 'primary'
+       WHERE lp.apple_sub = $1`,
+      [appleSub]
+    );
+
+    const primaryUserIDs = new Set(primaryRows.map((r) => r.user_id));
+    const profiles = [];
+
+    for (const row of primaryRows) {
+      profiles.push({
+        userID: row.user_id,
+        primaryHandle: row.primary_handle,
+        role: row.role,
+        label: null,
+        isActive: Boolean(row.is_active),
+        isPrimary: true
+      });
+    }
+
+    for (const row of linkedRows) {
+      if (primaryUserIDs.has(row.user_id)) continue;
+      profiles.push({
+        userID: row.user_id,
+        primaryHandle: row.primary_handle,
+        role: row.role,
+        label: row.label,
+        isActive: Boolean(row.is_active),
+        isPrimary: false
+      });
+    }
+
+    return res.json({ profiles });
+  } catch (err) {
+    logger.error("/v1/auth/profiles failed", { rid: req._rid, err: err?.message || String(err) });
+    return res.status(500).json({ error: "list profiles failed" });
+  }
+});
+
 module.exports = router;
