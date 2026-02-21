@@ -464,9 +464,9 @@ router.get(
         return res.status(400).json({ error: "no Apple identity found for current user" });
       }
 
-      // Primary account from auth_identities
+      // Primary account from auth_identities (deduplicate by user_id — multiple audiences possible)
       const { rows: primaryRows } = await pool.query(
-        `SELECT ai.user_id, u.role, u.is_active, uh.handle AS primary_handle
+        `SELECT DISTINCT ON (ai.user_id) ai.user_id, u.role, u.is_active, uh.handle AS primary_handle
          FROM auth_identities ai
          JOIN users u ON u.user_id = ai.user_id
          LEFT JOIN user_handles uh ON uh.user_id = ai.user_id AND uh.kind = 'primary'
