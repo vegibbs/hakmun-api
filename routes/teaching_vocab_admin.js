@@ -22,7 +22,7 @@ function looksLikeUUID(s) {
 
 const VALID_POS_CODES = [
   "noun", "pronoun", "numeral", "verb", "adjective", "adverb",
-  "determiner", "particle", "interjection", "dependent_noun", "auxiliary", "unknown",
+  "determiner", "particle", "interjection", "dependent_noun", "auxiliary", "loanword", "unknown",
 ];
 
 // Shared query: return a teaching vocab item with NIKL + override joins
