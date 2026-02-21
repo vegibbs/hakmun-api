@@ -7,7 +7,7 @@ const router = express.Router();
 
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
-const { requireSession } = require("../auth/session");
+const { requireSession, computeEntitlementsFromUser } = require("../auth/session");
 
 // ---------- Handle validation (mirrors admin.js) ----------
 
@@ -41,15 +41,24 @@ async function buildProfileResponse(userID, reqUser) {
   );
   const u = userRows?.[0] || {};
 
+  // Recompute entitlements from fresh DB state (role may have changed).
+  const freshUser = {
+    role: u.role || "student",
+    isActive: Boolean(u.is_active),
+    isAdmin: Boolean(u.is_admin),
+    isRootAdmin: Boolean(u.is_root_admin)
+  };
+  const { entitlements, capabilities } = computeEntitlementsFromUser(freshUser);
+
   return {
     userID,
-    role: u.role || "student",
-    isTeacher: String(u.role || "student") === "teacher",
-    isAdmin: Boolean(u.is_admin),
-    isRootAdmin: Boolean(u.is_root_admin),
-    isActive: Boolean(u.is_active),
-    entitlements: reqUser.entitlements || [],
-    capabilities: reqUser.capabilities || {},
+    role: freshUser.role,
+    isTeacher: freshUser.role === "teacher",
+    isAdmin: freshUser.isAdmin,
+    isRootAdmin: freshUser.isRootAdmin,
+    isActive: freshUser.isActive,
+    entitlements,
+    capabilities,
     profileComplete,
     primaryHandle,
     username: primaryHandle,
