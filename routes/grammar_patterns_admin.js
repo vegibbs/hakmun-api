@@ -28,9 +28,8 @@ router.get("/v1/admin/patterns/unmatched", requireSession, requireRole("teacher"
         SELECT u.surface_form, u.alias_norm, u.context_span, u.count,
                u.first_seen_at, u.last_seen_at
         FROM unmatched_grammar_patterns u
-        WHERE u.owner_user_id = $1::uuid
         ORDER BY u.count DESC, u.last_seen_at DESC
-      `, [userId]),
+      `),
       8000,
       "db-list-unmatched"
     );

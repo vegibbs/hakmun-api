@@ -28,9 +28,8 @@ router.get("/v1/admin/vocab/unmatched", requireSession, requireRole("teacher", "
         SELECT unmatched_id, lemma, pos, context_span, count,
                first_seen_at, last_seen_at
         FROM unmatched_vocab
-        WHERE owner_user_id = $1::uuid
         ORDER BY count DESC, last_seen_at DESC
-      `, [userId]),
+      `),
       8000,
       "db-list-unmatched-vocab"
     );
@@ -133,14 +132,13 @@ router.post("/v1/admin/vocab/resolve", requireSession, requireRole("teacher", "a
     try {
       await client.query("BEGIN");
 
-      // Delete the unmatched row
+      // Delete ALL unmatched rows for this lemma (across all users)
       const deleted = await withTimeout(
         client.query(`
           DELETE FROM unmatched_vocab
-          WHERE owner_user_id = $1::uuid
-            AND lemma = $2
+          WHERE lemma = $1
           RETURNING unmatched_id
-        `, [userId, lemma]),
+        `, [lemma]),
         8000,
         "db-delete-unmatched-vocab"
       );
@@ -152,16 +150,15 @@ router.post("/v1/admin/vocab/resolve", requireSession, requireRole("teacher", "a
 
       let backfilled = 0;
 
-      // If linking, backfill user_vocab_items rows that have vocab_id=NULL
+      // If linking, backfill ALL users' user_vocab_items rows that have vocab_id=NULL
       if (action === "link" && vocabId) {
         const bf = await withTimeout(
           client.query(`
             UPDATE user_vocab_items
-            SET vocab_id = $3::uuid
-            WHERE user_id = $1::uuid
-              AND lemma = $2
+            SET vocab_id = $2::uuid
+            WHERE lemma = $1
               AND vocab_id IS NULL
-          `, [userId, lemma, vocabId]),
+          `, [lemma, vocabId]),
           8000,
           "db-backfill-vocab-link"
         );
