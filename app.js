@@ -53,6 +53,7 @@ app.use(require("./routes/auth_apple"));
 app.use(require("./routes/session"));
 
 app.use(require("./routes/profile_photo"));
+app.use(require("./routes/profile_update"));
 app.use(require("./routes/assets"));
 app.use(require("./routes/handles"));
 

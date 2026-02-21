@@ -252,7 +252,7 @@ async function getUserState(userID) {
 
   const { rows } = await pool.query(
     `
-    select role, is_admin, is_root_admin, is_active
+    select role, is_admin, is_root_admin, is_active, display_name
     from users
     where user_id = $1
     limit 1
@@ -349,7 +349,8 @@ async function requireSession(req, res, next) {
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
       isActive,
-      isTeacher: String(state.role || "student") === "teacher"
+      isTeacher: String(state.role || "student") === "teacher",
+      displayName: state.display_name || null
     };
 
     const { entitlements, capabilities } = computeEntitlementsFromUser(user);

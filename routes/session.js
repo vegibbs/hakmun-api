@@ -85,7 +85,8 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       // Canonical profile facts
       profileComplete,
       primaryHandle,
-      username: primaryHandle
+      username: primaryHandle,
+      displayName: req.user.displayName || null
     });
   } catch (err) {
     logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
