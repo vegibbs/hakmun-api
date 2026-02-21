@@ -30,11 +30,6 @@ router.post("/v1/session/refresh", async (req, res) => {
       return res.status(401).json({ error: "refresh token required" });
     }
 
-    // Refresh tokens must never be impersonation tokens.
-    if (decoded.impersonating) {
-      return res.status(401).json({ error: "refresh not allowed for impersonation" });
-    }
-
     const state = await getUserState(decoded.userID);
     if (!Boolean(state.is_active)) {
       return res.status(403).json({ error: "account disabled" });
@@ -82,10 +77,6 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       isAdmin: Boolean(req.user.isAdmin),
       isRootAdmin: Boolean(req.user.isRootAdmin),
       isActive: Boolean(req.user.isActive),
-
-      // Impersonation (explicit)
-      impersonating: Boolean(req.user.impersonating),
-      actorUserID: req.user.actorUserID,
 
       // Server-authoritative capabilities
       entitlements: req.user.entitlements || [],

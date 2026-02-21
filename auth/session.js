@@ -41,8 +41,6 @@ const ROOT_ADMIN_USER_IDS =
 // Session token lifetimes (seconds) — constants as in original
 const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
 const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
-// Impersonation tokens are short-lived and access-only (no refresh)
-const IMPERSONATION_ACCESS_TTL_SEC = 60 * 10; // 10 minutes
 
 // Session JWT claims
 const SESSION_ISSUER = "hakmun-api";
@@ -169,14 +167,12 @@ async function touchLastSeen(userID) {
 /* ------------------------------------------------------------------
    EPIC 3.2 — Entitlements (server-authoritative)
    - Clients MUST NOT infer capabilities.
-   - Entitlements are reduced while impersonating.
 ------------------------------------------------------------------ */
 function computeEntitlementsFromUser(user) {
   const role = String(user?.role || "student");
   const isActive = Boolean(user?.isActive);
   const isRootAdmin = Boolean(user?.isRootAdmin);
   const isAdmin = Boolean(user?.isAdmin);
-  const impersonating = Boolean(user?.impersonating);
 
   // Fail-closed: inactive users have no entitlements.
   if (!isActive) {
@@ -185,18 +181,17 @@ function computeEntitlementsFromUser(user) {
       capabilities: {
         canUseApp: false,
         canAccessTeacherTools: false,
+        canApproveContent: false,
         canAdminUsers: false,
-        canImpersonate: false,
         canManageRoles: false,
         canManageActivation: false
       }
     };
   }
 
-  const canAccessTeacherTools = role === "teacher";
-
-  // Admin ops are never permitted while impersonating, even if the target user is admin/root admin.
-  const adminAllowed = isRootAdmin && !impersonating;
+  const canAccessTeacherTools = role === "teacher" || role === "approver";
+  const canApproveContent = role === "approver";
+  const adminAllowed = isRootAdmin;
 
   const entitlements = [];
 
@@ -204,25 +199,21 @@ function computeEntitlementsFromUser(user) {
   entitlements.push("app:use");
 
   if (canAccessTeacherTools) entitlements.push("teacher:tools");
+  if (canApproveContent) entitlements.push("approver:content");
 
   if (adminAllowed) {
     entitlements.push("admin:users:read");
     entitlements.push("admin:users:write");
-    entitlements.push("admin:impersonate");
   }
 
-  // Useful for ops/debugging; not an entitlement to grant new powers.
-  if (impersonating) entitlements.push("session:impersonating");
   if (isAdmin) entitlements.push("flag:is_admin");
   if (isRootAdmin) entitlements.push("flag:is_root_admin");
 
   const capabilities = {
     canUseApp: true,
     canAccessTeacherTools,
-
-    // Root-admin-only, and forbidden while impersonating.
+    canApproveContent,
     canAdminUsers: adminAllowed,
-    canImpersonate: adminAllowed,
     canManageRoles: adminAllowed,
     canManageActivation: adminAllowed
   };
@@ -235,6 +226,15 @@ function requireEntitlement(entitlement) {
     const ents = req.user?.entitlements || [];
     if (!Array.isArray(ents) || !ents.includes(entitlement)) {
       return res.status(403).json({ error: "insufficient entitlement" });
+    }
+    return next();
+  };
+}
+
+function requireRole(...roles) {
+  return function (req, res, next) {
+    if (!roles.includes(req.user?.role)) {
+      return res.status(403).json({ error: "insufficient role", required: roles });
     }
     return next();
   };
@@ -326,16 +326,7 @@ async function verifySessionJWT(token) {
     throw new Error(`invalid session token typ: ${String(typ)}`);
   }
 
-  // Admin impersonation (server-authoritative, explicit claims)
-  const impersonating = Boolean(payload.imp);
-  const actorUserID = payload.act ? String(payload.act) : null;
-
-  // Safety: impersonation tokens must carry an actor
-  if (impersonating && !actorUserID) {
-    throw new Error("impersonation token missing act");
-  }
-
-  return { userID: String(userID), typ, impersonating, actorUserID };
+  return { userID: String(userID), typ };
 }
 
 async function requireSession(req, res, next) {
@@ -358,11 +349,7 @@ async function requireSession(req, res, next) {
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
       isActive,
-      isTeacher: String(state.role || "student") === "teacher",
-
-      // Impersonation is an explicit session claim; client must never infer it.
-      impersonating: Boolean(decoded.impersonating),
-      actorUserID: decoded.actorUserID ? String(decoded.actorUserID) : null
+      isTeacher: String(state.role || "student") === "teacher"
     };
 
     const { entitlements, capabilities } = computeEntitlementsFromUser(user);
@@ -380,28 +367,6 @@ async function requireSession(req, res, next) {
   }
 }
 
-/* ------------------------------------------------------------------
-   EPIC 3 — Admin Ops helpers (tokens + checks)
------------------------------------------------------------------- */
-async function issueImpersonationAccessToken({ targetUserID, actorUserID }) {
-  const iat = nowSeconds();
-
-  // Access-only; short TTL; explicit impersonation claims.
-  const accessToken = await new SignJWT({ typ: "access", imp: true, act: String(actorUserID) })
-    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
-    .setIssuer(SESSION_ISSUER)
-    .setAudience(SESSION_AUDIENCE)
-    .setSubject(String(targetUserID))
-    .setIssuedAt(iat)
-    .setExpirationTime(iat + IMPERSONATION_ACCESS_TTL_SEC)
-    .sign(Buffer.from(SESSION_JWT_SECRET));
-
-  return {
-    accessToken,
-    expiresIn: IMPERSONATION_ACCESS_TTL_SEC
-  };
-}
-
 module.exports = {
   // middleware
   requireSession,
@@ -410,12 +375,12 @@ module.exports = {
   extractBearerToken,
   verifySessionJWT,
   issueSessionTokens,
-  issueImpersonationAccessToken,
 
   // state + entitlements
   getUserState,
   computeEntitlementsFromUser,
   requireEntitlement,
+  requireRole,
 
   // admin safety
   ensureAtLeastOneRootAdminNonFatal,
@@ -428,6 +393,5 @@ module.exports = {
   SESSION_ISSUER,
   SESSION_AUDIENCE,
   SESSION_ACCESS_TTL_SEC,
-  SESSION_REFRESH_TTL_SEC,
-  IMPERSONATION_ACCESS_TTL_SEC
+  SESSION_REFRESH_TTL_SEC
 };

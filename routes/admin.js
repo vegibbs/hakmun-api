@@ -9,9 +9,6 @@ const { logger } = require("../util/log");
 const {
   requireSession,
   requireEntitlement,
-  getUserState,
-  issueSessionTokens,
-  issueImpersonationAccessToken,
   isPinnedRootAdmin
 } = require("../auth/session");
 
@@ -57,20 +54,8 @@ function isValidPrimaryHandle(handle) {
    Root-admin gate (server-authoritative)
 ------------------------------------------------------------------ */
 function requireRootAdmin(req, res, next) {
-  // Root-admin ops require explicit capability derived server-side.
-  // This also guarantees admin ops are forbidden while impersonating.
   if (!req.user?.capabilities?.canAdminUsers) {
     return res.status(403).json({ error: "root admin required" });
-  }
-  return next();
-}
-
-function requireImpersonating(req, res, next) {
-  if (!req.user?.impersonating) {
-    return res.status(400).json({ error: "not impersonating" });
-  }
-  if (!req.user?.actorUserID) {
-    return res.status(400).json({ error: "impersonation missing actor" });
   }
   return next();
 }
@@ -228,7 +213,7 @@ router.post(
       const isActiveRaw = req.body?.isActive;
 
       const role = roleRaw !== undefined && roleRaw !== null ? String(roleRaw).trim() : "student";
-      if (role !== "student" && role !== "teacher") {
+      if (!["student", "teacher", "approver"].includes(role)) {
         return res.status(400).json({ error: "invalid role" });
       }
 
@@ -295,7 +280,7 @@ router.patch(
 
       if (roleRaw !== undefined && roleRaw !== null) {
         const role = String(roleRaw).trim();
-        if (role !== "student" && role !== "teacher") {
+        if (!["student", "teacher", "approver"].includes(role)) {
           return res.status(400).json({ error: "invalid role" });
         }
         updates.push(`role = $${idx++}`);
@@ -347,12 +332,25 @@ router.patch(
   }
 );
 
-// POST /v1/admin/impersonate { targetUserID }
+/* ------------------------------------------------------------------
+   Linked Profiles (profile switching for root admins)
+------------------------------------------------------------------ */
+
+// Helper: resolve the Apple sub for the current user
+async function resolveAppleSub(userID) {
+  const { rows } = await pool.query(
+    `SELECT subject FROM auth_identities WHERE user_id = $1 AND provider = 'apple' LIMIT 1`,
+    [userID]
+  );
+  return rows?.[0]?.subject || null;
+}
+
+// POST /v1/admin/profiles/link { targetUserID, label? }
 router.post(
-  "/v1/admin/impersonate",
+  "/v1/admin/profiles/link",
   requireSession,
   requireRootAdmin,
-  requireEntitlement("admin:impersonate"),
+  requireEntitlement("admin:users:write"),
   async (req, res) => {
     try {
       const targetUserID = requireJsonField(req, res, "targetUserID");
@@ -361,58 +359,164 @@ router.post(
         return res.status(400).json({ error: "invalid targetUserID" });
       }
 
-      // Target must exist + be active; no bypass.
-      const state = await getUserState(targetUserID);
-      if (!Boolean(state.is_active)) {
-        return res.status(403).json({ error: "target account disabled" });
+      const label = req.body?.label ? String(req.body.label).trim() : null;
+
+      const appleSub = await resolveAppleSub(req.user.userID);
+      if (!appleSub) {
+        return res.status(400).json({ error: "no Apple identity found for current user" });
       }
 
-      const tokens = await issueImpersonationAccessToken({
+      // Target must exist and be active.
+      const { rows: targetRows } = await pool.query(
+        `SELECT user_id, is_active FROM users WHERE user_id = $1 LIMIT 1`,
+        [targetUserID]
+      );
+      if (!targetRows?.length) {
+        return res.status(404).json({ error: "target user not found" });
+      }
+      if (!Boolean(targetRows[0].is_active)) {
+        return res.status(400).json({ error: "target user is not active" });
+      }
+
+      await pool.query(
+        `INSERT INTO linked_profiles (apple_sub, user_id, label)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (apple_sub, user_id) DO UPDATE SET label = EXCLUDED.label`,
+        [appleSub, targetUserID, label]
+      );
+
+      logger.info("[admin] profile linked", {
+        rid: req._rid,
+        actorUserID: req.user.userID,
         targetUserID,
-        actorUserID: req.user.userID
+        label
       });
 
-      logger.info("[admin] impersonation started", {
+      return res.json({ ok: true, linked: { appleSub, userID: targetUserID, label } });
+    } catch (err) {
+      logger.error("/v1/admin/profiles/link failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "link profile failed" });
+    }
+  }
+);
+
+// DELETE /v1/admin/profiles/link/:userID
+router.delete(
+  "/v1/admin/profiles/link/:userID",
+  requireSession,
+  requireRootAdmin,
+  async (req, res) => {
+    try {
+      const targetUserID = String(req.params.userID || "").trim();
+      if (!looksLikeUUID(targetUserID)) {
+        return res.status(400).json({ error: "invalid userID" });
+      }
+
+      const appleSub = await resolveAppleSub(req.user.userID);
+      if (!appleSub) {
+        return res.status(400).json({ error: "no Apple identity found for current user" });
+      }
+
+      // Cannot unlink the primary account (the one in auth_identities).
+      const { rows: primary } = await pool.query(
+        `SELECT user_id FROM auth_identities WHERE provider = 'apple' AND subject = $1 AND user_id = $2 LIMIT 1`,
+        [appleSub, targetUserID]
+      );
+      if (primary?.length) {
+        return res.status(400).json({ error: "cannot unlink primary account" });
+      }
+
+      const { rowCount } = await pool.query(
+        `DELETE FROM linked_profiles WHERE apple_sub = $1 AND user_id = $2`,
+        [appleSub, targetUserID]
+      );
+
+      if (!rowCount) {
+        return res.status(404).json({ error: "link not found" });
+      }
+
+      logger.info("[admin] profile unlinked", {
         rid: req._rid,
         actorUserID: req.user.userID,
         targetUserID
       });
 
-      return res.json({
-        ...tokens,
-        impersonating: true,
-        actorUserID: req.user.userID,
-        targetUserID
-      });
+      return res.json({ ok: true });
     } catch (err) {
-      logger.error("/v1/admin/impersonate failed", { rid: req._rid, err: err?.message || String(err) });
-      return res.status(500).json({ error: "impersonate failed" });
+      logger.error("/v1/admin/profiles/link/:userID (DELETE) failed", {
+        rid: req._rid,
+        err: err?.message || String(err)
+      });
+      return res.status(500).json({ error: "unlink profile failed" });
     }
   }
 );
 
-// POST /v1/admin/impersonate/exit (must be called with an impersonation access token)
-router.post("/v1/admin/impersonate/exit", requireSession, requireImpersonating, async (req, res) => {
-  try {
-    const actorUserID = req.user.actorUserID;
+// GET /v1/admin/profiles
+router.get(
+  "/v1/admin/profiles",
+  requireSession,
+  requireRootAdmin,
+  async (req, res) => {
+    try {
+      const appleSub = await resolveAppleSub(req.user.userID);
+      if (!appleSub) {
+        return res.status(400).json({ error: "no Apple identity found for current user" });
+      }
 
-    // Issue normal session tokens for the actor.
-    const tokens = await issueSessionTokens({ userID: actorUserID });
+      // Primary account from auth_identities
+      const { rows: primaryRows } = await pool.query(
+        `SELECT ai.user_id, u.role, u.is_active, uh.handle AS primary_handle
+         FROM auth_identities ai
+         JOIN users u ON u.user_id = ai.user_id
+         LEFT JOIN user_handles uh ON uh.user_id = ai.user_id AND uh.kind = 'primary'
+         WHERE ai.provider = 'apple' AND ai.subject = $1`,
+        [appleSub]
+      );
 
-    logger.info("[admin] impersonation exited", {
-      rid: req._rid,
-      actorUserID,
-      targetUserID: req.user.userID
-    });
+      // Linked profiles
+      const { rows: linkedRows } = await pool.query(
+        `SELECT lp.user_id, lp.label, u.role, u.is_active, uh.handle AS primary_handle
+         FROM linked_profiles lp
+         JOIN users u ON u.user_id = lp.user_id
+         LEFT JOIN user_handles uh ON uh.user_id = lp.user_id AND uh.kind = 'primary'
+         WHERE lp.apple_sub = $1`,
+        [appleSub]
+      );
 
-    return res.json({
-      ...tokens,
-      impersonating: false
-    });
-  } catch (err) {
-    logger.error("/v1/admin/impersonate/exit failed", { rid: req._rid, err: err?.message || String(err) });
-    return res.status(500).json({ error: "exit impersonation failed" });
+      const primaryUserIDs = new Set(primaryRows.map((r) => r.user_id));
+
+      const profiles = [];
+
+      for (const row of primaryRows) {
+        profiles.push({
+          userID: row.user_id,
+          primaryHandle: row.primary_handle,
+          role: row.role,
+          label: null,
+          isActive: Boolean(row.is_active),
+          isPrimary: true
+        });
+      }
+
+      for (const row of linkedRows) {
+        if (primaryUserIDs.has(row.user_id)) continue;
+        profiles.push({
+          userID: row.user_id,
+          primaryHandle: row.primary_handle,
+          role: row.role,
+          label: row.label,
+          isActive: Boolean(row.is_active),
+          isPrimary: false
+        });
+      }
+
+      return res.json({ profiles });
+    } catch (err) {
+      logger.error("/v1/admin/profiles failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "list profiles failed" });
+    }
   }
-});
+);
 
 module.exports = router;
