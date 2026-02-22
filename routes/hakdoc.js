@@ -27,13 +27,14 @@ router.post("/v1/hakdocs", requireSession, async (req, res) => {
     const title = (req.body?.title || "Untitled").trim();
     const studentId = req.body?.student_id || null;
     const classCode = req.body?.class_code || null;
+    const rawText = req.body?.raw_text ?? null;
 
     const r = await withTimeout(
       pool.query(
-        `INSERT INTO hakdocs (teacher_id, title, student_id, class_code)
-         VALUES ($1::uuid, $2, $3, $4)
-         RETURNING hakdoc_id, teacher_id, title, student_id, class_code, created_at, updated_at`,
-        [userId, title, studentId, classCode]
+        `INSERT INTO hakdocs (teacher_id, title, student_id, class_code, raw_text)
+         VALUES ($1::uuid, $2, $3, $4, $5)
+         RETURNING hakdoc_id, teacher_id, title, student_id, class_code, raw_text, created_at, updated_at`,
+        [userId, title, studentId, classCode, rawText]
       ),
       8000,
       "db-create-hakdoc"
@@ -55,7 +56,7 @@ router.get("/v1/hakdocs", requireSession, async (req, res) => {
     const r = await withTimeout(
       pool.query(
         `SELECT h.hakdoc_id, h.title, h.student_id, h.class_code,
-                h.created_at, h.updated_at,
+                h.raw_text, h.created_at, h.updated_at,
                 COUNT(s.session_id)::int AS session_count
            FROM hakdocs h
            LEFT JOIN hakdoc_sessions s ON s.hakdoc_id = h.hakdoc_id
@@ -86,7 +87,7 @@ router.get("/v1/hakdocs/:hakdocId", requireSession, async (req, res) => {
     // Fetch hakdoc
     const docR = await withTimeout(
       pool.query(
-        `SELECT hakdoc_id, teacher_id, title, student_id, class_code, created_at, updated_at
+        `SELECT hakdoc_id, teacher_id, title, student_id, class_code, raw_text, created_at, updated_at
            FROM hakdocs
           WHERE hakdoc_id = $1::uuid AND teacher_id = $2::uuid`,
         [hakdocId, userId]
@@ -172,6 +173,10 @@ router.put("/v1/hakdocs/:hakdocId", requireSession, async (req, res) => {
       sets.push(`class_code = $${idx++}`);
       params.push(body.class_code || null);
     }
+    if (body.raw_text !== undefined) {
+      sets.push(`raw_text = $${idx++}`);
+      params.push(body.raw_text);
+    }
 
     if (sets.length === 0) {
       return res.status(400).json({ ok: false, error: "NO_FIELDS" });
@@ -183,7 +188,7 @@ router.put("/v1/hakdocs/:hakdocId", requireSession, async (req, res) => {
         `UPDATE hakdocs
             SET ${sets.join(", ")}
           WHERE hakdoc_id = $1::uuid AND teacher_id = $2::uuid
-         RETURNING hakdoc_id, teacher_id, title, student_id, class_code, created_at, updated_at`,
+         RETURNING hakdoc_id, teacher_id, title, student_id, class_code, raw_text, created_at, updated_at`,
         params
       ),
       8000,
