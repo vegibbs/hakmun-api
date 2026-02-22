@@ -371,6 +371,33 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
 });
 
 // ------------------------------------------------------------------
+// GET /v1/content/items/:contentItemId/audio-variants
+// Returns all audio variants for a content item (owner-scoped).
+// ------------------------------------------------------------------
+router.get("/v1/content/items/:contentItemId/audio-variants", requireSession, async (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const { contentItemId } = req.params;
+
+  try {
+    const { rows } = await dbQuery(
+      `SELECT cav.*
+       FROM content_item_audio_variants cav
+       JOIN content_items ci ON ci.content_item_id = cav.content_item_id
+       WHERE cav.content_item_id = $1 AND ci.owner_user_id = $2
+       ORDER BY cav.is_default DESC, cav.created_at DESC`,
+      [contentItemId, userId]
+    );
+
+    return res.json({ ok: true, variants: rows });
+  } catch (err) {
+    console.error("fetch audio variants failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // POST /v1/content/items/:contentItemId/audio-variants
 // Body: { asset_id, voice_gender, speed, label?, is_default? }
 // Links an uploaded asset to a content item as an audio variant.
