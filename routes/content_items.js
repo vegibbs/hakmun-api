@@ -298,6 +298,65 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
 });
 
 // ------------------------------------------------------------------
+// PATCH /v1/content/items/:contentItemId
+// Body: { text?: "...", notes?: "..." }
+// Owner-scoped update of text and/or notes fields.
+// ------------------------------------------------------------------
+router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const { contentItemId } = req.params;
+  const { text, notes } = req.body || {};
+
+  if (text === undefined && notes === undefined) {
+    return res.status(400).json({ ok: false, error: "NO_FIELDS_PROVIDED" });
+  }
+  if (text !== undefined && (typeof text !== "string" || text.trim().length === 0)) {
+    return res.status(400).json({ ok: false, error: "TEXT_EMPTY" });
+  }
+
+  try {
+    const setClauses = [];
+    const params = [];
+    let idx = 1;
+
+    if (text !== undefined) {
+      setClauses.push(`text = $${idx++}`);
+      params.push(text.trim());
+    }
+    if (notes !== undefined) {
+      setClauses.push(`notes = $${idx++}`);
+      params.push(notes === null ? null : notes.trim());
+    }
+    setClauses.push(`updated_at = now()`);
+
+    params.push(contentItemId); // $idx
+    params.push(userId);        // $idx+1
+
+    const sql = `
+      UPDATE content_items
+      SET ${setClauses.join(", ")}
+      WHERE content_item_id = $${idx++}
+        AND owner_user_id = $${idx}
+      RETURNING content_item_id, content_type, text, notes,
+                cefr_level, topic, global_state, source,
+                owner_user_id, created_at, updated_at
+    `;
+
+    const { rows } = await dbQuery(sql, params);
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    return res.json({ ok: true, item: rows[0] });
+  } catch (err) {
+    console.error("content item update failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // DELETE /v1/content/items
 // Body: { content_item_ids: ["uuid", ...] }
 // Deletes content items and their registry rows (owner-scoped).
