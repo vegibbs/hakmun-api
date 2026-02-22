@@ -2,4 +2,4 @@
 -- Add optional display name to users table for profile settings.
 -- Nullable — users without a display name show their handle.
 
-ALTER TABLE users ADD COLUMN display_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name text;
