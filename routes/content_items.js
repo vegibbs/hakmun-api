@@ -357,6 +357,81 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
 });
 
 // ------------------------------------------------------------------
+// POST /v1/content/items/:contentItemId/audio-variants
+// Body: { asset_id, voice_gender, speed, label?, is_default? }
+// Links an uploaded asset to a content item as an audio variant.
+// Upserts on (content_item_id, voice_gender, speed).
+// ------------------------------------------------------------------
+router.post("/v1/content/items/:contentItemId/audio-variants", requireSession, async (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const { contentItemId } = req.params;
+  const { asset_id, voice_gender, speed, label, is_default } = req.body || {};
+
+  if (!asset_id || !voice_gender || !speed) {
+    return res.status(400).json({ ok: false, error: "MISSING_REQUIRED_FIELDS" });
+  }
+
+  const validGenders = ["female", "male"];
+  const validSpeeds = ["slow", "moderate", "native"];
+  if (!validGenders.includes(voice_gender)) {
+    return res.status(400).json({ ok: false, error: "INVALID_VOICE_GENDER" });
+  }
+  if (!validSpeeds.includes(speed)) {
+    return res.status(400).json({ ok: false, error: "INVALID_SPEED" });
+  }
+
+  try {
+    // Verify ownership of both the content item and the asset
+    const ownerCheck = await dbQuery(
+      `SELECT
+        (SELECT owner_user_id FROM content_items WHERE content_item_id = $1) AS ci_owner,
+        (SELECT owner_user_id FROM media_assets WHERE asset_id = $2) AS asset_owner`,
+      [contentItemId, asset_id]
+    );
+
+    const { ci_owner, asset_owner } = ownerCheck.rows[0] || {};
+    if (ci_owner !== userId) {
+      return res.status(404).json({ ok: false, error: "CONTENT_ITEM_NOT_FOUND" });
+    }
+    if (asset_owner !== userId) {
+      return res.status(404).json({ ok: false, error: "ASSET_NOT_FOUND" });
+    }
+
+    // If is_default, clear other defaults for this content item first
+    if (is_default) {
+      await dbQuery(
+        `UPDATE content_item_audio_variants SET is_default = false WHERE content_item_id = $1 AND is_default = true`,
+        [contentItemId]
+      );
+    }
+
+    const sql = `
+      INSERT INTO content_item_audio_variants
+        (content_item_id, asset_id, voice_gender, speed, label, is_default)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (content_item_id, voice_gender, speed) DO UPDATE
+        SET asset_id = EXCLUDED.asset_id,
+            label = EXCLUDED.label,
+            is_default = EXCLUDED.is_default,
+            updated_at = now()
+      RETURNING *
+    `;
+
+    const { rows } = await dbQuery(sql, [
+      contentItemId, asset_id, voice_gender, speed,
+      label || null, is_default || false,
+    ]);
+
+    return res.json({ ok: true, variant: rows[0] });
+  } catch (err) {
+    console.error("audio variant link failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // DELETE /v1/content/items
 // Body: { content_item_ids: ["uuid", ...] }
 // Deletes content items and their registry rows (owner-scoped).
