@@ -77,7 +77,8 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
         lri.operational_status,
         lri.owner_user_id      AS registry_owner_user_id,
 
-        gl.grammar_links
+        gl.grammar_links,
+        COALESCE(aud.has_audio, false) AS has_audio
       FROM content_items ci
       JOIN library_registry_items lri
         ON lri.content_type = ci.content_type
@@ -92,6 +93,12 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
         JOIN grammar_patterns gp ON gp.id = cigl.grammar_pattern_id
         WHERE cigl.content_item_id = ci.content_item_id
       ) gl ON true
+      LEFT JOIN LATERAL (
+        SELECT true AS has_audio
+        FROM content_item_audio_variants cav
+        WHERE cav.content_item_id = ci.content_item_id
+        LIMIT 1
+      ) aud ON true
       WHERE ci.owner_user_id = $1::uuid
         AND ci.content_type = $2::text
         AND lri.audience = 'personal'
@@ -148,7 +155,8 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         lri.owner_user_id      AS registry_owner_user_id,
 
         gl.grammar_links,
-        vl.vocab_ids
+        vl.vocab_ids,
+        COALESCE(aud.has_audio, false) AS has_audio
       FROM content_items ci
       JOIN library_registry_items lri
         ON lri.content_type = ci.content_type
@@ -168,6 +176,12 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         FROM sentence_vocab_links svl
         WHERE svl.sentence_content_item_id = ci.content_item_id
       ) vl ON true
+      LEFT JOIN LATERAL (
+        SELECT true AS has_audio
+        FROM content_item_audio_variants cav
+        WHERE cav.content_item_id = ci.content_item_id
+        LIMIT 1
+      ) aud ON true
       WHERE ci.content_type = $1::text
         AND lri.audience = 'global'
         AND lri.global_state = $2::text
