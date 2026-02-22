@@ -85,6 +85,7 @@ app.use(require("./routes/document_sources"));
 app.use(require("./routes/google_docs_snapshot"));
 app.use(require("./routes/google_docs_commit"));
 app.use(require("./routes/practice_events"));
+app.use(require("./routes/practice_completions"));
 app.use(require("./routes/lists"));
 app.use(require("./routes/document_fragments"));
 app.use(require("./routes/grammar_patterns_admin"));
