@@ -527,10 +527,14 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
     let user_document_id = null;
     try {
       const docR = await pool.query(
-        `SELECT d.document_id FROM documents d
+        `SELECT d.document_id
+         FROM documents d
+         LEFT JOIN document_content_item_links dcil ON dcil.document_id = d.document_id
          WHERE d.owner_user_id = $1::uuid
            AND d.source_kind = 'google_doc'
            AND d.source_uri LIKE '%' || $2 || '%'
+         GROUP BY d.document_id
+         ORDER BY COUNT(dcil.content_item_id) DESC
          LIMIT 1`,
         [userId, fileId]
       );
