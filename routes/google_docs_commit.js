@@ -88,6 +88,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
       // -----------------------------
       // Sentences -> content_items (dedupe on owner + text)
+      // Even when a sentence already exists, ensure document link is created
+      // so that blue highlights appear in the snapshot viewer.
       // -----------------------------
       for (const s of sentences) {
         const ko = cleanString(s?.ko, 4000);
@@ -107,35 +109,40 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           8000,
           "db-check-dup-sentence"
         );
-        if (existing.rows.length > 0) continue;
 
-        const contentItemId = crypto.randomUUID();
+        let resolvedId = existing.rows?.[0]?.content_item_id || null;
 
-        const ins = await withTimeout(
-          client.query(
-            `INSERT INTO content_items (
-               content_item_id,
-               owner_user_id,
-               content_type,
-               text,
-               language,
-               notes
-             )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', $5)
-             ON CONFLICT DO NOTHING
-             RETURNING content_item_id`,
-            [contentItemId, userId, "sentence", ko, gloss]
-          ),
-          8000,
-          "db-insert-content-sentence"
-        );
+        if (!resolvedId) {
+          // New sentence — insert
+          const contentItemId = crypto.randomUUID();
 
-        const insertedId = ins.rows?.[0]?.content_item_id || null;
-        if (insertedId) {
-          sentencesCreated += 1;
-          sentenceMap.set(ko, insertedId);
+          const ins = await withTimeout(
+            client.query(
+              `INSERT INTO content_items (
+                 content_item_id,
+                 owner_user_id,
+                 content_type,
+                 text,
+                 language,
+                 notes
+               )
+               VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', $5)
+               ON CONFLICT DO NOTHING
+               RETURNING content_item_id`,
+              [contentItemId, userId, "sentence", ko, gloss]
+            ),
+            8000,
+            "db-insert-content-sentence"
+          );
 
-          // Link to document for scoping (requires table to exist)
+          resolvedId = ins.rows?.[0]?.content_item_id || null;
+          if (resolvedId) sentencesCreated += 1;
+        }
+
+        if (resolvedId) {
+          sentenceMap.set(ko, resolvedId);
+
+          // Link to document for scoping (creates link even for pre-existing sentences)
           // On re-import, update session_date to the most recent session
           await withTimeout(
             client.query(
@@ -143,7 +150,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                VALUES ($1::uuid, $2::uuid, 'sentence', $3::date)
                ON CONFLICT (document_id, content_item_id, link_kind)
                DO UPDATE SET session_date = GREATEST(EXCLUDED.session_date, document_content_item_links.session_date)`,
-              [documentId, insertedId, sessionDate]
+              [documentId, resolvedId, sessionDate]
             ),
             8000,
             "db-link-doc-content-sentence"
@@ -156,7 +163,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                VALUES
                  ($1::uuid, $2::text, $3::uuid, $4::uuid, 'personal', NULL, 'active')
                ON CONFLICT (content_type, content_id) DO NOTHING`,
-              [crypto.randomUUID(), 'sentence', insertedId, userId]
+              [crypto.randomUUID(), 'sentence', resolvedId, userId]
             ),
             8000,
             "db-insert-registry-sentence"
@@ -166,6 +173,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
       // -----------------------------
       // Patterns -> content_items (dedupe on owner + text, match against grammar_pattern_aliases)
+      // Even when a pattern already exists, ensure document link is created.
       // -----------------------------
       for (const p of patterns) {
         const surface = cleanString(p?.surface_form, 200);
@@ -187,7 +195,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           8000,
           "db-check-dup-pattern"
         );
-        if (existingPattern.rows.length > 0) continue;
+
+        let resolvedId = existingPattern.rows?.[0]?.content_item_id || null;
 
         // Attempt alias match against grammar_pattern_aliases
         const norm = surface.replace(/[\s\t\n\r]/g, "");
@@ -212,39 +221,42 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           logger.warn("[google-commit] alias lookup failed", { surface, norm, error: e?.message });
         }
 
-        const contentItemId = crypto.randomUUID();
+        if (!resolvedId) {
+          // New pattern — insert
+          const contentItemId = crypto.randomUUID();
 
-        const ins = await withTimeout(
-          client.query(
-            `INSERT INTO content_items (
-               content_item_id,
-               owner_user_id,
-               content_type,
-               text,
-               language,
-               notes,
-               grammar_pattern_id
-             )
-             VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL, $5::uuid)
-             ON CONFLICT DO NOTHING
-             RETURNING content_item_id`,
-            [contentItemId, userId, "pattern", text, matchedPatternId]
-          ),
-          8000,
-          "db-insert-content-pattern"
-        );
+          const ins = await withTimeout(
+            client.query(
+              `INSERT INTO content_items (
+                 content_item_id,
+                 owner_user_id,
+                 content_type,
+                 text,
+                 language,
+                 notes,
+                 grammar_pattern_id
+               )
+               VALUES ($1::uuid, $2::uuid, $3, $4, 'ko', NULL, $5::uuid)
+               ON CONFLICT DO NOTHING
+               RETURNING content_item_id`,
+              [contentItemId, userId, "pattern", text, matchedPatternId]
+            ),
+            8000,
+            "db-insert-content-pattern"
+          );
 
-        const insertedId = ins.rows?.[0]?.content_item_id || null;
-        if (insertedId) {
-          patternsCreated += 1;
+          resolvedId = ins.rows?.[0]?.content_item_id || null;
+          if (resolvedId) patternsCreated += 1;
+        }
 
+        if (resolvedId) {
           await withTimeout(
             client.query(
               `INSERT INTO document_content_item_links (document_id, content_item_id, link_kind, session_date)
                VALUES ($1::uuid, $2::uuid, 'pattern', $3::date)
                ON CONFLICT (document_id, content_item_id, link_kind)
                DO UPDATE SET session_date = GREATEST(EXCLUDED.session_date, document_content_item_links.session_date)`,
-              [documentId, insertedId, sessionDate]
+              [documentId, resolvedId, sessionDate]
             ),
             8000,
             "db-link-doc-content-pattern"
@@ -257,7 +269,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                VALUES
                  ($1::uuid, $2::text, $3::uuid, $4::uuid, 'personal', NULL, 'active')
                ON CONFLICT (content_type, content_id) DO NOTHING`,
-              [crypto.randomUUID(), 'pattern', insertedId, userId]
+              [crypto.randomUUID(), 'pattern', resolvedId, userId]
             ),
             8000,
             "db-insert-registry-pattern"
@@ -270,12 +282,12 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
                 `INSERT INTO content_item_grammar_links (content_item_id, grammar_pattern_id, role)
                  VALUES ($1::uuid, $2::uuid, 'primary')
                  ON CONFLICT DO NOTHING`,
-                [insertedId, matchedPatternId]
+                [resolvedId, matchedPatternId]
               ),
               8000,
               "db-insert-grammar-link-primary"
             );
-            patternLinks.push({ contentItemId: insertedId, grammarPatternId: matchedPatternId, contextSpan: context });
+            patternLinks.push({ contentItemId: resolvedId, grammarPatternId: matchedPatternId, contextSpan: context });
           }
         }
 
