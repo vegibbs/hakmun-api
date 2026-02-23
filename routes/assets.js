@@ -150,6 +150,7 @@ router.post("/v1/assets", requireSession, uploadAsset.single("file"), async (req
     const title = cleanOptionalText(req.body?.title, 140);
     const language = cleanOptionalText(req.body?.language, 32);
     const durationMs = cleanOptionalInt(req.body?.duration_ms, 0, 24 * 60 * 60 * 1000); // cap 24h
+    const sourceLabel = cleanOptionalText(req.body?.source_label, 100);
 
     // Deterministic object identity: asset_id is created server-side
     const assetID = crypto.randomUUID();
@@ -195,12 +196,13 @@ router.post("/v1/assets", requireSession, uploadAsset.single("file"), async (req
           size_bytes,
           title,
           language,
-          duration_ms
+          duration_ms,
+          source_label
         )
-        values ($1,$2,$3,$4,$5,$6,$7,$8)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         returning asset_id, created_at
         `,
-        [assetID, ownerUserID, objectKey, mime, sizeBytes, title, language, durationMs]
+        [assetID, ownerUserID, objectKey, mime, sizeBytes, title, language, durationMs, sourceLabel]
       ),
       8000,
       "db-insert-asset"
