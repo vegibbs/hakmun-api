@@ -2,6 +2,7 @@
 // PURPOSE: CRUD for classes — containers that group documents, lists, and students.
 
 const express = require("express");
+const crypto = require("crypto");
 const { requireSession, requireRole } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
@@ -13,48 +14,82 @@ function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
 }
 
-// ===========================================================================
-// USER SEARCH (must be before /:classId routes)
-// ===========================================================================
-
-// GET /v1/classes/search-users?q=... — search users by handle or display name
-router.get(
-  "/v1/classes/search-users",
-  requireSession,
-  requireRole("teacher", "approver", "admin"),
-  async (req, res) => {
-    try {
-      const q = String(req.query.q || "").trim();
-      if (q.length < 2) {
-        return res.json({ ok: true, users: [] });
-      }
-
-      const pattern = `%${q}%`;
-      const r = await withTimeout(
-        pool.query(
-          `SELECT u.user_id, u.display_name, uh.handle AS primary_handle, u.role
-             FROM users u
-             LEFT JOIN user_handles uh
-               ON uh.user_id = u.user_id AND uh.kind = 'primary'
-            WHERE u.is_active = true
-              AND (uh.handle ILIKE $1 OR u.display_name ILIKE $1)
-            ORDER BY u.display_name NULLS LAST
-            LIMIT 20`,
-          [pattern]
-        ),
-        8000,
-        "db-search-users"
-      );
-
-      return res.json({ ok: true, users: r.rows });
-    } catch (err) {
-      logger.error("[classes] search-users failed", {
-        err: String(err?.message || err),
-      });
-      return res.status(500).json({ ok: false, error: "INTERNAL" });
-    }
+function generateCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I ambiguity
+  const bytes = crypto.randomBytes(6);
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars[bytes[i] % chars.length];
   }
-);
+  return code;
+}
+
+// ===========================================================================
+// JOIN BY CODE (must be before /:classId routes)
+// ===========================================================================
+
+// POST /v1/classes/join — student joins a class by enrollment code
+router.post("/v1/classes/join", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    if (!code) {
+      return res.status(400).json({ ok: false, error: "CODE_REQUIRED" });
+    }
+
+    // Find class with valid (non-expired) code
+    const classR = await withTimeout(
+      pool.query(
+        `SELECT class_id, teacher_id, name, description, is_active,
+                enrollment_code, enrollment_code_expires_at,
+                created_at, updated_at
+           FROM classes
+          WHERE enrollment_code = $1
+            AND enrollment_code_expires_at > NOW()`,
+        [code]
+      ),
+      8000,
+      "db-join-by-code-lookup"
+    );
+
+    if (classR.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "INVALID_OR_EXPIRED_CODE" });
+    }
+
+    const cls = classR.rows[0];
+
+    // Don't let teacher join their own class as member
+    if (cls.teacher_id === userId) {
+      return res.status(400).json({ ok: false, error: "OWNER_CANNOT_JOIN" });
+    }
+
+    // Insert as student
+    const r = await withTimeout(
+      pool.query(
+        `INSERT INTO class_members (class_id, user_id, role)
+         VALUES ($1::uuid, $2::uuid, 'student')
+         ON CONFLICT (class_id, user_id) DO NOTHING
+         RETURNING id, class_id, user_id, role, joined_at`,
+        [cls.class_id, userId]
+      ),
+      8000,
+      "db-join-by-code-insert"
+    );
+
+    if (r.rows.length === 0) {
+      return res.json({ ok: true, class_info: cls, note: "ALREADY_MEMBER" });
+    }
+
+    return res.status(201).json({ ok: true, class_info: cls });
+  } catch (err) {
+    logger.error("[classes] join by code failed", {
+      err: String(err?.message || err),
+    });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
 
 // ===========================================================================
 // CLASSES CRUD
@@ -157,6 +192,7 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
     const classR = await withTimeout(
       pool.query(
         `SELECT c.class_id, c.teacher_id, c.name, c.description, c.is_active,
+                c.enrollment_code, c.enrollment_code_expires_at,
                 c.created_at, c.updated_at
            FROM classes c
           WHERE c.class_id = $1::uuid
@@ -337,67 +373,89 @@ router.delete("/v1/classes/:classId", requireSession, async (req, res) => {
 // MEMBERS
 // ===========================================================================
 
-// POST /v1/classes/:classId/members — add a member (owner only)
-router.post("/v1/classes/:classId/members", requireSession, async (req, res) => {
+// POST /v1/classes/:classId/enrollment-code — generate enrollment code (owner only)
+router.post("/v1/classes/:classId/enrollment-code", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
     const { classId } = req.params;
-    const memberUserId = req.body?.user_id;
-    const role = req.body?.role || "student";
+    const durationHours = Math.min(Math.max(Number(req.body?.duration_hours) || 24, 1), 720); // 1h–30d
 
-    if (!memberUserId) {
-      return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED" });
+    // Generate unique code, retry on collision
+    let code;
+    let attempts = 0;
+    while (attempts < 5) {
+      code = generateCode();
+      try {
+        const r = await withTimeout(
+          pool.query(
+            `UPDATE classes
+                SET enrollment_code = $3,
+                    enrollment_code_expires_at = NOW() + INTERVAL '1 hour' * $4
+              WHERE class_id = $1::uuid AND teacher_id = $2::uuid
+             RETURNING class_id, teacher_id, name, description, is_active,
+                       enrollment_code, enrollment_code_expires_at,
+                       created_at, updated_at`,
+            [classId, userId, code, durationHours]
+          ),
+          8000,
+          "db-generate-enrollment-code"
+        );
+
+        if (r.rows.length === 0) {
+          return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+        }
+
+        return res.json({ ok: true, class_info: r.rows[0] });
+      } catch (e) {
+        if (e.code === "23505" && e.constraint === "idx_classes_enrollment_code") {
+          attempts++;
+          continue; // collision, retry
+        }
+        throw e;
+      }
     }
 
-    // Verify ownership
-    const ownerR = await withTimeout(
-      pool.query(
-        `SELECT class_id FROM classes WHERE class_id = $1::uuid AND teacher_id = $2::uuid`,
-        [classId, userId]
-      ),
-      8000,
-      "db-check-class-owner"
-    );
-    if (ownerR.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-    }
+    return res.status(500).json({ ok: false, error: "CODE_GENERATION_FAILED" });
+  } catch (err) {
+    logger.error("[classes] generate enrollment code failed", {
+      err: String(err?.message || err),
+    });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// DELETE /v1/classes/:classId/enrollment-code — close enrollment (owner only)
+router.delete("/v1/classes/:classId/enrollment-code", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId } = req.params;
 
     const r = await withTimeout(
       pool.query(
-        `INSERT INTO class_members (class_id, user_id, role)
-         VALUES ($1::uuid, $2::uuid, $3)
-         ON CONFLICT (class_id, user_id) DO NOTHING
-         RETURNING id, class_id, user_id, role, joined_at`,
-        [classId, memberUserId, role]
+        `UPDATE classes
+            SET enrollment_code = NULL,
+                enrollment_code_expires_at = NULL
+          WHERE class_id = $1::uuid AND teacher_id = $2::uuid
+         RETURNING class_id, teacher_id, name, description, is_active,
+                   enrollment_code, enrollment_code_expires_at,
+                   created_at, updated_at`,
+        [classId, userId]
       ),
       8000,
-      "db-add-class-member"
+      "db-close-enrollment"
     );
 
     if (r.rows.length === 0) {
-      return res.json({ ok: true, member: null, note: "ALREADY_MEMBER" });
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
 
-    // Fetch display info
-    const infoR = await pool.query(
-      `SELECT u.display_name, uh.handle AS primary_handle
-         FROM users u
-         LEFT JOIN user_handles uh ON uh.user_id = u.user_id AND uh.kind = 'primary'
-        WHERE u.user_id = $1::uuid`,
-      [memberUserId]
-    );
-
-    const member = {
-      ...r.rows[0],
-      display_name: infoR.rows[0]?.display_name || null,
-      primary_handle: infoR.rows[0]?.primary_handle || null,
-    };
-
-    return res.status(201).json({ ok: true, member });
+    return res.json({ ok: true, class_info: r.rows[0] });
   } catch (err) {
-    logger.error("[classes] add member failed", {
+    logger.error("[classes] close enrollment failed", {
       err: String(err?.message || err),
     });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
