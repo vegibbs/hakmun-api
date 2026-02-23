@@ -703,7 +703,8 @@ router.get(
              ci.created_at AS content_created_at,
              lri.audience,
              lri.global_state,
-             lri.operational_status
+             lri.operational_status,
+             COALESCE(aud.has_audio, false) AS has_audio
            FROM list_items li
            LEFT JOIN content_items ci
              ON li.item_id = ci.content_item_id
@@ -712,6 +713,12 @@ router.get(
              ON lri.content_id = ci.content_item_id
             AND lri.content_type = ci.content_type
             AND lri.owner_user_id = $2::uuid
+           LEFT JOIN LATERAL (
+             SELECT true AS has_audio
+             FROM content_item_audio_variants cav
+             WHERE cav.content_item_id = ci.content_item_id
+             LIMIT 1
+           ) aud ON true
            WHERE li.list_id = $1::uuid
            ORDER BY li.position ASC, li.added_at ASC`,
           [listId, userId]
