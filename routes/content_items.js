@@ -271,6 +271,119 @@ router.post("/v1/content/items", requireSession, async (req, res) => {
 });
 
 // ------------------------------------------------------------------
+// POST /v1/content/items/adopt
+// Body: { content_type: "sentence", text: "...", language: "ko", notes: "..." }
+// Creates PERSONAL content item if user doesn't already have one with
+// the same (content_type, text). Returns existing item if duplicate.
+// ------------------------------------------------------------------
+router.post("/v1/content/items/adopt", requireSession, async (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+  const contentType = normalizeContentType(req.body?.content_type) || "sentence";
+  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  if (!text) return res.status(400).json({ ok: false, error: "TEXT_REQUIRED" });
+
+  const language = req.body?.language || "ko";
+  const notes = typeof req.body?.notes === "string" ? req.body.notes.trim() || null : null;
+
+  try {
+    // Check if user already has this exact item
+    const existing = await dbQuery(
+      `SELECT ci.content_item_id, ci.content_type, ci.text, ci.language, ci.notes,
+              ci.created_at, ci.updated_at,
+              lri.id AS registry_item_id, lri.audience, lri.global_state, lri.operational_status
+         FROM content_items ci
+         JOIN library_registry_items lri
+           ON lri.content_id = ci.content_item_id
+          AND lri.content_type = ci.content_type
+          AND lri.owner_user_id = ci.owner_user_id
+        WHERE ci.owner_user_id = $1::uuid
+          AND ci.content_type = $2::text
+          AND ci.text = $3::text
+        LIMIT 1`,
+      [userId, contentType, text]
+    );
+
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      return res.status(200).json({
+        ok: true,
+        adopted: false,
+        item: {
+          content_item_id: row.content_item_id,
+          content_type: row.content_type,
+          text: row.text,
+          language: row.language,
+          notes: row.notes,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          registry_item_id: row.registry_item_id,
+          audience: row.audience,
+          global_state: row.global_state,
+          operational_status: row.operational_status,
+        },
+      });
+    }
+
+    // Create new content item + registry entry
+    const client = db && typeof db.connect === "function" ? await db.connect() : null;
+    const q = client ? client.query.bind(client) : dbQuery;
+
+    try {
+      if (client) await q("BEGIN", []);
+
+      const ins = await q(
+        `INSERT INTO content_items (owner_user_id, content_type, text, language, notes)
+         VALUES ($1::uuid, $2::text, $3::text, $4::text, $5)
+         RETURNING content_item_id, content_type, text, language, notes, created_at, updated_at`,
+        [userId, contentType, text, language, notes]
+      );
+      const item = ins.rows[0];
+
+      const reg = await q(
+        `INSERT INTO library_registry_items
+           (content_type, content_id, owner_user_id, audience, global_state, operational_status)
+         VALUES ($1::text, $2::uuid, $3::uuid, 'personal', NULL, 'active')
+         RETURNING id, audience, global_state, operational_status`,
+        [item.content_type, item.content_item_id, userId]
+      );
+      const registry = reg.rows[0];
+
+      if (client) await q("COMMIT", []);
+
+      return res.status(201).json({
+        ok: true,
+        adopted: true,
+        item: {
+          content_item_id: item.content_item_id,
+          content_type: item.content_type,
+          text: item.text,
+          language: item.language,
+          notes: item.notes,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          registry_item_id: registry.id,
+          audience: registry.audience,
+          global_state: registry.global_state,
+          operational_status: registry.operational_status,
+        },
+      });
+    } catch (err) {
+      if (client) {
+        try { await client.query("ROLLBACK"); } catch (_) {}
+      }
+      throw err;
+    } finally {
+      if (client) client.release();
+    }
+  } catch (err) {
+    console.error("content items adopt failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // GET /v1/content/items/coverage?content_type=sentence
 //
 // Capability-only surface:

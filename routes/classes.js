@@ -730,6 +730,143 @@ router.get(
   }
 );
 
+// GET /v1/classes/:classId/documents/:documentId/items — view document content items (any class member)
+router.get(
+  "/v1/classes/:classId/documents/:documentId/items",
+  requireSession,
+  async (req, res) => {
+    try {
+      const userId = getUserId(req);
+      if (!userId)
+        return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+      const { classId, documentId } = req.params;
+      const documentType = req.query.document_type || "google_doc";
+
+      // Verify user is teacher or member
+      const memberCheck = await withTimeout(
+        pool.query(
+          `SELECT 1 FROM classes WHERE class_id = $1::uuid AND teacher_id = $2::uuid
+           UNION ALL
+           SELECT 1 FROM class_members WHERE class_id = $1::uuid AND user_id = $2::uuid
+           LIMIT 1`,
+          [classId, userId]
+        ),
+        8000,
+        "db-class-member-check"
+      );
+
+      if (memberCheck.rows.length === 0) {
+        return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+      }
+
+      // Verify document is attached to this class
+      const attachCheck = await withTimeout(
+        pool.query(
+          `SELECT 1 FROM class_documents
+            WHERE class_id = $1::uuid AND document_type = $2 AND document_id = $3`,
+          [classId, documentType, documentId]
+        ),
+        8000,
+        "db-class-doc-attach-check"
+      );
+
+      if (attachCheck.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      if (documentType === "hakdoc") {
+        // HakDocs: fetch practice_sentence blocks from hakdoc_sessions → hakdoc_blocks
+        const blocksR = await withTimeout(
+          pool.query(
+            `SELECT
+               hb.block_id AS id,
+               hb.block_type,
+               hb.content,
+               hb.sort_order,
+               hs.session_date,
+               hs.topic
+             FROM hakdoc_sessions hs
+             JOIN hakdoc_blocks hb ON hb.session_id = hs.session_id
+             WHERE hs.hakdoc_id = $1::uuid
+               AND hb.block_type = 'practice_sentence'
+             ORDER BY hs.session_date ASC, hb.sort_order ASC`,
+            [documentId]
+          ),
+          8000,
+          "db-class-hakdoc-blocks"
+        );
+
+        const items = blocksR.rows.map((row) => ({
+          content_item_id: row.id,
+          content_type: "sentence",
+          text: row.content?.ko || "",
+          language: "ko",
+          notes: row.content?.en || null,
+          cefr_level: null,
+          topic: row.topic || null,
+          session_date: row.session_date,
+          source: "hakdoc",
+        }));
+
+        return res.json({ ok: true, items });
+      } else {
+        // Google Docs: resolve saved_source_id → documents.document_id → document_content_item_links
+        const docIdR = await withTimeout(
+          pool.query(
+            `SELECT d.document_id
+               FROM saved_document_sources sds
+               JOIN documents d
+                 ON d.owner_user_id = sds.owner_user_id
+                AND d.source_uri = sds.source_uri
+              WHERE sds.saved_source_id = $1::uuid
+              ORDER BY d.created_at DESC
+              LIMIT 1`,
+            [documentId]
+          ),
+          8000,
+          "db-class-doc-resolve"
+        );
+
+        if (docIdR.rows.length === 0) {
+          return res.json({ ok: true, items: [] });
+        }
+
+        const resolvedDocId = docIdR.rows[0].document_id;
+
+        const itemsR = await withTimeout(
+          pool.query(
+            `SELECT
+               ci.content_item_id,
+               ci.content_type,
+               ci.text,
+               ci.language,
+               ci.notes,
+               ci.created_at,
+               dcil.session_date
+             FROM document_content_item_links dcil
+             JOIN content_items ci ON ci.content_item_id = dcil.content_item_id
+             WHERE dcil.document_id = $1::uuid
+               AND dcil.link_kind = 'sentence'
+             ORDER BY dcil.session_date DESC NULLS LAST, ci.created_at DESC
+             LIMIT 2000`,
+            [resolvedDocId]
+          ),
+          8000,
+          "db-class-doc-items"
+        );
+
+        return res.json({ ok: true, items: itemsR.rows });
+      }
+    } catch (err) {
+      logger.error("[classes] document items failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
+
 // ===========================================================================
 // DOCUMENTS (attach/detach)
 // ===========================================================================
