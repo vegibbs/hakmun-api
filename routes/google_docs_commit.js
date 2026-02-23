@@ -77,8 +77,11 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
       });
 
       let sentencesCreated = 0;
+      let sentencesExisting = 0;
       let patternsCreated = 0;
-      let vocabTouched = 0;
+      let patternsExisting = 0;
+      let vocabCreated = 0;
+      let vocabExisting = 0;
 
       // Track committed sentences and patterns for cross-linking
       // sentenceMap: normalized sentence text -> content_item_id
@@ -111,6 +114,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         );
 
         let resolvedId = existing.rows?.[0]?.content_item_id || null;
+        const sentenceWasExisting = !!resolvedId;
 
         if (!resolvedId) {
           // New sentence — insert
@@ -137,6 +141,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
           resolvedId = ins.rows?.[0]?.content_item_id || null;
           if (resolvedId) sentencesCreated += 1;
+        } else if (sentenceWasExisting) {
+          sentencesExisting += 1;
         }
 
         if (resolvedId) {
@@ -197,6 +203,7 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         );
 
         let resolvedId = existingPattern.rows?.[0]?.content_item_id || null;
+        const patternWasExisting = !!resolvedId;
 
         // Attempt alias match against grammar_pattern_aliases
         const norm = surface.replace(/[\s\t\n\r]/g, "");
@@ -247,6 +254,8 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
 
           resolvedId = ins.rows?.[0]?.content_item_id || null;
           if (resolvedId) patternsCreated += 1;
+        } else if (patternWasExisting) {
+          patternsExisting += 1;
         }
 
         if (resolvedId) {
@@ -379,21 +388,26 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
           }
         }
 
-        await withTimeout(
+        const vocabUpsert = await withTimeout(
           client.query(
             `INSERT INTO user_vocab_items (user_id, lemma, vocab_id, first_seen_at, last_seen_at)
              VALUES ($1::uuid, $2, $3::uuid, now(), now())
              ON CONFLICT (user_id, lemma)
              DO UPDATE SET
                last_seen_at = now(),
-               vocab_id = COALESCE(EXCLUDED.vocab_id, user_vocab_items.vocab_id)`,
+               vocab_id = COALESCE(EXCLUDED.vocab_id, user_vocab_items.vocab_id)
+             RETURNING (xmax = 0) AS is_new`,
             [userId, lemma, vocabIdUuid]
           ),
           8000,
           "db-upsert-user-vocab"
         );
 
-        vocabTouched += 1;
+        if (vocabUpsert.rows?.[0]?.is_new) {
+          vocabCreated += 1;
+        } else {
+          vocabExisting += 1;
+        }
 
         // Link vocab to document for later scoping (requires table to exist)
         // On re-import, update session_date to the most recent session
@@ -492,8 +506,11 @@ router.post("/v1/documents/google/commit", requireSession, async (req, res) => {
         ok: true,
         document_id: documentId,
         sentences_created: sentencesCreated,
+        sentences_existing: sentencesExisting,
         patterns_created: patternsCreated,
-        vocab_touched: vocabTouched,
+        patterns_existing: patternsExisting,
+        vocab_created: vocabCreated,
+        vocab_existing: vocabExisting,
         sentence_vocab_linked: sentenceVocabLinked,
         fragments_created: fragmentsCreated
       });
