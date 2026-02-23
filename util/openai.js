@@ -393,10 +393,12 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
 // Practice sentence generation & validation
 // ---------------------------------------------------------------------------
 
-function buildPracticeGenerationPrompt({ text, cefrLevel, glossLang, count }) {
+function buildPracticeGenerationPrompt({ text, cefrLevel, glossLang, count, perspective, politeness }) {
   const lang = (glossLang || "en").trim() || "en";
   const cefr = (cefrLevel || "A1").trim();
   const n = count || 5;
+  const pov = perspective || "first_person";
+  const pol = politeness || "해요체";
 
   return `You are a Korean language teaching assistant creating practice sentences for a student.
 
@@ -434,11 +436,12 @@ GENERATION RULES:
 4. Vary sentence structures — do not repeat the same pattern across sentences within a type.
 5. Mix tenses: past (-았/었어요), present (-아/어요), future (-(으)ㄹ 거예요), and progressive (-고 있어요)
    unless the type specifically targets a single tense.
-6. Use 요-form (해요체) as the default politeness level unless the lesson notes show 합니다체 usage.
-7. Each sentence should be 8-25 syllables long (natural conversation length).
-8. Do NOT include English words mixed into Korean.
-9. Every sentence MUST end with punctuation (. ? !).
-10. Generate exactly ${n} sentences per type — no more, no less.
+6. ${pol === "합니다체" ? "Use formal 합니다체 for all sentences." : pol === "반말" ? "Use 반말 (informal) for all sentences. Do not add 요 endings." : "Use 요-form (해요체) for all sentences."}
+7. ${pov === "third_person" ? "Write all sentences about other people (third person). Use natural subjects like 친구, 동생, 선생님, 그 사람, etc. Vary the subjects across sentences." : "Write all sentences from the speaker's own perspective (first person). Use natural Korean — do NOT start sentences with 저는 or 나는 unless the speaker's identity would be genuinely ambiguous without it. In Korean, the subject is normally dropped when it's the speaker. A native speaker says \"오늘 바빠요\" not \"저는 오늘 바빠요\". Only include 저/나 when contrasting with someone else or when omitting it would cause confusion about who is speaking."}
+8. Each sentence should be 8-25 syllables long (natural conversation length).
+9. Do NOT include English words mixed into Korean.
+10. Every sentence MUST end with punctuation (. ? !).
+11. Generate exactly ${n} sentences per type — no more, no less.
 
 FOR EACH SENTENCE, ALSO PROVIDE:
 - group_label: the type/category this sentence belongs to (from the teacher's notes).
@@ -602,12 +605,12 @@ function parseValidationResult(jsonText) {
  * @param {number} [opts.count=5] - Sentences per type
  * @returns {Object} { sentences: [...] }
  */
-async function generatePracticeSentences({ text, cefrLevel, glossLang, count }) {
+async function generatePracticeSentences({ text, cefrLevel, glossLang, count, perspective, politeness }) {
   if (typeof text !== "string" || !text.trim()) {
     return { sentences: [] };
   }
 
-  const prompt = buildPracticeGenerationPrompt({ text: text.trim(), cefrLevel, glossLang, count });
+  const prompt = buildPracticeGenerationPrompt({ text: text.trim(), cefrLevel, glossLang, count, perspective, politeness });
 
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

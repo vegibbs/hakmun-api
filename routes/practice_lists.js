@@ -40,6 +40,10 @@ router.post("/v1/practice-lists/generate", requireSession, async (req, res) => {
     const rawSessionDate = cleanString(req.body?.session_date, 10);
     const sessionDate = /^\d{4}-\d{2}-\d{2}$/.test(rawSessionDate) ? rawSessionDate : null;
     const count = Math.min(Math.max(Number(req.body?.count) || 5, 1), 20);
+    const perspective = ["first_person", "third_person"].includes(req.body?.perspective)
+      ? req.body.perspective : "first_person";
+    const politeness = ["해요체", "합니다체", "반말"].includes(req.body?.politeness)
+      ? req.body.politeness : "해요체";
 
     if (!selectedText) {
       return res.status(400).json({ ok: false, error: "SELECTED_TEXT_REQUIRED" });
@@ -371,7 +375,9 @@ router.post("/v1/practice-lists/generate", requireSession, async (req, res) => {
         text: selectedText,
         cefrLevel,
         glossLang: "en",
-        count
+        count,
+        perspective,
+        politeness
       });
 
       const generated = genResult.sentences || [];
