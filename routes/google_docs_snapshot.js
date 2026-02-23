@@ -523,6 +523,22 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       logger.warn("[google-snapshot] imported_fragment_texts query failed", { err: String(e.message || e) });
     }
 
+    // Resolve user's document_id for this Google Doc (enables "View Content" button)
+    let user_document_id = null;
+    try {
+      const docR = await pool.query(
+        `SELECT d.document_id FROM documents d
+         WHERE d.owner_user_id = $1::uuid
+           AND d.source_kind = 'google_doc'
+           AND d.source_uri LIKE '%' || $2 || '%'
+         LIMIT 1`,
+        [userId, fileId]
+      );
+      if (docR.rows.length > 0) user_document_id = docR.rows[0].document_id;
+    } catch (e) {
+      logger.warn("[google-snapshot] document_id lookup failed", { err: String(e.message || e) });
+    }
+
     return res.status(201).json({
       ok: true,
       file_id: fileId,
@@ -530,6 +546,7 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       title,
       asset_id: assetID,
       viewer_url: viewerUrl,
+      document_id: user_document_id,
       expiresIn: 900,
       sessions_included: sessions.length,
       days_window: 90,
