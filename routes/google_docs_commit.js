@@ -26,64 +26,12 @@ const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
 const { linkSentenceVocab } = require("../util/link_vocab_patterns");
+const { ensureGoogleDocumentRow, looksLikeUUID, cleanString } = require("../util/document_helpers");
 
 const router = express.Router();
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
-}
-
-function looksLikeUUID(v) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(v || ""));
-}
-
-function cleanString(v, maxLen = 2000) {
-  if (v === undefined || v === null) return "";
-  const s = String(v).trim();
-  if (!s) return "";
-  return s.length > maxLen ? s.slice(0, maxLen) : s;
-}
-
-async function ensureGoogleDocumentRow({ userId, googleDocUrl, snapshotAssetId, title }) {
-  // Prefer reusing an existing document row for this user+source_uri.
-  const r = await withTimeout(
-    pool.query(
-      `SELECT document_id
-         FROM documents
-        WHERE owner_user_id = $1::uuid
-          AND source_kind = 'google_doc'
-          AND source_uri = $2
-        LIMIT 1`,
-      [userId, googleDocUrl]
-    ),
-    8000,
-    "db-find-document"
-  );
-
-  const existing = r.rows?.[0]?.document_id || null;
-  if (existing) return existing;
-
-  if (!looksLikeUUID(snapshotAssetId)) {
-    throw new Error("SNAPSHOT_ASSET_ID_REQUIRED");
-  }
-
-  const documentId = crypto.randomUUID();
-  const t = cleanString(title, 140) || "Google Doc";
-
-  await withTimeout(
-    pool.query(
-      `INSERT INTO documents (
-         document_id, owner_user_id, asset_id, source_kind, source_uri, title, ingest_status
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, 'google_doc', $4, $5, 'verified'
-       )`,
-      [documentId, userId, snapshotAssetId, googleDocUrl, t]
-    ),
-    8000,
-    "db-insert-document"
-  );
-
-  return documentId;
 }
 
 router.post("/v1/documents/google/commit", requireSession, async (req, res) => {

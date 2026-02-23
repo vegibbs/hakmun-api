@@ -523,6 +523,29 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       logger.warn("[google-snapshot] imported_fragment_texts query failed", { err: String(e.message || e) });
     }
 
+    // Fetch practice list sentence texts for green highlight
+    let practice_list_texts = [];
+    try {
+      const plR = await pool.query(
+        `SELECT DISTINCT ci.text
+         FROM lists l
+         JOIN list_items li ON li.list_id = l.id
+         JOIN content_items ci ON ci.content_item_id = li.item_id
+         WHERE l.user_id = $1::uuid
+           AND l.source_kind = 'practice_generation'
+           AND l.source_document_id IN (
+             SELECT document_id FROM documents
+             WHERE owner_user_id = $1::uuid
+               AND source_kind = 'google_doc'
+               AND source_uri LIKE '%' || $2 || '%'
+           )`,
+        [userId, fileId]
+      );
+      practice_list_texts = plR.rows.map(r => r.text);
+    } catch (e) {
+      logger.warn("[google-snapshot] practice_list_texts query failed", { err: String(e.message || e) });
+    }
+
     // Resolve user's document_id for this Google Doc (enables "View Content" button)
     let user_document_id = null;
     try {
@@ -555,7 +578,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       sessions_included: sessions.length,
       days_window: 90,
       imported_texts,
-      imported_fragment_texts
+      imported_fragment_texts,
+      practice_list_texts
     });
   } catch (err) {
     const msg = String(err?.message || err);

@@ -389,7 +389,278 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
   throw lastError || new Error("openai_failed");
 }
 
+// ---------------------------------------------------------------------------
+// Practice sentence generation & validation
+// ---------------------------------------------------------------------------
+
+function buildPracticeGenerationPrompt({ text, cefrLevel, glossLang, count }) {
+  const lang = (glossLang || "en").trim() || "en";
+  const cefr = (cefrLevel || "A1").trim();
+  const n = count || 5;
+
+  return `You are a Korean language teaching assistant creating practice sentences for a student.
+
+CONTEXT:
+The student's teacher wrote the following notes during a recent Korean lesson.
+The student's current CEFR level is ${cefr}.
+Your job is to generate practice sentences that reinforce the vocabulary, grammar patterns,
+and topics found in these lesson notes — exactly the way the teacher intended them to be practiced.
+
+TEACHER'S LESSON NOTES:
+"""
+${text}
+"""
+
+UNDERSTANDING THE NOTES:
+- In Korean teaching materials, parentheses () mark OPTIONAL elements that can be dropped in
+  natural speech. For example, "(말)했어요" means "말" is optional — both "말했어요" and "했어요"
+  are valid. Generate sentences using both forms across your output.
+- Parentheses are also sometimes used as pronunciation guides for the student.
+  For example, "좋아요(조아요)" — the part in parentheses is how to pronounce it.
+  Do NOT include pronunciation guides in your generated sentences.
+- If the notes contain multiple grammar types, categories, or conjugation patterns,
+  identify each type and generate ${n} sentences PER TYPE. Label each sentence with its type.
+- Read the teacher's examples carefully. Match the sentence patterns, politeness level, and
+  teaching style the teacher demonstrated.
+
+GENERATION RULES:
+1. Each sentence MUST be a complete, natural Korean sentence a native speaker would actually say.
+2. Target ${cefr} CEFR level — use vocabulary and grammar appropriate for this level.
+   - A1-A2: Simple present/past, 요-form (해요체), basic connectors (-고, -어서), everyday topics.
+   - B1-B2: Compound sentences, indirect speech, conditional (-면), causative, varied tenses.
+   - C1-C2: Nuanced connectors (-는 바람에, -더니), formal/informal register mixing, idiomatic expressions.
+3. Draw vocabulary and grammar directly from the lesson notes. Each sentence should practice
+   at least one word or pattern that appears in the notes.
+4. Vary sentence structures — do not repeat the same pattern across sentences within a type.
+5. Mix tenses: past (-았/었어요), present (-아/어요), future (-(으)ㄹ 거예요), and progressive (-고 있어요)
+   unless the type specifically targets a single tense.
+6. Use 요-form (해요체) as the default politeness level unless the lesson notes show 합니다체 usage.
+7. Each sentence should be 8-25 syllables long (natural conversation length).
+8. Do NOT include English words mixed into Korean.
+9. Every sentence MUST end with punctuation (. ? !).
+10. Generate exactly ${n} sentences per type — no more, no less.
+
+FOR EACH SENTENCE, ALSO PROVIDE:
+- group_label: the type/category this sentence belongs to (from the teacher's notes).
+  If the notes have only one topic, use a descriptive label like "vocabulary practice" or the
+  grammar point name. If there are multiple types (e.g., -다고, -냐고, -자고, -라고), use
+  those as group labels.
+- en: ${lang} translation
+- cefr_level: your estimate of the actual CEFR level (e.g., "A2", "B1")
+- topic: pick ONE from: daily_life, food, weather, travel, work, school, shopping, health,
+  hobbies, relationships, directions, time, emotions, family, transportation, housing,
+  clothing, nature, culture, technology
+- naturalness_score: 0.0 to 1.0 — how likely a native Korean speaker would say this in
+  everyday conversation. Be honest. Penalize textbook-sounding phrasing.
+- source_words: array of Korean words/patterns from the lesson notes that this sentence practices
+  (so the student can see the connection to their lesson)
+- vocabulary: array of content words in this sentence
+  { "lemma_ko": "dictionary form", "pos_ko": "명사|동사|형용사|부사|기타" }
+  Exclude particles (이/가, 을/를, 에, 은/는, 의, 도, 와/과, 에서, 으로).
+- grammar_patterns: array of grammar patterns used
+  { "surface_form": "the attachable ending pattern, e.g. -았/었어요" }
+  Return atomic patterns only.
+- politeness: "해요체" or "합니다체" or "반말"
+- tense: "past" or "present" or "future" or "progressive" or "imperative"
+
+Return ONLY valid JSON. No markdown. No explanations.
+
+Output schema:
+{
+  "sentences": [
+    {
+      "ko": "Korean sentence here.",
+      "en": "English translation here.",
+      "group_label": "type label",
+      "cefr_level": "A2",
+      "topic": "daily_life",
+      "naturalness_score": 0.92,
+      "source_words": ["만나다", "-았/었어요"],
+      "vocabulary": [{ "lemma_ko": "만나다", "pos_ko": "동사" }],
+      "grammar_patterns": [{ "surface_form": "-았/었어요" }],
+      "politeness": "해요체",
+      "tense": "past"
+    }
+  ]
+}`;
+}
+
+function buildValidationPrompt(sentences, glossLang) {
+  const lang = (glossLang || "en").trim() || "en";
+  const sentenceList = sentences.map((s, i) => `${i + 1}. ${s.ko}`).join("\n");
+
+  return `You are a native Korean language expert reviewing sentences for naturalness.
+
+For each Korean sentence below, evaluate:
+1. Is it grammatically correct Korean?
+2. Would a native Korean speaker naturally say this in everyday conversation?
+3. Does the sentence sound natural and idiomatic, or does it feel artificial/textbook-like?
+4. Are there any unnatural word choices, awkward phrasing, or particle errors?
+5. Are verb conjugations correct (correct 받침 handling, correct vowel contraction)?
+
+SENTENCES TO REVIEW:
+${sentenceList}
+
+For each sentence, return:
+- index: the 1-based sentence number
+- natural: true if a native speaker would say this, false if it sounds unnatural
+- naturalness_score: 0.0 to 1.0 (1.0 = perfectly natural)
+- issues: array of strings describing any problems (empty array if none)
+- suggested_fix: if natural is false, provide the corrected Korean sentence. null if natural is true.
+- explanation: brief ${lang} explanation of any issues (empty string if none)
+
+Return ONLY valid JSON. No markdown.
+
+Output schema:
+{
+  "validations": [
+    {
+      "index": 1,
+      "natural": true,
+      "naturalness_score": 0.95,
+      "issues": [],
+      "suggested_fix": null,
+      "explanation": ""
+    }
+  ]
+}`;
+}
+
+function parseGenerationResult(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    throw new Error("openai_invalid_json");
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("openai_invalid_shape");
+  }
+
+  if (!Array.isArray(parsed.sentences)) {
+    throw new Error("openai_invalid_shape");
+  }
+
+  parsed.sentences = parsed.sentences
+    .filter(x => x && typeof x === "object")
+    .map(x => ({
+      ko: ensureEndingPunctuation(typeof x.ko === "string" ? x.ko.trim() : ""),
+      en: (x.en === null || x.en === undefined) ? null : String(x.en).trim(),
+      group_label: (x.group_label === null || x.group_label === undefined) ? null : String(x.group_label).trim(),
+      cefr_level: (x.cefr_level === null || x.cefr_level === undefined) ? null : String(x.cefr_level).trim(),
+      topic: (x.topic === null || x.topic === undefined) ? null : String(x.topic).trim(),
+      naturalness_score: (typeof x.naturalness_score === "number" && Number.isFinite(x.naturalness_score)) ? x.naturalness_score : null,
+      source_words: Array.isArray(x.source_words) ? x.source_words.filter(w => typeof w === "string") : [],
+      vocabulary: Array.isArray(x.vocabulary) ? x.vocabulary.filter(v => v && typeof v === "object" && v.lemma_ko) : [],
+      grammar_patterns: Array.isArray(x.grammar_patterns) ? x.grammar_patterns.filter(g => g && typeof g === "object" && g.surface_form) : [],
+      politeness: (x.politeness === null || x.politeness === undefined) ? null : String(x.politeness).trim(),
+      tense: (x.tense === null || x.tense === undefined) ? null : String(x.tense).trim()
+    }))
+    .filter(x => x.ko);
+
+  return parsed;
+}
+
+function parseValidationResult(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    throw new Error("openai_invalid_json");
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("openai_invalid_shape");
+  }
+
+  if (!Array.isArray(parsed.validations)) {
+    throw new Error("openai_invalid_shape");
+  }
+
+  parsed.validations = parsed.validations
+    .filter(x => x && typeof x === "object")
+    .map(x => ({
+      index: typeof x.index === "number" ? x.index : 0,
+      natural: x.natural === true,
+      naturalness_score: (typeof x.naturalness_score === "number" && Number.isFinite(x.naturalness_score)) ? x.naturalness_score : 0,
+      issues: Array.isArray(x.issues) ? x.issues.filter(i => typeof i === "string") : [],
+      suggested_fix: (x.suggested_fix === null || x.suggested_fix === undefined) ? null : String(x.suggested_fix).trim() || null,
+      explanation: (x.explanation === null || x.explanation === undefined) ? "" : String(x.explanation).trim()
+    }));
+
+  return parsed;
+}
+
+/**
+ * Generate practice sentences from teacher lesson notes.
+ *
+ * @param {Object} opts
+ * @param {string} opts.text - The teacher's lesson notes (highlighted text)
+ * @param {string} opts.cefrLevel - Student's CEFR level (e.g., "A2")
+ * @param {string} [opts.glossLang="en"] - Translation language
+ * @param {number} [opts.count=5] - Sentences per type
+ * @returns {Object} { sentences: [...] }
+ */
+async function generatePracticeSentences({ text, cefrLevel, glossLang, count }) {
+  if (typeof text !== "string" || !text.trim()) {
+    return { sentences: [] };
+  }
+
+  const prompt = buildPracticeGenerationPrompt({ text: text.trim(), cefrLevel, glossLang, count });
+
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const raw = await callOpenAIOnce(prompt);
+      return parseGenerationResult(raw);
+    } catch (err) {
+      lastError = err;
+      if (attempt < MAX_RETRIES) {
+        await sleep(500);
+        continue;
+      }
+    }
+  }
+
+  throw lastError || new Error("openai_failed");
+}
+
+/**
+ * Validate generated sentences for Korean naturalness.
+ * This is an independent check — it does NOT see the generation prompt.
+ *
+ * @param {Array<{ko: string}>} sentences - Generated sentences to validate
+ * @param {string} [glossLang="en"] - Language for issue explanations
+ * @returns {Object} { validations: [...] }
+ */
+async function validatePracticeSentences(sentences, glossLang) {
+  if (!Array.isArray(sentences) || sentences.length === 0) {
+    return { validations: [] };
+  }
+
+  const prompt = buildValidationPrompt(sentences, glossLang);
+
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const raw = await callOpenAIOnce(prompt);
+      return parseValidationResult(raw);
+    } catch (err) {
+      lastError = err;
+      if (attempt < MAX_RETRIES) {
+        await sleep(500);
+        continue;
+      }
+    }
+  }
+
+  throw lastError || new Error("openai_failed");
+}
+
 module.exports = {
   analyzeTextForImport,
-  callOpenAIOnce
+  callOpenAIOnce,
+  generatePracticeSentences,
+  validatePracticeSentences
 };
