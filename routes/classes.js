@@ -217,7 +217,7 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
                     WHEN cd.document_type = 'hakdoc'
                       THEN (SELECT h.title FROM hakdocs h WHERE h.hakdoc_id = cd.document_id::uuid)
                     WHEN cd.document_type = 'google_doc'
-                      THEN (SELECT ds.title FROM document_sources ds WHERE ds.saved_source_id = cd.document_id::uuid)
+                      THEN (SELECT ds.title FROM saved_document_sources ds WHERE ds.saved_source_id = cd.document_id::uuid)
                   END AS title
              FROM class_documents cd
             WHERE cd.class_id = $1::uuid
@@ -632,7 +632,7 @@ router.post(
         title = tr.rows[0]?.title || null;
       } else if (documentType === "google_doc") {
         const tr = await pool.query(
-          `SELECT title FROM document_sources WHERE saved_source_id = $1::uuid`,
+          `SELECT title FROM saved_document_sources WHERE saved_source_id = $1::uuid`,
           [documentId]
         );
         title = tr.rows[0]?.title || null;
