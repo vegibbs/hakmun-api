@@ -619,6 +619,117 @@ router.delete(
   }
 );
 
+// GET /v1/classes/:classId/lists/:listId/items — view list items (any class member)
+router.get(
+  "/v1/classes/:classId/lists/:listId/items",
+  requireSession,
+  async (req, res) => {
+    try {
+      const userId = getUserId(req);
+      if (!userId)
+        return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+      const { classId, listId } = req.params;
+
+      // Verify user is teacher or member
+      const memberCheck = await withTimeout(
+        pool.query(
+          `SELECT 1 FROM classes WHERE class_id = $1::uuid AND teacher_id = $2::uuid
+           UNION ALL
+           SELECT 1 FROM class_members WHERE class_id = $1::uuid AND user_id = $2::uuid
+           LIMIT 1`,
+          [classId, userId]
+        ),
+        8000,
+        "db-class-member-check"
+      );
+
+      if (memberCheck.rows.length === 0) {
+        return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+      }
+
+      // Verify list is attached to this class
+      const attachCheck = await withTimeout(
+        pool.query(
+          `SELECT 1 FROM class_lists WHERE class_id = $1::uuid AND list_id = $2::uuid`,
+          [classId, listId]
+        ),
+        8000,
+        "db-class-list-attach-check"
+      );
+
+      if (attachCheck.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      // Fetch list metadata
+      const listR = await withTimeout(
+        pool.query(
+          `SELECT id, name, description, global_weight, is_active, created_at, updated_at
+             FROM lists WHERE id = $1::uuid`,
+          [listId]
+        ),
+        8000,
+        "db-class-list-meta"
+      );
+
+      if (listR.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      // Fetch items with enriched content (same JOIN as GET /v1/lists/:id)
+      const itemsR = await withTimeout(
+        pool.query(
+          `SELECT
+             li.id,
+             li.list_id,
+             li.item_type,
+             li.item_id,
+             li.position,
+             li.added_at,
+             ci.content_item_id,
+             ci.content_type,
+             ci.text,
+             ci.language,
+             ci.notes,
+             ci.cefr_level,
+             ci.topic,
+             ci.politeness,
+             ci.tense,
+             ci.created_at AS content_created_at,
+             lri.audience,
+             lri.global_state,
+             lri.operational_status
+           FROM list_items li
+           LEFT JOIN content_items ci
+             ON li.item_id = ci.content_item_id
+            AND li.item_type IN ('sentence', 'pattern')
+           LEFT JOIN library_registry_items lri
+             ON lri.content_id = ci.content_item_id
+            AND lri.content_type = ci.content_type
+            AND lri.owner_user_id = $2::uuid
+           WHERE li.list_id = $1::uuid
+           ORDER BY li.position ASC, li.added_at ASC`,
+          [listId, userId]
+        ),
+        8000,
+        "db-class-list-items"
+      );
+
+      return res.json({
+        ok: true,
+        list: listR.rows[0],
+        items: itemsR.rows || [],
+      });
+    } catch (err) {
+      logger.error("[classes] list items failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
+
 // ===========================================================================
 // DOCUMENTS (attach/detach)
 // ===========================================================================
