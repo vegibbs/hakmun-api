@@ -89,6 +89,7 @@ app.use(require("./routes/practice_completions"));
 app.use(require("./routes/lists"));
 app.use(require("./routes/document_fragments"));
 app.use(require("./routes/hakdoc"));
+app.use(require("./routes/classes"));
 app.use(require("./routes/grammar_patterns_admin"));
 app.use(require("./routes/unmatched_vocab_admin"));
 
