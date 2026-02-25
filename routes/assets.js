@@ -360,4 +360,64 @@ router.get("/v1/assets/:asset_id/url", requireSession, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   Handwriting image lookup — find by source_label + title (entry UUID)
+   GET /v1/assets/handwriting/:entry_id/url
+   Returns signed URL for the handwriting PNG associated with a journal entry.
+------------------------------------------------------------------ */
+router.get("/v1/assets/handwriting/:entry_id/url", requireSession, async (req, res) => {
+  const maybe = requireStorageOr503(res);
+  if (maybe) return;
+
+  try {
+    const ownerUserID = req.user.userID;
+    const entryID = String(req.params.entry_id || "").trim();
+
+    if (!entryID || entryID.length < 36) {
+      return res.status(400).json({ error: "invalid entry_id" });
+    }
+
+    const r = await withTimeout(
+      pool.query(
+        `select object_key, mime_type, size_bytes
+         from media_assets
+         where owner_user_id = $1
+           and source_label = 'handwriting'
+           and title = $2
+         limit 1`,
+        [ownerUserID, entryID]
+      ),
+      8000,
+      "db-get-handwriting-asset"
+    );
+
+    const row = r.rows?.[0];
+    if (!row?.object_key) {
+      return res.status(404).json({ error: "handwriting image not found" });
+    }
+
+    const s3 = makeS3Client();
+    const url = await withTimeout(
+      getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: bucketName(), Key: row.object_key }),
+        { expiresIn: 60 * 15 }
+      ),
+      8000,
+      "sign-handwriting-url"
+    );
+
+    return res.json({
+      url,
+      expiresIn: 900,
+      mime_type: row.mime_type || null,
+      size_bytes: Number(row.size_bytes || 0)
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[/v1/assets/handwriting] url failed", { rid: req._rid, err: msg });
+    return res.status(500).json({ error: "failed to get handwriting image url" });
+  }
+});
+
 module.exports = router;
