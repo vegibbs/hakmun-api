@@ -68,18 +68,21 @@ const ASSET_ALLOWED_MIME = new Set([
   "audio/wav",
   "audio/x-wav",
   "audio/m4a",
-  "application/pdf"
+  "application/pdf",
+  "image/png"
 ]);
 
 // Size limits per mime family (bytes)
 const ASSET_MAX_BYTES = {
   audio: 25 * 1024 * 1024, // 25MB
-  pdf: 10 * 1024 * 1024 // 10MB
+  pdf: 10 * 1024 * 1024, // 10MB
+  image: 5 * 1024 * 1024 // 5MB
 };
 
 function assetFamilyForMime(mime) {
   const m = String(mime || "").toLowerCase().trim();
   if (m.startsWith("audio/")) return "audio";
+  if (m.startsWith("image/")) return "image";
   if (m === "application/pdf") return "pdf";
   return "other";
 }
@@ -90,6 +93,7 @@ function assetExtForMime(mime) {
   if (m === "audio/wav" || m === "audio/x-wav") return "wav";
   if (m === "audio/m4a") return "m4a";
   if (m === "application/pdf") return "pdf";
+  if (m === "image/png") return "png";
   return "bin";
 }
 
