@@ -70,6 +70,16 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
     const primaryHandle = await getPrimaryHandleForUser(req.user.userID, pool);
     const profileComplete = Boolean(primaryHandle && String(primaryHandle).trim());
 
+    // Load per-user feature flags
+    const { rows: flagRows } = await pool.query(
+      `SELECT flag_key, enabled FROM user_feature_flags WHERE user_id = $1`,
+      [req.user.userID]
+    );
+    const featureFlags = {};
+    for (const row of flagRows) {
+      featureFlags[row.flag_key] = row.enabled;
+    }
+
     return res.json({
       userID: req.user.userID,
       role: req.user.role,
@@ -81,6 +91,9 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       // Server-authoritative capabilities
       entitlements: req.user.entitlements || [],
       capabilities: req.user.capabilities || {},
+
+      // Per-user feature flags (admin-controlled)
+      featureFlags,
 
       // Canonical profile facts
       profileComplete,

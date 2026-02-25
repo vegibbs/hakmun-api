@@ -140,8 +140,21 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
   }
 }
 
-async function findUsersForAdmin({ search }) {
+const VALID_FEATURE_FLAGS = [
+  "section:practice",
+  "section:library",
+  "section:global",
+  "section:immersion",
+  "section:hanja",
+  "section:lists"
+];
+
+async function findUsersForAdmin({ search, offset = 0, limit = 50 }) {
   const s = String(search || "").trim();
+  const safeLimit = Math.min(Math.max(1, Number(limit) || 50), 200);
+  const safeOffset = Math.max(0, Number(offset) || 0);
+
+  let users;
 
   // If UUID, direct lookup.
   if (s && looksLikeUUID(s)) {
@@ -153,6 +166,9 @@ async function findUsersForAdmin({ search }) {
         u.is_active,
         u.is_admin,
         u.is_root_admin,
+        u.display_name,
+        u.last_seen_at,
+        u.created_at,
         uh.handle as primary_handle
       from users u
       left join user_handles uh
@@ -162,30 +178,65 @@ async function findUsersForAdmin({ search }) {
       `,
       [s]
     );
-    return rows || [];
+    users = rows || [];
+  } else {
+    // Search by primary handle (case-insensitive substring), or all if empty.
+    const q = s ? `%${s}%` : "%";
+    const { rows } = await pool.query(
+      `
+      select
+        u.user_id,
+        u.role,
+        u.is_active,
+        u.is_admin,
+        u.is_root_admin,
+        u.display_name,
+        u.last_seen_at,
+        u.created_at,
+        uh.handle as primary_handle
+      from users u
+      left join user_handles uh
+        on uh.user_id = u.user_id and uh.kind = 'primary'
+      where ($1 = '%' or uh.handle ilike $1)
+      order by uh.handle nulls last, u.user_id
+      limit $2 offset $3
+      `,
+      [q, safeLimit, safeOffset]
+    );
+    users = rows || [];
   }
 
-  // Otherwise search by primary handle (case-insensitive substring).
-  const q = s ? `%${s}%` : "%";
-  const { rows } = await pool.query(
+  // Batch-load feature flags for returned users
+  const userIDs = users.map((u) => u.user_id);
+  if (userIDs.length) {
+    const { rows: flagRows } = await pool.query(
+      `SELECT user_id, flag_key, enabled FROM user_feature_flags WHERE user_id = ANY($1)`,
+      [userIDs]
+    );
+    const flagMap = {};
+    for (const row of flagRows) {
+      if (!flagMap[row.user_id]) flagMap[row.user_id] = {};
+      flagMap[row.user_id][row.flag_key] = row.enabled;
+    }
+    for (const user of users) {
+      user.feature_flags = flagMap[user.user_id] || {};
+    }
+  }
+
+  // Get total count for pagination
+  const countQ = s ? `%${s}%` : "%";
+  const { rows: countRows } = await pool.query(
     `
-    select
-      u.user_id,
-      u.role,
-      u.is_active,
-      u.is_admin,
-      u.is_root_admin,
-      uh.handle as primary_handle
+    select count(*)::int as total
     from users u
     left join user_handles uh
       on uh.user_id = u.user_id and uh.kind = 'primary'
     where ($1 = '%' or uh.handle ilike $1)
-    order by uh.handle nulls last, u.user_id
-    limit 50
     `,
-    [q]
+    [countQ]
   );
-  return rows || [];
+
+  return { users, total: countRows?.[0]?.total || 0 };
 }
 
 /* ------------------------------------------------------------------
@@ -240,7 +291,7 @@ router.post(
   }
 );
 
-// GET /v1/admin/users?search=<handle-substring-or-uuid>
+// GET /v1/admin/users?search=<handle-substring-or-uuid>&offset=0&limit=50
 router.get(
   "/v1/admin/users",
   requireSession,
@@ -249,8 +300,10 @@ router.get(
   async (req, res) => {
     try {
       const search = String(req.query?.search || "").trim();
-      const users = await findUsersForAdmin({ search });
-      return res.json({ users });
+      const offset = Number(req.query?.offset) || 0;
+      const limit = Number(req.query?.limit) || 50;
+      const { users, total } = await findUsersForAdmin({ search, offset, limit });
+      return res.json({ users, total });
     } catch (err) {
       logger.error("/v1/admin/users failed", { rid: req._rid, err: err?.message || String(err) });
       return res.status(500).json({ error: "admin users failed" });
@@ -328,6 +381,99 @@ router.patch(
     } catch (err) {
       logger.error("/v1/admin/users/:userID failed", { rid: req._rid, err: err?.message || String(err) });
       return res.status(500).json({ error: "admin update failed" });
+    }
+  }
+);
+
+/* ------------------------------------------------------------------
+   Feature Flags (per-user sidebar visibility)
+------------------------------------------------------------------ */
+
+// GET /v1/admin/users/:userID/flags
+router.get(
+  "/v1/admin/users/:userID/flags",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:users:read"),
+  async (req, res) => {
+    try {
+      const targetUserID = String(req.params.userID || "").trim();
+      if (!looksLikeUUID(targetUserID)) {
+        return res.status(400).json({ error: "invalid userID" });
+      }
+      const { rows } = await pool.query(
+        `SELECT flag_key, enabled FROM user_feature_flags WHERE user_id = $1 ORDER BY flag_key`,
+        [targetUserID]
+      );
+      const flags = {};
+      for (const row of rows) {
+        flags[row.flag_key] = row.enabled;
+      }
+      return res.json({ userID: targetUserID, flags });
+    } catch (err) {
+      logger.error("/v1/admin/users/:userID/flags (GET) failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "get flags failed" });
+    }
+  }
+);
+
+// PUT /v1/admin/users/:userID/flags { flags: { "section:hanja": false, ... } }
+router.put(
+  "/v1/admin/users/:userID/flags",
+  requireSession,
+  requireRootAdmin,
+  requireEntitlement("admin:users:write"),
+  async (req, res) => {
+    try {
+      const targetUserID = String(req.params.userID || "").trim();
+      if (!looksLikeUUID(targetUserID)) {
+        return res.status(400).json({ error: "invalid userID" });
+      }
+      const flags = req.body?.flags;
+      if (!flags || typeof flags !== "object") {
+        return res.status(400).json({ error: "flags object required" });
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        for (const [key, value] of Object.entries(flags)) {
+          if (!VALID_FEATURE_FLAGS.includes(key)) continue;
+          await client.query(
+            `INSERT INTO user_feature_flags (user_id, flag_key, enabled, updated_at, updated_by)
+             VALUES ($1, $2, $3, now(), $4)
+             ON CONFLICT (user_id, flag_key)
+             DO UPDATE SET enabled = $3, updated_at = now(), updated_by = $4`,
+            [targetUserID, key, Boolean(value), req.user.userID]
+          );
+        }
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+
+      // Return updated flags
+      const { rows } = await pool.query(
+        `SELECT flag_key, enabled FROM user_feature_flags WHERE user_id = $1`,
+        [targetUserID]
+      );
+      const result = {};
+      for (const row of rows) result[row.flag_key] = row.enabled;
+
+      logger.info("[admin] flags updated", {
+        rid: req._rid,
+        actorUserID: req.user.userID,
+        targetUserID,
+        flags: result
+      });
+
+      return res.json({ userID: targetUserID, flags: result });
+    } catch (err) {
+      logger.error("/v1/admin/users/:userID/flags (PUT) failed", { rid: req._rid, err: err?.message || String(err) });
+      return res.status(500).json({ error: "set flags failed" });
     }
   }
 );
