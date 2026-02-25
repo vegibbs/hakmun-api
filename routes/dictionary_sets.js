@@ -11,6 +11,7 @@
 //
 // Set IDs (v0):
 //   - teaching:ALL
+//   - hanja:ALL
 //   - my_pins
 //   - my_vocab
 
@@ -32,6 +33,7 @@ function dbQuery(sql, params) {
 
 function parseSetId(setId) {
   if (setId === "teaching:ALL") return { kind: "teaching_all" };
+  if (setId === "hanja:ALL") return { kind: "hanja_all" };
   if (setId === "my_pins") return { kind: "my_pins" };
   if (setId === "my_vocab") return { kind: "my_vocab" };
   return null;
@@ -49,6 +51,12 @@ router.get("/v1/dictionary/sets", requireSession, async (req, res) => {
         kind: "teaching",
         title: "Teaching Vocabulary",
         subtitle: "Seed list",
+      },
+      {
+        set_id: "hanja:ALL",
+        kind: "hanja",
+        title: "Hanja",
+        subtitle: "By frequency",
       },
       {
         set_id: "my_pins",
@@ -143,6 +151,37 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
     `;
       const { rows } = await dbQuery(sql, []);
       return res.json({ ok: true, set_id: setId, kind: "teaching", items: rows || [] });
+    }
+
+    if (parsed.kind === "hanja_all") {
+      const sql = `
+        SELECT
+          hc.id,
+          hc.hanja,
+          hr.reading_hangul,
+          ht_ko.text_value AS gloss_ko,
+          ht_en.text_value AS meaning_en,
+          hl.level_code,
+          r.freq_words,
+          r.rank_global
+        FROM hanja_character_ranking_mv r
+        JOIN hanja_characters hc ON hc.id = r.hanja_character_id
+        LEFT JOIN hanja_texts ht_ko
+          ON ht_ko.hanja_character_id = hc.id
+         AND ht_ko.lang = 'ko'
+         AND ht_ko.text_type = 'gloss'
+        LEFT JOIN hanja_texts ht_en
+          ON ht_en.hanja_character_id = hc.id
+         AND ht_en.lang = 'en'
+         AND ht_en.text_type = 'meaning'
+        LEFT JOIN hanja_readings hr
+          ON hr.hanja_character_id = hc.id
+        LEFT JOIN hanja_character_levels hl
+          ON hl.hanja_character_id = hc.id
+        ORDER BY r.rank_global
+      `;
+      const { rows } = await dbQuery(sql, []);
+      return res.json({ ok: true, set_id: setId, kind: "hanja", items: rows || [] });
     }
 
     if (parsed.kind === "my_pins") {
