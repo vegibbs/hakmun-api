@@ -451,6 +451,7 @@ router.post("/v1/practice-lists/commit", requireSession, async (req, res) => {
     const documentId = cleanString(req.body?.document_id, 80) || null;
     const rawSessionDate = cleanString(req.body?.session_date, 10);
     const sessionDate = /^\d{4}-\d{2}-\d{2}$/.test(rawSessionDate) ? rawSessionDate : null;
+    const customName = cleanString(req.body?.name, 100) || null;
     const sentences = Array.isArray(req.body?.sentences) ? req.body.sentences : [];
 
     if (sentences.length === 0) {
@@ -474,7 +475,7 @@ router.post("/v1/practice-lists/commit", requireSession, async (req, res) => {
         "db-count-practice-lists"
       );
       const listNumber = (parseInt(countR.rows[0]?.cnt, 10) || 0) + 1;
-      const listName = `Practice List ${listNumber}`;
+      const listName = customName || `Practice List ${listNumber}`;
 
       // Create the list
       const listId = crypto.randomUUID();
