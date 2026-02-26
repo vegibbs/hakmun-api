@@ -334,20 +334,74 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     const hanjaReading = hanjaRows[0]?.reading_hangul || "";
     const hanjaGloss = hanjaRows[0]?.gloss_ko || "";
 
-    // 3. Fetch user CEFR level
-    let cefrLevel = "A1";
-    try {
-      const { pool: p } = db;
-      const uR = await p.query(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]);
-      cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
-    } catch (e) {
-      logger.warn("[hanja-practice] cefr fetch failed, defaulting to A1", { err: e?.message });
+    // 3. Search for existing approved sentences containing each word
+    const sentenceSql = `
+      SELECT DISTINCT ON (ci.content_item_id)
+        ci.content_item_id,
+        ci.text,
+        ci.notes,
+        ci.cefr_level,
+        ci.topic
+      FROM content_items ci
+      JOIN library_registry_items lri
+        ON lri.content_type = 'sentence'
+       AND lri.content_id = ci.content_item_id
+       AND lri.global_state = 'approved'
+       AND lri.operational_status = 'active'
+      WHERE ci.content_type = 'sentence'
+        AND ci.text ILIKE $1
+      LIMIT $2
+    `;
+
+    const foundSentences = [];
+    const coveredWords = new Set();
+    const uncoveredWords = [];
+
+    for (const word of headwords) {
+      const { rows } = await dbQuery(sentenceSql, [`%${word}%`, count]);
+      if (rows.length > 0) {
+        coveredWords.add(word);
+        for (const row of rows) {
+          if (!foundSentences.find(s => s.ko === row.text)) {
+            foundSentences.push({
+              ko: row.text,
+              en: row.notes || "",
+              group_label: word,
+              cefr_level: row.cefr_level,
+              topic: row.topic,
+              naturalness_score: 1.0,
+              validation_score: 1.0,
+              validation_natural: true,
+              source_words: [word],
+              issues: [],
+              suggested_fix: null,
+              explanation: "",
+              politeness: null,
+              tense: null
+            });
+          }
+        }
+      } else {
+        uncoveredWords.push(word);
+      }
     }
 
-    // 4. Build context text for the shared generation utility
-    // The generic prompt generates N sentences "per type". Each word is a type.
-    const wordLines = headwords.map(w => `- ${w}`).join("\n");
-    const contextText = `Hanja vocabulary practice — character ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
+    // 4. Generate via AI only for words without existing sentences
+    let generated = [];
+    if (uncoveredWords.length > 0) {
+      // Fetch user CEFR level
+      let cefrLevel = "A1";
+      try {
+        const { pool: p } = db;
+        const uR = await p.query(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]);
+        cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
+      } catch (e) {
+        logger.warn("[hanja-practice] cefr fetch failed, defaulting to A1", { err: e?.message });
+      }
+
+      // Build context text — each uncovered word is a type
+      const wordLines = uncoveredWords.map(w => `- ${w}`).join("\n");
+      const contextText = `Hanja vocabulary practice — character ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
 
 The following vocabulary words all share the hanja character ${hanjaChar}.
 Each word is a separate practice type — use the word itself as the group_label.
@@ -358,44 +412,46 @@ ${wordLines}
 For each word, generate sentences that naturally use it in everyday context.
 Include the practiced word in the source_words array for each sentence.`;
 
-    // 5. Generate via shared utility (same pipeline as practice-lists)
-    // Hanja generates N sentences × up to 10 words, so allow 90s per LLM call
-    const LLM_TIMEOUT = 90_000;
-    const genResult = await generatePracticeSentences({
-      text: contextText,
-      cefrLevel,
-      glossLang: "en",
-      count,
-      perspective,
-      politeness,
-      timeoutMs: LLM_TIMEOUT
-    });
+      const LLM_TIMEOUT = 90_000;
+      const genResult = await generatePracticeSentences({
+        text: contextText,
+        cefrLevel,
+        glossLang: "en",
+        count,
+        perspective,
+        politeness,
+        timeoutMs: LLM_TIMEOUT
+      });
 
-    const generated = genResult.sentences || [];
+      generated = genResult.sentences || [];
 
-    // 6. Validate for naturalness (second LLM pass)
-    if (generated.length > 0) {
-      try {
-        const valResult = await validatePracticeSentences(generated, "en", LLM_TIMEOUT);
-        const validations = valResult.validations || [];
-        for (const v of validations) {
-          const idx = v.index - 1;
-          if (idx >= 0 && idx < generated.length) {
-            generated[idx].validation_score = v.naturalness_score;
-            generated[idx].validation_natural = v.natural;
-            generated[idx].issues = v.issues;
-            generated[idx].suggested_fix = v.suggested_fix;
-            generated[idx].explanation = v.explanation;
+      // Validate for naturalness (second LLM pass)
+      if (generated.length > 0) {
+        try {
+          const valResult = await validatePracticeSentences(generated, "en", LLM_TIMEOUT);
+          const validations = valResult.validations || [];
+          for (const v of validations) {
+            const idx = v.index - 1;
+            if (idx >= 0 && idx < generated.length) {
+              generated[idx].validation_score = v.naturalness_score;
+              generated[idx].validation_natural = v.natural;
+              generated[idx].issues = v.issues;
+              generated[idx].suggested_fix = v.suggested_fix;
+              generated[idx].explanation = v.explanation;
+            }
           }
+        } catch (valErr) {
+          logger.warn("[hanja-practice] validation failed, returning unvalidated", { err: valErr?.message });
         }
-      } catch (valErr) {
-        logger.warn("[hanja-practice] validation failed, returning unvalidated", { err: valErr?.message });
       }
     }
 
+    // 5. Combine: existing sentences first, then generated
+    const allSentences = [...foundSentences, ...generated];
+
     return res.json({
       ok: true,
-      practice_sentences: generated,
+      practice_sentences: allSentences,
     });
   } catch (err) {
     logger.error("[hanja-practice] practice-session POST failed", { err: err?.message, stack: err?.stack });
