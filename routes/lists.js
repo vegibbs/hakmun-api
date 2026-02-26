@@ -42,6 +42,8 @@ router.get("/v1/lists", requireSession, async (req, res) => {
               AND (
                 li.item_type NOT IN ('sentence', 'pattern')
                 OR EXISTS (SELECT 1 FROM content_items ci WHERE ci.content_item_id = li.item_id)
+                OR (li.item_type = 'pattern' AND EXISTS (SELECT 1 FROM grammar_patterns gp WHERE gp.id = li.item_id))
+                OR (li.item_type = 'sentence' AND EXISTS (SELECT 1 FROM sentences s WHERE s.id = li.item_id))
               )
          ) ic ON true
          WHERE l.user_id = $1::uuid
@@ -84,6 +86,7 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
     }
 
     // Clean up orphaned list_items whose content no longer exists
+    // Items can live in content_items (personal) OR grammar_patterns / sentences (global)
     await withTimeout(
       pool.query(
         `DELETE FROM list_items li
@@ -91,7 +94,13 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
            AND li.item_type IN ('sentence', 'pattern')
            AND NOT EXISTS (
              SELECT 1 FROM content_items ci WHERE ci.content_item_id = li.item_id
-           )`,
+           )
+           AND NOT (li.item_type = 'pattern' AND EXISTS (
+             SELECT 1 FROM grammar_patterns gp WHERE gp.id = li.item_id
+           ))
+           AND NOT (li.item_type = 'sentence' AND EXISTS (
+             SELECT 1 FROM sentences s WHERE s.id = li.item_id
+           ))`,
         [listId]
       ),
       8000,
@@ -109,12 +118,12 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
            li.item_id,
            li.position,
            li.added_at,
-           COALESCE(ci.content_item_id, hc2.id, tv.id) AS content_item_id,
-           COALESCE(ci.content_type, CASE WHEN hc2.id IS NOT NULL THEN 'hanja' WHEN tv.id IS NOT NULL THEN 'vocabulary' END) AS content_type,
-           COALESCE(ci.text, hc2.hanja || ' ' || COALESCE(hr.reading_hangul, ''), tv.lemma) AS text,
-           COALESCE(ci.language, CASE WHEN hc2.id IS NOT NULL OR tv.id IS NOT NULL THEN 'ko' END) AS language,
-           COALESCE(ci.notes, NULLIF(CONCAT_WS(' — ', ht_ko.text_value, ht_en.text_value), ''), vg.text) AS notes,
-           COALESCE(ci.cefr_level, tv.cefr_level) AS cefr_level,
+           COALESCE(ci.content_item_id, gp.id, snt.id, hc2.id, tv.id) AS content_item_id,
+           COALESCE(ci.content_type, CASE WHEN gp.id IS NOT NULL THEN 'pattern' WHEN snt.id IS NOT NULL THEN 'sentence' WHEN hc2.id IS NOT NULL THEN 'hanja' WHEN tv.id IS NOT NULL THEN 'vocabulary' END) AS content_type,
+           COALESCE(ci.text, gp.display_name, snt.ko, hc2.hanja || ' ' || COALESCE(hr.reading_hangul, ''), tv.lemma) AS text,
+           COALESCE(ci.language, CASE WHEN gp.id IS NOT NULL OR snt.id IS NOT NULL OR hc2.id IS NOT NULL OR tv.id IS NOT NULL THEN 'ko' END) AS language,
+           COALESCE(ci.notes, gp.explanation, NULLIF(CONCAT_WS(' — ', ht_ko.text_value, ht_en.text_value), ''), vg.text) AS notes,
+           COALESCE(ci.cefr_level, gp.cefr_min, snt.level, tv.cefr_level) AS cefr_level,
            ci.topic,
            ci.politeness,
            ci.tense,
@@ -127,6 +136,14 @@ router.get("/v1/lists/:id", requireSession, async (req, res) => {
          LEFT JOIN content_items ci
            ON li.item_id = ci.content_item_id
           AND li.item_type IN ('sentence', 'pattern')
+         LEFT JOIN grammar_patterns gp
+           ON li.item_id = gp.id
+          AND li.item_type = 'pattern'
+          AND ci.content_item_id IS NULL
+         LEFT JOIN sentences snt
+           ON li.item_id = snt.id
+          AND li.item_type = 'sentence'
+          AND ci.content_item_id IS NULL
          LEFT JOIN hanja_characters hc2
            ON li.item_id = hc2.id
           AND li.item_type = 'hanja'
