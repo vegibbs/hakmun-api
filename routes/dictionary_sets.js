@@ -20,8 +20,8 @@ const router = express.Router();
 
 const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
-const { callOpenAIOnce } = require("../util/openai");
-const { linkSentenceVocab, linkSentenceGrammarPatterns } = require("../util/link_vocab_patterns");
+const { generatePracticeSentences, validatePracticeSentences } = require("../util/openai");
+const { logger } = require("../util/log");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
@@ -287,15 +287,20 @@ router.get("/v1/hanja/:id/words", requireSession, async (req, res) => {
 });
 
 // POST /v1/hanja/:id/practice-session
-// Looks up existing sentences containing the hanja-derived words,
-// generates via OpenAI for any words that lack coverage,
-// and returns a practice-ready sentence list.
+// Generates practice sentences for hanja-derived words using the shared
+// generate + validate pipeline. Returns sentences for client-side review
+// (not committed yet — commit happens via POST /v1/practice-lists/commit).
 router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) => {
   const userId = getUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
   try {
     const hanjaCharacterId = req.params.id;
+    const count = Math.min(Math.max(Number(req.body?.count) || 5, 1), 20);
+    const perspective = ["first_person", "third_person"].includes(req.body?.perspective)
+      ? req.body.perspective : "first_person";
+    const politeness = ["해요체", "합니다체", "반말"].includes(req.body?.politeness)
+      ? req.body.politeness : "해요체";
 
     // 1. Get the words for this hanja character
     const wordsSql = `
@@ -312,199 +317,80 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     const headwords = wordRows.map(r => r.headword);
 
     if (headwords.length === 0) {
-      return res.json({ ok: true, sentences: [] });
+      return res.json({ ok: true, practice_sentences: [] });
     }
 
-    // 2. Search for existing approved sentences containing each word
-    const sentenceSql = `
-      SELECT DISTINCT ON (ci.content_item_id)
-        ci.content_item_id,
-        ci.text,
-        ci.notes,
-        ci.cefr_level,
-        ci.topic
-      FROM content_items ci
-      JOIN library_registry_items lri
-        ON lri.content_type = 'sentence'
-       AND lri.content_id = ci.content_item_id
-       AND lri.global_state = 'approved'
-       AND lri.operational_status = 'active'
-      WHERE ci.content_type = 'sentence'
-        AND ci.text ILIKE $1
-      LIMIT 2
+    // 2. Get hanja character context for the generation prompt
+    const hanjaSql = `
+      SELECT hc.hanja, hr.reading_hangul, ht_ko.text_value AS gloss_ko
+      FROM hanja_characters hc
+      LEFT JOIN hanja_readings hr ON hr.hanja_character_id = hc.id
+      LEFT JOIN hanja_texts ht_ko
+        ON ht_ko.hanja_character_id = hc.id AND ht_ko.lang = 'ko' AND ht_ko.text_type = 'gloss'
+      WHERE hc.id = $1
     `;
+    const { rows: hanjaRows } = await dbQuery(hanjaSql, [hanjaCharacterId]);
+    const hanjaChar = hanjaRows[0]?.hanja || "";
+    const hanjaReading = hanjaRows[0]?.reading_hangul || "";
+    const hanjaGloss = hanjaRows[0]?.gloss_ko || "";
 
-    const foundSentences = [];
-    const coveredWords = new Set();
-    const uncoveredWords = [];
-
-    for (const word of headwords) {
-      const { rows } = await dbQuery(sentenceSql, [`%${word}%`]);
-      if (rows.length > 0) {
-        coveredWords.add(word);
-        for (const row of rows) {
-          // Avoid duplicates if same sentence matches multiple words
-          if (!foundSentences.find(s => s.content_item_id === row.content_item_id)) {
-            foundSentences.push({
-              content_item_id: row.content_item_id,
-              text: row.text,
-              notes: row.notes,
-              cefr_level: row.cefr_level,
-              topic: row.topic,
-              source_word: word,
-              generated: false,
-            });
-          }
-        }
-      } else {
-        uncoveredWords.push(word);
-      }
+    // 3. Fetch user CEFR level
+    let cefrLevel = "A1";
+    try {
+      const { pool: p } = db;
+      const uR = await p.query(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]);
+      cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
+    } catch (e) {
+      logger.warn("[hanja-practice] cefr fetch failed, defaulting to A1", { err: e?.message });
     }
 
-    // 3. Generate sentences for uncovered words via OpenAI
-    if (uncoveredWords.length > 0) {
-      // Get the hanja character for context
-      const hanjaSql = `
-        SELECT hc.hanja, hr.reading_hangul, ht_ko.text_value AS gloss_ko
-        FROM hanja_characters hc
-        LEFT JOIN hanja_readings hr ON hr.hanja_character_id = hc.id
-        LEFT JOIN hanja_texts ht_ko
-          ON ht_ko.hanja_character_id = hc.id AND ht_ko.lang = 'ko' AND ht_ko.text_type = 'gloss'
-        WHERE hc.id = $1
-      `;
-      const { rows: hanjaRows } = await dbQuery(hanjaSql, [hanjaCharacterId]);
-      const hanjaChar = hanjaRows[0]?.hanja || "";
-      const hanjaReading = hanjaRows[0]?.reading_hangul || "";
-      const hanjaGloss = hanjaRows[0]?.gloss_ko || "";
+    // 4. Build context text for the shared generation utility
+    const contextText = `Hanja character: ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
 
-      const wordList = uncoveredWords.join(", ");
-      const prompt = `You are a Korean language teaching assistant.
+Words using this character: ${headwords.join(", ")}
 
-Generate natural Korean practice sentences that contain these vocabulary words: ${wordList}
+Generate practice sentences that naturally use these vocabulary words.
+Each sentence should demonstrate the meaning of one of these hanja-derived words in everyday context.
+For each sentence, include the source_word it practices in the source_words array.`;
 
-Context: These words all share the hanja character ${hanjaChar} (${hanjaReading} — ${hanjaGloss}).
-Generate 1-2 sentences per word. Each sentence should naturally use the word in everyday context.
+    // 5. Generate via shared utility (same pipeline as practice-lists)
+    const genResult = await generatePracticeSentences({
+      text: contextText,
+      cefrLevel,
+      glossLang: "en",
+      count,
+      perspective,
+      politeness
+    });
 
-Rules:
-- Use 요-form (해요체) politeness level.
-- Each sentence must be a complete, natural, standalone Korean sentence.
-- Each sentence should be 5-20 syllables long.
-- Every sentence MUST end with punctuation (. ? !).
-- Vary grammar patterns and tenses across sentences.
-- Do NOT include English words mixed into Korean.
+    const generated = genResult.sentences || [];
 
-For each sentence provide:
-- ko: the Korean sentence
-- en: English translation
-- source_word: which word from the list this sentence practices
-- cefr_level: estimated CEFR level (A1, A2, B1, B2)
-- topic: ONE from: daily_life, food, weather, travel, work, school, shopping, health, hobbies, relationships, directions, time, emotions, family, transportation, housing, clothing, nature, culture, technology
-- naturalness_score: 0.0 to 1.0
-- vocabulary: array of content words { "lemma_ko": "dictionary form", "pos_ko": "명사|동사|형용사|부사|기타" }
-- grammar_patterns: array { "surface_form": "e.g. -았/었어요" }
-
-Return ONLY valid JSON:
-{
-  "sentences": [
-    {
-      "ko": "...",
-      "en": "...",
-      "source_word": "...",
-      "cefr_level": "A2",
-      "topic": "daily_life",
-      "naturalness_score": 0.9,
-      "vocabulary": [{ "lemma_ko": "...", "pos_ko": "..." }],
-      "grammar_patterns": [{ "surface_form": "..." }]
-    }
-  ]
-}`;
-
-      const raw = await callOpenAIOnce(prompt);
-      let parsed;
+    // 6. Validate for naturalness (second LLM pass)
+    if (generated.length > 0) {
       try {
-        parsed = JSON.parse(raw);
-      } catch {
-        // If OpenAI returns bad JSON, just skip generation
-        parsed = { sentences: [] };
-      }
-
-      const generated = (parsed.sentences || [])
-        .filter(s => s && typeof s.ko === "string" && s.ko.trim().length >= 5)
-        .filter(s => {
-          const score = typeof s.naturalness_score === "number" ? s.naturalness_score : 1;
-          return score >= 0.7;
-        });
-
-      // Store generated sentences in DB (same pattern as POST /v1/generate/sentences)
-      if (generated.length > 0) {
-        const { pool } = db;
-        const client = await pool.connect();
-        const q = client.query.bind(client);
-
-        try {
-          await q("BEGIN", []);
-
-          for (const s of generated) {
-            const ko = s.ko.trim();
-            const en = typeof s.en === "string" ? s.en.trim() : null;
-            const cefr = typeof s.cefr_level === "string" ? s.cefr_level.trim() : null;
-            let topic = typeof s.topic === "string" ? s.topic.trim() : null;
-            const score = typeof s.naturalness_score === "number" ? s.naturalness_score : null;
-            const sourceWord = typeof s.source_word === "string" ? s.source_word.trim() : null;
-
-            const ins = await q(
-              `INSERT INTO content_items
-                (owner_user_id, content_type, text, language, notes, cefr_level, topic, naturalness_score)
-              VALUES ($1::uuid, 'sentence', $2, 'ko', $3, $4, $5, $6)
-              RETURNING content_item_id, text, notes, cefr_level, topic`,
-              [userId, ko, en, cefr, topic, score]
-            );
-            const item = ins.rows[0];
-
-            await q(
-              `INSERT INTO library_registry_items
-                (content_type, content_id, owner_user_id, audience, global_state, operational_status)
-              VALUES ('sentence', $1::uuid, $2::uuid, 'global', 'approved', 'active')`,
-              [item.content_item_id, userId]
-            );
-
-            // Link vocabulary and grammar patterns
-            const vocabArray = Array.isArray(s.vocabulary) ? s.vocabulary : [];
-            const patternsArray = Array.isArray(s.grammar_patterns) ? s.grammar_patterns : [];
-            await linkSentenceVocab(q, item.content_item_id, vocabArray);
-            await linkSentenceGrammarPatterns(q, item.content_item_id, patternsArray);
-
-            foundSentences.push({
-              content_item_id: item.content_item_id,
-              text: item.text,
-              notes: item.notes,
-              cefr_level: item.cefr_level,
-              topic: item.topic,
-              source_word: sourceWord,
-              generated: true,
-            });
+        const valResult = await validatePracticeSentences(generated, "en");
+        const validations = valResult.validations || [];
+        for (const v of validations) {
+          const idx = v.index - 1;
+          if (idx >= 0 && idx < generated.length) {
+            generated[idx].validation_score = v.naturalness_score;
+            generated[idx].validation_natural = v.natural;
+            generated[idx].issues = v.issues;
+            generated[idx].suggested_fix = v.suggested_fix;
+            generated[idx].explanation = v.explanation;
           }
-
-          await q("COMMIT", []);
-        } catch (err) {
-          try { await client.query("ROLLBACK"); } catch (_) {}
-          throw err;
-        } finally {
-          client.release();
         }
+      } catch (valErr) {
+        logger.warn("[hanja-practice] validation failed, returning unvalidated", { err: valErr?.message });
       }
     }
 
     return res.json({
       ok: true,
-      hanja_character_id: hanjaCharacterId,
-      total_words: headwords.length,
-      covered_words: coveredWords.size,
-      generated_for: uncoveredWords.length,
-      sentences: foundSentences,
+      practice_sentences: generated,
     });
   } catch (err) {
-    console.error("hanja practice-session POST failed:", err);
+    logger.error("[hanja-practice] practice-session POST failed", { err: err?.message, stack: err?.stack });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
