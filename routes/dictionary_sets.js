@@ -446,8 +446,9 @@ Include the practiced word in the source_words array for each sentence.`;
       }
     }
 
-    // 5. Combine: existing sentences first, then generated
-    const allSentences = [...foundSentences, ...generated];
+    // 5. Combine: existing sentences first, then generated (cap at 20)
+    const MAX_SENTENCES = 20;
+    const allSentences = [...foundSentences, ...generated].slice(0, MAX_SENTENCES);
 
     return res.json({
       ok: true,
