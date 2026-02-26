@@ -345,13 +345,20 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     }
 
     // 4. Build context text for the shared generation utility
-    const contextText = `Hanja character: ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
+    // IMPORTANT: The generic prompt says "N sentences per type". We explicitly
+    // tell it this is ONE type so it doesn't multiply count × number of words.
+    const contextText = `Hanja vocabulary practice — ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
 
-Words using this character: ${headwords.join(", ")}
+This is a SINGLE practice type: "한자 ${hanjaChar} vocabulary".
+Use this as the group_label for ALL sentences.
 
-Generate practice sentences that naturally use these vocabulary words.
-Each sentence should demonstrate the meaning of one of these hanja-derived words in everyday context.
-For each sentence, include the source_word it practices in the source_words array.`;
+Vocabulary words to practice: ${headwords.join(", ")}
+These words all share the hanja character ${hanjaChar}.
+
+Spread the sentences across these vocabulary words — each sentence should
+naturally use one of the words above in everyday context.
+For each sentence, put the word it practices in the source_words array.
+Do NOT create separate types per word — this is one group.`;
 
     // 5. Generate via shared utility (same pipeline as practice-lists)
     const genResult = await generatePracticeSentences({
