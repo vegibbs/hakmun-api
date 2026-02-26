@@ -345,29 +345,30 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     }
 
     // 4. Build context text for the shared generation utility
-    // IMPORTANT: The generic prompt says "N sentences per type". We explicitly
-    // tell it this is ONE type so it doesn't multiply count × number of words.
-    const contextText = `Hanja vocabulary practice — ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
+    // The generic prompt generates N sentences "per type". Each word is a type.
+    const wordLines = headwords.map(w => `- ${w}`).join("\n");
+    const contextText = `Hanja vocabulary practice — character ${hanjaChar} (${hanjaReading} — ${hanjaGloss})
 
-This is a SINGLE practice type: "한자 ${hanjaChar} vocabulary".
-Use this as the group_label for ALL sentences.
+The following vocabulary words all share the hanja character ${hanjaChar}.
+Each word is a separate practice type — use the word itself as the group_label.
 
-Vocabulary words to practice: ${headwords.join(", ")}
-These words all share the hanja character ${hanjaChar}.
+Words (one type per word):
+${wordLines}
 
-Spread the sentences across these vocabulary words — each sentence should
-naturally use one of the words above in everyday context.
-For each sentence, put the word it practices in the source_words array.
-Do NOT create separate types per word — this is one group.`;
+For each word, generate sentences that naturally use it in everyday context.
+Include the practiced word in the source_words array for each sentence.`;
 
     // 5. Generate via shared utility (same pipeline as practice-lists)
+    // Hanja generates N sentences × up to 10 words, so allow 90s per LLM call
+    const LLM_TIMEOUT = 90_000;
     const genResult = await generatePracticeSentences({
       text: contextText,
       cefrLevel,
       glossLang: "en",
       count,
       perspective,
-      politeness
+      politeness,
+      timeoutMs: LLM_TIMEOUT
     });
 
     const generated = genResult.sentences || [];
@@ -375,7 +376,7 @@ Do NOT create separate types per word — this is one group.`;
     // 6. Validate for naturalness (second LLM pass)
     if (generated.length > 0) {
       try {
-        const valResult = await validatePracticeSentences(generated, "en");
+        const valResult = await validatePracticeSentences(generated, "en", LLM_TIMEOUT);
         const validations = valResult.validations || [];
         for (const v of validations) {
           const idx = v.index - 1;

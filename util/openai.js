@@ -228,7 +228,7 @@ function buildPrompt({ text, importAs, profile, glossLang, canonicalPatterns }) 
   return buildLegacyPrompt({ text, importAs });
 }
 
-async function callOpenAIOnce(prompt) {
+async function callOpenAIOnce(prompt, timeoutMs) {
   const url = "https://api.openai.com/v1/chat/completions";
 
   return withTimeout(async (signal) => {
@@ -261,7 +261,7 @@ async function callOpenAIOnce(prompt) {
     }
 
     return content;
-  }, REQUEST_TIMEOUT_MS);
+  }, timeoutMs || REQUEST_TIMEOUT_MS);
 }
 
 function parseAndValidate(jsonText, profile) {
@@ -605,7 +605,7 @@ function parseValidationResult(jsonText) {
  * @param {number} [opts.count=5] - Sentences per type
  * @returns {Object} { sentences: [...] }
  */
-async function generatePracticeSentences({ text, cefrLevel, glossLang, count, perspective, politeness }) {
+async function generatePracticeSentences({ text, cefrLevel, glossLang, count, perspective, politeness, timeoutMs }) {
   if (typeof text !== "string" || !text.trim()) {
     return { sentences: [] };
   }
@@ -615,7 +615,7 @@ async function generatePracticeSentences({ text, cefrLevel, glossLang, count, pe
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const raw = await callOpenAIOnce(prompt);
+      const raw = await callOpenAIOnce(prompt, timeoutMs);
       return parseGenerationResult(raw);
     } catch (err) {
       lastError = err;
@@ -637,7 +637,7 @@ async function generatePracticeSentences({ text, cefrLevel, glossLang, count, pe
  * @param {string} [glossLang="en"] - Language for issue explanations
  * @returns {Object} { validations: [...] }
  */
-async function validatePracticeSentences(sentences, glossLang) {
+async function validatePracticeSentences(sentences, glossLang, timeoutMs) {
   if (!Array.isArray(sentences) || sentences.length === 0) {
     return { validations: [] };
   }
@@ -647,7 +647,7 @@ async function validatePracticeSentences(sentences, glossLang) {
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const raw = await callOpenAIOnce(prompt);
+      const raw = await callOpenAIOnce(prompt, timeoutMs);
       return parseValidationResult(raw);
     } catch (err) {
       lastError = err;
