@@ -248,4 +248,40 @@ router.get("/v1/dictionary/sets/:set_id/items", requireSession, async (req, res)
   }
 });
 
+// GET /v1/hanja/:id/words
+// Returns 5-10 Korean words that contain the given hanja character.
+router.get("/v1/hanja/:id/words", requireSession, async (req, res) => {
+  try {
+    const hanjaCharacterId = req.params.id;
+    const sql = `
+      SELECT
+        ne.headword,
+        ne.pos_ko,
+        ns.definition_ko,
+        nst.trans_word AS meaning_en
+      FROM nikl_entry_hanja_link l
+      JOIN nikl_entries ne
+        ON ne.provider = l.provider
+       AND ne.provider_target_code = l.provider_target_code
+      LEFT JOIN nikl_senses ns
+        ON ns.provider = ne.provider
+       AND ns.provider_target_code = ne.provider_target_code
+       AND ns.sense_no = 1
+      LEFT JOIN nikl_sense_translations nst
+        ON nst.provider = ns.provider
+       AND nst.provider_target_code = ns.provider_target_code
+       AND nst.sense_no = ns.sense_no
+       AND nst.lang = 'en'
+      WHERE l.hanja_character_id = $1
+      ORDER BY ne.headword
+      LIMIT 10
+    `;
+    const { rows } = await dbQuery(sql, [hanjaCharacterId]);
+    return res.json({ ok: true, hanja_character_id: hanjaCharacterId, words: rows || [] });
+  } catch (err) {
+    console.error("hanja words GET failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
 module.exports = router;
