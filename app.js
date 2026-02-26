@@ -94,6 +94,7 @@ app.use(require("./routes/classes"));
 app.use(require("./routes/grammar_patterns_admin"));
 app.use(require("./routes/unmatched_vocab_admin"));
 app.use(require("./routes/vocab_builder"));
+app.use(require("./routes/vocab_images"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
