@@ -389,12 +389,14 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     // 4. Generate via AI only for words without existing sentences
     let generated = [];
     if (uncoveredWords.length > 0) {
-      // Fetch user CEFR level
+      // Fetch user CEFR level range
       let cefrLevel = "A1";
+      let cefrTarget = null;
       try {
         const { pool: p } = db;
-        const uR = await p.query(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]);
+        const uR = await p.query(`SELECT cefr_current, cefr_target FROM users WHERE user_id = $1::uuid`, [userId]);
         cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
+        cefrTarget = uR.rows?.[0]?.cefr_target || null;
       } catch (e) {
         logger.warn("[hanja-practice] cefr fetch failed, defaulting to A1", { err: e?.message });
       }
@@ -416,6 +418,7 @@ Include the practiced word in the source_words array for each sentence.`;
       const genResult = await generatePracticeSentences({
         text: contextText,
         cefrLevel,
+        cefrTarget,
         glossLang: "en",
         count,
         perspective,

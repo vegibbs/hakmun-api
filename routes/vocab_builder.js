@@ -363,9 +363,11 @@ router.post("/v1/vocab/practice-session", requireSession, async (req, res) => {
     let generated = [];
     if (uncoveredWords.length > 0) {
       let cefrLevel = "A1";
+      let cefrTarget = null;
       try {
-        const uR = await dbQuery(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]);
+        const uR = await dbQuery(`SELECT cefr_current, cefr_target FROM users WHERE user_id = $1::uuid`, [userId]);
         cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
+        cefrTarget = uR.rows?.[0]?.cefr_target || null;
       } catch (e) {
         logger.warn("[vocab-builder] cefr fetch failed, defaulting to A1", { err: e?.message });
       }
@@ -385,6 +387,7 @@ Include the practiced word in the source_words array for each sentence.`;
       const genResult = await generatePracticeSentences({
         text: contextText,
         cefrLevel,
+        cefrTarget,
         glossLang: "en",
         count,
         perspective,

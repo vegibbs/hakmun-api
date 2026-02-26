@@ -393,18 +393,23 @@ async function analyzeTextForImport(arg1, arg2 = "all", arg3 = null) {
 // Practice sentence generation & validation
 // ---------------------------------------------------------------------------
 
-function buildPracticeGenerationPrompt({ text, cefrLevel, glossLang, count, perspective, politeness }) {
+function buildPracticeGenerationPrompt({ text, cefrLevel, cefrTarget, glossLang, count, perspective, politeness }) {
   const lang = (glossLang || "en").trim() || "en";
-  const cefr = (cefrLevel || "A1").trim();
+  const cefrMin = (cefrLevel || "A1").trim();
+  const cefrMax = (cefrTarget || "").trim();
   const n = count || 5;
   const pov = perspective || "first_person";
   const pol = politeness || "해요체";
+
+  const cefrDesc = cefrMax && cefrMax !== cefrMin
+    ? `The student's current CEFR level is ${cefrMin} and their target level is ${cefrMax}.\nGenerate sentences that range from ${cefrMin} to ${cefrMax} — mostly at or slightly above ${cefrMin} to stretch the student toward ${cefrMax}.`
+    : `The student's current CEFR level is ${cefrMin}.`;
 
   return `You are a Korean language teaching assistant creating practice sentences for a student.
 
 CONTEXT:
 The student's teacher wrote the following notes during a recent Korean lesson.
-The student's current CEFR level is ${cefr}.
+${cefrDesc}
 Your job is to generate practice sentences that reinforce the vocabulary, grammar patterns,
 and topics found in these lesson notes — exactly the way the teacher intended them to be practiced.
 
@@ -427,7 +432,7 @@ UNDERSTANDING THE NOTES:
 
 GENERATION RULES:
 1. Each sentence MUST be a complete, natural Korean sentence a native speaker would actually say.
-2. Target ${cefr} CEFR level — use vocabulary and grammar appropriate for this level.
+2. Target ${cefrMax && cefrMax !== cefrMin ? `${cefrMin}–${cefrMax}` : cefrMin} CEFR level — use vocabulary and grammar appropriate for this range.
    - A1-A2: Simple present/past, 요-form (해요체), basic connectors (-고, -어서), everyday topics.
    - B1-B2: Compound sentences, indirect speech, conditional (-면), causative, varied tenses.
    - C1-C2: Nuanced connectors (-는 바람에, -더니), formal/informal register mixing, idiomatic expressions.
@@ -600,17 +605,18 @@ function parseValidationResult(jsonText) {
  *
  * @param {Object} opts
  * @param {string} opts.text - The teacher's lesson notes (highlighted text)
- * @param {string} opts.cefrLevel - Student's CEFR level (e.g., "A2")
+ * @param {string} opts.cefrLevel - Student's current CEFR level (e.g., "A2")
+ * @param {string} [opts.cefrTarget] - Student's target CEFR level (e.g., "B1")
  * @param {string} [opts.glossLang="en"] - Translation language
  * @param {number} [opts.count=5] - Sentences per type
  * @returns {Object} { sentences: [...] }
  */
-async function generatePracticeSentences({ text, cefrLevel, glossLang, count, perspective, politeness, timeoutMs }) {
+async function generatePracticeSentences({ text, cefrLevel, cefrTarget, glossLang, count, perspective, politeness, timeoutMs }) {
   if (typeof text !== "string" || !text.trim()) {
     return { sentences: [] };
   }
 
-  const prompt = buildPracticeGenerationPrompt({ text: text.trim(), cefrLevel, glossLang, count, perspective, politeness });
+  const prompt = buildPracticeGenerationPrompt({ text: text.trim(), cefrLevel, cefrTarget, glossLang, count, perspective, politeness });
 
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

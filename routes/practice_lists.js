@@ -52,15 +52,17 @@ router.post("/v1/practice-lists/generate", requireSession, async (req, res) => {
       return res.status(400).json({ ok: false, error: "GOOGLE_DOC_URL_REQUIRED" });
     }
 
-    // Fetch user CEFR level
+    // Fetch user CEFR level range
     let cefrLevel = "A1";
+    let cefrTarget = null;
     try {
       const uR = await withTimeout(
-        pool.query(`SELECT cefr_current FROM users WHERE user_id = $1::uuid`, [userId]),
+        pool.query(`SELECT cefr_current, cefr_target FROM users WHERE user_id = $1::uuid`, [userId]),
         QUERY_TIMEOUT_MS,
         "db-fetch-cefr"
       );
       cefrLevel = uR.rows?.[0]?.cefr_current || "A1";
+      cefrTarget = uR.rows?.[0]?.cefr_target || null;
     } catch (e) {
       logger.warn("[practice-lists] cefr fetch failed, defaulting to A1", { err: e?.message });
     }
@@ -374,6 +376,7 @@ router.post("/v1/practice-lists/generate", requireSession, async (req, res) => {
       const genResult = await generatePracticeSentences({
         text: selectedText,
         cefrLevel,
+        cefrTarget,
         glossLang: "en",
         count,
         perspective,
