@@ -799,6 +799,63 @@ router.get("/v1/documents/:documentId/sessions", requireSession, async (req, res
 });
 
 // ------------------------------------------------------------------
+// GET /v1/documents/:documentId/vocab
+// Returns vocabulary linked to a specific document (owner-scoped).
+// Joins through teaching_vocab for definitions and vocab_glosses for English glosses.
+// Optional query params: session_date_from, session_date_to
+// ------------------------------------------------------------------
+router.get("/v1/documents/:documentId/vocab", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const documentId = req.params.documentId;
+    if (!documentId) return res.status(400).json({ ok: false, error: "DOCUMENT_ID_REQUIRED" });
+
+    const sessionDateFrom = req.query?.session_date_from || null;
+    const sessionDateTo = req.query?.session_date_to || null;
+
+    const params = [userId, documentId];
+    let dateFilter = "";
+
+    if (sessionDateFrom) {
+      params.push(sessionDateFrom);
+      dateFilter += ` AND dvl.session_date >= $${params.length}::date`;
+    }
+    if (sessionDateTo) {
+      params.push(sessionDateTo);
+      dateFilter += ` AND dvl.session_date <= $${params.length}::date`;
+    }
+
+    const sql = `
+      SELECT DISTINCT ON (dvl.lemma, dvl.session_date)
+        dvl.lemma,
+        dvl.session_date,
+        tv.part_of_speech,
+        tv.cefr_level,
+        tv.image_url,
+        uvi.status AS user_status,
+        vg.gloss
+      FROM document_vocab_links dvl
+      JOIN documents d ON d.document_id = dvl.document_id
+      LEFT JOIN teaching_vocab tv ON tv.lemma = dvl.lemma
+      LEFT JOIN vocab_glosses vg ON vg.lemma = dvl.lemma AND vg.language = 'en'
+      LEFT JOIN user_vocab_items uvi ON uvi.lemma = dvl.lemma AND uvi.user_id = $1::uuid
+      WHERE dvl.document_id = $2::uuid
+        AND d.owner_user_id = $1::uuid
+        ${dateFilter}
+      ORDER BY dvl.lemma, dvl.session_date, tv.lemma
+    `;
+
+    const { rows } = await dbQuery(sql, params);
+    return res.json({ ok: true, items: rows || [] });
+  } catch (err) {
+    console.error("document vocab list failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ------------------------------------------------------------------
 // GET /v1/grammar-patterns
 // Returns all active grammar patterns from the canonical grammar_patterns table.
 // ------------------------------------------------------------------
