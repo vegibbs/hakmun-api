@@ -833,13 +833,12 @@ router.get("/v1/documents/:documentId/vocab", requireSession, async (req, res) =
         dvl.session_date,
         tv.part_of_speech,
         tv.cefr_level,
-        tv.image_url,
         uvi.status AS user_status,
-        vg.gloss
+        vg.text AS gloss
       FROM document_vocab_links dvl
       JOIN documents d ON d.document_id = dvl.document_id
       LEFT JOIN teaching_vocab tv ON tv.lemma = dvl.lemma
-      LEFT JOIN vocab_glosses vg ON vg.lemma = dvl.lemma AND vg.language = 'en'
+      LEFT JOIN vocab_glosses vg ON vg.vocab_id = tv.id AND vg.language = 'en' AND vg.is_primary = true
       LEFT JOIN user_vocab_items uvi ON uvi.lemma = dvl.lemma AND uvi.user_id = $1::uuid
       WHERE dvl.document_id = $2::uuid
         AND d.owner_user_id = $1::uuid
