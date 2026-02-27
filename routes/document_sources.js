@@ -238,6 +238,10 @@ router.post("/v1/documents/sources", requireSession, async (req, res) => {
     return res.json({ ok: true, source: upsertR.rows?.[0] || null });
   } catch (err) {
     const msg = String(err?.message || err);
+    if (err?.code === "GOOGLE_DOCS_GET_FAILED" || msg.includes("GOOGLE_DOCS_GET_FAILED")) {
+      logger.error("[document-sources] upsert failed", { err: msg });
+      return res.status(400).json({ ok: false, error: "GOOGLE_RECONNECT_REQUIRED" });
+    }
     logger.error("[document-sources] upsert failed", { err: msg });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
