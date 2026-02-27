@@ -114,11 +114,41 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       shareCity: req.user.shareCity,
       shareCountry: req.user.shareCountry,
       cefrCurrent: req.user.cefrCurrent,
-      cefrTarget: req.user.cefrTarget
+      cefrTarget: req.user.cefrTarget,
+
+      // Terms of Service acceptance
+      acceptedTosVersion: req.user.acceptedTosVersion || null
     });
   } catch (err) {
     logger.error("/v1/session/whoami failed", { rid: req._rid, err: err?.message || String(err) });
     return res.status(500).json({ error: "whoami failed" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/session/accept-terms
+------------------------------------------------------------------ */
+router.post("/v1/session/accept-terms", requireSession, async (req, res) => {
+  try {
+    const version = req.body?.version;
+    if (!version || String(version).trim() === "") {
+      return res.status(400).json({ error: "version is required" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET accepted_tos_version = $1, accepted_tos_at = now()
+       WHERE user_id = $2`,
+      [String(version).trim(), req.user.userID]
+    );
+
+    return res.json({ ok: true, acceptedTosVersion: String(version).trim() });
+  } catch (err) {
+    logger.error("/v1/session/accept-terms failed", {
+      rid: req._rid,
+      err: err?.message || String(err)
+    });
+    return res.status(500).json({ error: "accept-terms failed" });
   }
 });
 

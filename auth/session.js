@@ -257,7 +257,8 @@ async function getUserState(userID) {
            customize_learning, share_progress_default, allow_teacher_adjust_default,
            location_city, location_country, share_city, share_country,
            location_lat, location_lon,
-           cefr_current, cefr_target
+           cefr_current, cefr_target,
+           accepted_tos_version
     from users
     where user_id = $1
     limit 1
@@ -369,7 +370,8 @@ async function requireSession(req, res, next) {
       shareCity: Boolean(state.share_city),
       shareCountry: Boolean(state.share_country),
       cefrCurrent: state.cefr_current || "A1",
-      cefrTarget: state.cefr_target || null
+      cefrTarget: state.cefr_target || null,
+      acceptedTosVersion: state.accepted_tos_version || null
     };
 
     const { entitlements, capabilities } = computeEntitlementsFromUser(user);
