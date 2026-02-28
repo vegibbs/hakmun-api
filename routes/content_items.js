@@ -19,6 +19,7 @@ const router = express.Router();
 
 const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
+const { signImageUrls } = require("../util/s3");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
@@ -833,6 +834,7 @@ router.get("/v1/documents/:documentId/vocab", requireSession, async (req, res) =
         dvl.session_date,
         tv.part_of_speech,
         tv.cefr_level,
+        tv.image_s3_key,
         uvi.status AS user_status,
         vg.text AS gloss
       FROM document_vocab_links dvl
@@ -847,6 +849,7 @@ router.get("/v1/documents/:documentId/vocab", requireSession, async (req, res) =
     `;
 
     const { rows } = await dbQuery(sql, params);
+    await signImageUrls(rows);
     return res.json({ ok: true, items: rows || [] });
   } catch (err) {
     console.error("document vocab list failed:", err);

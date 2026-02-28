@@ -11,6 +11,7 @@ const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
 const { generatePracticeSentences, validatePracticeSentences } = require("../util/openai");
 const { logger } = require("../util/log");
+const { signImageUrl, signImageUrls } = require("../util/s3");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
@@ -43,6 +44,7 @@ router.get("/v1/vocab/search", requireSession, async (req, res) => {
         tv.part_of_speech AS pos_ko,
         tv.pos_code,
         tv.cefr_level,
+        tv.image_s3_key,
         ne.word_type_ko,
         neh.hanja_text
       FROM teaching_vocab tv
@@ -69,6 +71,7 @@ router.get("/v1/vocab/search", requireSession, async (req, res) => {
 
     const { rows } = await dbQuery(sql, [`%${q}%`, q, `${q}%`, limit]);
 
+    await signImageUrls(rows);
     return res.json({ ok: true, results: rows });
   } catch (err) {
     logger.error("[vocab-builder] search failed", { err: err?.message });
@@ -95,6 +98,7 @@ router.get("/v1/vocab/:id/detail", requireSession, async (req, res) => {
         tv.pos_code,
         tv.cefr_level,
         tv.level,
+        tv.image_s3_key,
         vg.text AS gloss_en,
         ne.word_type_ko,
         ne.word_grade_ko,
@@ -191,6 +195,8 @@ router.get("/v1/vocab/:id/detail", requireSession, async (req, res) => {
       }
     }
 
+    const image_url = await signImageUrl(core.image_s3_key);
+
     return res.json({
       ok: true,
       vocab_id: core.vocab_id,
@@ -200,6 +206,7 @@ router.get("/v1/vocab/:id/detail", requireSession, async (req, res) => {
       pos_code: core.pos_code,
       cefr_level: core.cefr_level,
       level: core.level,
+      image_url,
       word_type_ko: core.word_type_ko,
       word_grade_ko: core.word_grade_ko,
       hanja_text: core.hanja_text,

@@ -10,6 +10,7 @@ const router = express.Router();
 
 const { requireSession } = require("../auth/session");
 const db = require("../db/pool");
+const { signImageUrls } = require("../util/s3");
 
 function getUserId(req) {
   return req.user?.userID || req.userID || req.user?.user_id || null;
@@ -43,6 +44,7 @@ router.get("/v1/me/vocab", requireSession, async (req, res) => {
         tv.part_of_speech,
         tv.pos_code,
         tv.pos_label,
+        tv.image_s3_key,
         vg.text AS gloss_en
 
       FROM user_vocab_items uvi
@@ -59,6 +61,7 @@ router.get("/v1/me/vocab", requireSession, async (req, res) => {
     `;
 
     const { rows } = await dbQuery(sql, [userId]);
+    await signImageUrls(rows);
     return res.json({ ok: true, items: rows || [] });
   } catch (err) {
     console.error("my vocab GET failed:", err);

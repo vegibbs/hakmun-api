@@ -1,31 +1,16 @@
 // routes/vocab_images.js — Vocab image review endpoints
 
 const express = require("express");
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
 const { requireSession } = require("../auth/session");
+const { makeS3Client, bucketName, signImageUrl } = require("../util/s3");
+const { GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const router = express.Router();
 const QUERY_TIMEOUT_MS = 8000;
-
-function makeS3Client() {
-  return new S3Client({
-    endpoint: process.env.OBJECT_STORAGE_ENDPOINT,
-    region: process.env.OBJECT_STORAGE_REGION || "auto",
-    credentials: {
-      accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID,
-      secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY,
-    },
-    forcePathStyle: true,
-  });
-}
-
-function bucketName() {
-  return process.env.OBJECT_STORAGE_BUCKET;
-}
 
 /* ------------------------------------------------------------------
    GET /v1/vocab-images/batches
@@ -137,7 +122,7 @@ router.patch("/v1/vocab-images/:id/status", requireSession, async (req, res) => 
         `UPDATE vocab_image_assets
          SET status = $1, reviewed_at = CASE WHEN $1 = 'pending' THEN NULL ELSE NOW() END
          WHERE id = $2
-         RETURNING id, status`,
+         RETURNING id, vocab_id, s3_key, status`,
         [status, imageId]
       ),
       QUERY_TIMEOUT_MS,
@@ -148,7 +133,35 @@ router.patch("/v1/vocab-images/:id/status", requireSession, async (req, res) => 
       return res.status(404).json({ error: "image not found" });
     }
 
-    return res.json(r.rows[0]);
+    // Sync teaching_vocab.image_s3_key
+    const row = r.rows[0];
+    if (status === "approved") {
+      await pool.query(
+        `UPDATE teaching_vocab SET image_s3_key = $1 WHERE id = $2`,
+        [row.s3_key, row.vocab_id]
+      );
+    } else {
+      // If rejecting/resetting the current canonical image, clear or replace it
+      const current = await pool.query(
+        `SELECT image_s3_key FROM teaching_vocab WHERE id = $1`,
+        [row.vocab_id]
+      );
+      if (current.rows[0]?.image_s3_key === row.s3_key) {
+        // Try to find another approved image for this vocab
+        const alt = await pool.query(
+          `SELECT s3_key FROM vocab_image_assets
+           WHERE vocab_id = $1 AND status = 'approved' AND id != $2
+           ORDER BY reviewed_at DESC NULLS LAST LIMIT 1`,
+          [row.vocab_id, row.id]
+        );
+        await pool.query(
+          `UPDATE teaching_vocab SET image_s3_key = $1 WHERE id = $2`,
+          [alt.rows[0]?.s3_key || null, row.vocab_id]
+        );
+      }
+    }
+
+    return res.json({ id: row.id, status: row.status });
   } catch (err) {
     logger.error("[vocab-images] status update failed", { err: String(err?.message || err) });
     return res.status(500).json({ error: "failed to update status" });
@@ -179,12 +192,42 @@ router.patch("/v1/vocab-images/batch/:batch_number/status", requireSession, asyn
       pool.query(
         `UPDATE vocab_image_assets
          SET status = $1, reviewed_at = CASE WHEN $1 = 'pending' THEN NULL ELSE NOW() END
-         ${whereClause}`,
+         ${whereClause}
+         RETURNING vocab_id, s3_key`,
         [status, batchNumber]
       ),
       QUERY_TIMEOUT_MS,
       "db-vocab-image-batch-status"
     );
+
+    // Sync teaching_vocab.image_s3_key for affected words
+    if (r.rowCount > 0 && status === "approved") {
+      const vocabIds = [...new Set(r.rows.map((row) => row.vocab_id))];
+      for (const vocabId of vocabIds) {
+        const img = r.rows.find((row) => row.vocab_id === vocabId);
+        if (img) {
+          await pool.query(
+            `UPDATE teaching_vocab SET image_s3_key = $1 WHERE id = $2`,
+            [img.s3_key, vocabId]
+          );
+        }
+      }
+    } else if (r.rowCount > 0 && status !== "approved") {
+      // Clear image_s3_key for any that matched the canonical
+      const vocabIds = [...new Set(r.rows.map((row) => row.vocab_id))];
+      for (const vocabId of vocabIds) {
+        const alt = await pool.query(
+          `SELECT s3_key FROM vocab_image_assets
+           WHERE vocab_id = $1 AND status = 'approved'
+           ORDER BY reviewed_at DESC NULLS LAST LIMIT 1`,
+          [vocabId]
+        );
+        await pool.query(
+          `UPDATE teaching_vocab SET image_s3_key = $1 WHERE id = $2`,
+          [alt.rows[0]?.s3_key || null, vocabId]
+        );
+      }
+    }
 
     return res.json({ updated: r.rowCount });
   } catch (err) {
