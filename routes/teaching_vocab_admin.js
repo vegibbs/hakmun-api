@@ -5,10 +5,19 @@
 //   POST  /v1/admin/teaching_vocab
 
 const express = require("express");
+const multer = require("multer");
 const router = express.Router();
 
 const { requireSession, requireEntitlement } = require("../auth/session");
 const db = require("../db/pool");
+const { makeS3Client, bucketName, signImageUrl, PutObjectCommand } = require("../util/s3");
+const { logger } = require("../util/log");
+const { withTimeout } = require("../util/time");
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+});
 
 function dbQuery(sql, params) {
   if (db && typeof db.query === "function") return db.query(sql, params);
@@ -44,7 +53,9 @@ const returnItemSql = `
 
     ap.gloss_en AS legacy_gloss_en,
     ap.nikl_target_code,
-    ap.nikl_sense_no
+    ap.nikl_sense_no,
+
+    tv.image_s3_key
 
   FROM teaching_vocab_split_apply_plan ap
   JOIN teaching_vocab tv
@@ -159,7 +170,9 @@ router.patch(
         return res.status(404).json({ ok: false, error: "NOT_FOUND_AFTER_UPDATE" });
       }
 
-      return res.json(rows[0]);
+      const item = rows[0];
+      item.image_url = await signImageUrl(item.image_s3_key);
+      return res.json(item);
     } catch (err) {
       console.error("teaching vocab PATCH failed:", err);
       return res.status(500).json({ ok: false, error: "INTERNAL" });
@@ -291,10 +304,113 @@ router.post(
         return res.status(500).json({ ok: false, error: "CREATED_BUT_NOT_FOUND" });
       }
 
-      return res.status(201).json(rows[0]);
+      const item = rows[0];
+      item.image_url = await signImageUrl(item.image_s3_key);
+      return res.status(201).json(item);
     } catch (err) {
       console.error("teaching vocab POST failed:", err);
       return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
+
+// PUT /v1/admin/teaching_vocab/:vocab_id/image — upload/replace vocab image
+router.put(
+  "/v1/admin/teaching_vocab/:vocab_id/image",
+  requireSession,
+  requireEntitlement("approver:content"),
+  imageUpload.single("image"),
+  async (req, res) => {
+    try {
+      const vocabId = req.params.vocab_id;
+      if (!looksLikeUUID(vocabId)) {
+        return res.status(400).json({ ok: false, error: "INVALID_VOCAB_ID" });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ ok: false, error: "IMAGE_REQUIRED" });
+      }
+
+      const mime = String(req.file.mimetype || "").toLowerCase();
+      if (!["image/jpeg", "image/png", "image/webp"].includes(mime)) {
+        return res.status(400).json({ ok: false, error: "INVALID_IMAGE_TYPE" });
+      }
+
+      // Verify the vocab exists
+      const { rows: tvRows } = await dbQuery(
+        `SELECT id FROM teaching_vocab WHERE id = $1::uuid`,
+        [vocabId]
+      );
+      if (tvRows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+      const s3Key = `vocab-images/${vocabId}.${ext}`;
+
+      const s3 = makeS3Client();
+      await withTimeout(
+        s3.send(
+          new PutObjectCommand({
+            Bucket: bucketName(),
+            Key: s3Key,
+            Body: req.file.buffer,
+            ContentType: mime,
+            CacheControl: "no-store",
+          })
+        ),
+        15000,
+        "s3-put-vocab-image"
+      );
+
+      await dbQuery(
+        `UPDATE teaching_vocab SET image_s3_key = $1 WHERE id = $2::uuid`,
+        [s3Key, vocabId]
+      );
+
+      const imageUrl = await signImageUrl(s3Key);
+
+      logger.info("[teaching-vocab-admin] image uploaded", {
+        vocabId,
+        s3Key,
+        bytes: req.file.size,
+      });
+
+      return res.json({ ok: true, image_url: imageUrl });
+    } catch (err) {
+      logger.error("[teaching-vocab-admin] image upload failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
+    }
+  }
+);
+
+// DELETE /v1/admin/teaching_vocab/:vocab_id/image — remove vocab image
+router.delete(
+  "/v1/admin/teaching_vocab/:vocab_id/image",
+  requireSession,
+  requireEntitlement("approver:content"),
+  async (req, res) => {
+    try {
+      const vocabId = req.params.vocab_id;
+      if (!looksLikeUUID(vocabId)) {
+        return res.status(400).json({ ok: false, error: "INVALID_VOCAB_ID" });
+      }
+
+      await dbQuery(
+        `UPDATE teaching_vocab SET image_s3_key = NULL WHERE id = $1::uuid`,
+        [vocabId]
+      );
+
+      logger.info("[teaching-vocab-admin] image removed", { vocabId });
+
+      return res.json({ ok: true });
+    } catch (err) {
+      logger.error("[teaching-vocab-admin] image delete failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "DELETE_FAILED" });
     }
   }
 );
