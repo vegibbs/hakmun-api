@@ -44,7 +44,8 @@ async function buildProfileResponse(userID) {
             customize_learning, share_progress_default, allow_teacher_adjust_default,
             location_city, location_country, location_lat, location_lon,
             share_city, share_country,
-            cefr_current, cefr_target
+            cefr_current, cefr_target,
+            accepted_tos_version
      FROM users WHERE user_id = $1 LIMIT 1`,
     [userID]
   );
@@ -59,6 +60,16 @@ async function buildProfileResponse(userID) {
   };
   const { entitlements, capabilities } = computeEntitlementsFromUser(freshUser);
 
+  // Load per-user feature flags
+  const { rows: flagRows } = await pool.query(
+    `SELECT flag_key, enabled FROM user_feature_flags WHERE user_id = $1`,
+    [userID]
+  );
+  const featureFlags = {};
+  for (const row of flagRows) {
+    featureFlags[row.flag_key] = row.enabled;
+  }
+
   return {
     userID,
     role: freshUser.role,
@@ -68,6 +79,7 @@ async function buildProfileResponse(userID) {
     isActive: freshUser.isActive,
     entitlements,
     capabilities,
+    featureFlags,
     profileComplete,
     primaryHandle,
     username: primaryHandle,
@@ -85,7 +97,8 @@ async function buildProfileResponse(userID) {
     shareCity: Boolean(u.share_city),
     shareCountry: Boolean(u.share_country),
     cefrCurrent: u.cefr_current || "A1",
-    cefrTarget: u.cefr_target || null
+    cefrTarget: u.cefr_target || null,
+    acceptedTosVersion: u.accepted_tos_version || null
   };
 }
 
