@@ -69,9 +69,9 @@ async function main() {
     );
     const appliedSet = new Set(applied.map(r => r.filename));
 
-    // Load migration files
+    // Load migration files (.sql and .js both supported)
     const files = fs.readdirSync(MIGRATIONS_DIR)
-      .filter(f => f.endsWith('.sql') && !fs.statSync(path.join(MIGRATIONS_DIR, f)).isDirectory())
+      .filter(f => (f.endsWith('.sql') || f.endsWith('.js')) && !fs.statSync(path.join(MIGRATIONS_DIR, f)).isDirectory())
       .sort();
 
     if (LIST) {
@@ -92,8 +92,8 @@ async function main() {
       }
 
       const filePath = path.join(MIGRATIONS_DIR, file);
-      const sql = fs.readFileSync(filePath, 'utf8');
-      const checksum = crypto.createHash('sha256').update(sql).digest('hex');
+      const content = fs.readFileSync(filePath, 'utf8');
+      const checksum = crypto.createHash('sha256').update(content).digest('hex');
 
       if (DRY_RUN) {
         console.log(`  [would apply] ${file}`);
@@ -104,7 +104,13 @@ async function main() {
       process.stdout.write(`  Running ${file} ... `);
       await client.query('BEGIN');
       try {
-        await client.query(sql);
+        if (file.endsWith('.js')) {
+          const mod = require(filePath);
+          if (typeof mod.up !== 'function') throw new Error(`${file} does not export an up() function`);
+          await mod.up(client);
+        } else {
+          await client.query(content);
+        }
         await client.query(
           'INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)',
           [file, checksum]
