@@ -10,8 +10,8 @@
  *   node db/migrate.js --list     # show applied/pending status
  *   node db/migrate.js --dry-run  # show what would run without running
  *
- * Requires DATABASE_URL in environment (Railway injects this automatically).
- * For local use: set DATABASE_URL in .env or export it before running.
+ * Requires DATABASE_MIGRATION_URL in environment (falls back to DATABASE_URL).
+ * Migration user needs DDL privileges; app user (DATABASE_URL) does not.
  *
  * Tracking table: schema_migrations (created automatically on first run)
  *
@@ -44,9 +44,9 @@ const LIST = args.includes('--list');
 const DRY_RUN = args.includes('--dry-run');
 
 async function main() {
-  const dbUrl = process.env.DATABASE_URL;
+  const dbUrl = process.env.DATABASE_MIGRATION_URL || process.env.DATABASE_URL;
   if (!dbUrl) {
-    console.error('ERROR: DATABASE_URL is not set.');
+    console.error('ERROR: DATABASE_MIGRATION_URL (or DATABASE_URL) is not set.');
     process.exit(1);
   }
 
