@@ -1,17 +1,50 @@
-# CLAUDE.md
+# CLAUDE.md — hakmun-api
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+**Operating model (session roles, bridge protocol, impl docs, working principles):** See `atlas-dev/CLAUDE.md` Part 1. This file covers HakMun-specific context only.
 
 ## Project Overview
 
 HakMun API is a Node.js/Express REST API backend for a Korean language learning platform. It manages authentication, vocabulary/content, Google Docs integration, and multimedia assets. Deployed on Railway with PostgreSQL.
 
+## Environments & Deploy
+
+| Branch | Railway Environment | URL |
+|--------|---------------------|-----|
+| `sandbox` | sandbox | hakmun-api-sandbox.up.railway.app |
+| `main` | production | hakmun-api-production.up.railway.app |
+
+- **Default: commit and push to `sandbox`.** Railway auto-deploys on push — target branch determines the environment.
+- To promote to production: merge `sandbox` into `main` and push `main`.
+- ccdev runs on the Hetzner server (`dev.atlasdatanav.com`), not locally.
+
+## Database Migrations
+
+Migrations live in `db/migrations/` as numbered SQL files (`NNN_description.sql`).
+The runner is `db/migrate.js` — Node.js, uses `pg`, no system dependencies.
+
+**Three hard rules:**
+1. All migration SQL must be idempotent — `IF NOT EXISTS`, `IF EXISTS` on all DDL.
+2. Create a migration → run it immediately. Never leave one unrun.
+3. `db/migrate.js` is the only authorized way to apply migrations.
+
+```bash
+npm run migrate           # run all pending
+npm run migrate:list      # show applied/pending status
+npm run migrate:dry-run   # show what would run without running
+```
+
+Migrations run automatically on every Railway deploy (start script: `node db/migrate.js && node server.js`). For local or manual runs, `DATABASE_URL` must be set — use the public proxy URL from `.env`.
+
+**Tracking:** `schema_migrations` table — one row per applied migration file.
+
+**Legacy:** `schema_change_log` is a historical record of migrations 219–246 applied before the migration system was rebuilt (2026-03-18). It is kept for reference only. Do not write to it. Do not use it to determine migration state. `db/migrate.sh.legacy` is the old bash runner — kept for reference, do not run it.
+
 ## Commands
 
 ```bash
 npm install          # Install dependencies
-node server.js       # Start server (default port 8080)
-npm start            # Same as node server.js
+npm start            # Run migrations then start server
+node server.js       # Start server only (skip migrations)
 ```
 
 **Smoke tests** (requires a running server):
@@ -82,3 +115,10 @@ Checked at boot (fail-fast): `DATABASE_URL`, `SESSION_JWT_SECRET`, `APPLE_CLIENT
 - `requireEntitlement(ent)` — Express middleware that checks JWT entitlements, sends 403
 - `looksLikeUUID(s)` — regex UUID validation used throughout
 - Structured JSON logging via `util/log.js` with debug scopes; no secrets in log output
+
+## Related Repos
+
+| Repo | What |
+|------|------|
+| `hakMun-engine` | Background workers (doc parsing, NIKL XML ingest). Shares the same Railway Postgres database. |
+| `HakMun` (Swift) | iOS app client. Connects to this API. Builds locally in Xcode — no CI pipeline. |
