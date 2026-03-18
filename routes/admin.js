@@ -6,6 +6,7 @@ const crypto = require("crypto");
 
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
+const { audit } = require("../util/audit");
 const {
   requireSession,
   requireEntitlement,
@@ -282,6 +283,7 @@ router.post(
         role,
         isActive
       });
+      await audit(req, 'admin.user_create', 'user', created.user.user_id, { primaryHandle, role, isActive });
 
       return res.json({ user: created.user });
     } catch (err) {
@@ -376,6 +378,7 @@ router.patch(
         targetUserID,
         changed: updates
       });
+      await audit(req, 'admin.user_update', 'user', targetUserID, { changed: updates });
 
       return res.json({ user: rows[0] });
     } catch (err) {
@@ -469,6 +472,7 @@ router.put(
         targetUserID,
         flags: result
       });
+      await audit(req, 'admin.user_flags_update', 'user', targetUserID, { flags: result });
 
       return res.json({ userID: targetUserID, flags: result });
     } catch (err) {
@@ -537,6 +541,7 @@ router.post(
         targetUserID,
         label
       });
+      await audit(req, 'admin.profile_link', 'user', targetUserID, { label });
 
       return res.json({ ok: true, linked: { appleSub, userID: targetUserID, label } });
     } catch (err) {
@@ -586,6 +591,7 @@ router.delete(
         actorUserID: req.user.userID,
         targetUserID
       });
+      await audit(req, 'admin.profile_unlink', 'user', targetUserID, {});
 
       return res.json({ ok: true });
     } catch (err) {

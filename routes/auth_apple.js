@@ -12,6 +12,7 @@ const { withTimeout } = require("../util/time");
 
 const { verifyAppleToken } = require("../auth/apple");
 const { issueSessionTokens, getUserState, touchLastSeen, requireSession } = require("../auth/session");
+const { audit } = require("../util/audit");
 
 const router = express.Router();
 
@@ -308,6 +309,7 @@ router.post("/v1/auth/apple", async (req, res) => {
 
     if (profiles) response.profiles = profiles;
 
+    audit(req, 'user.signin', 'user', userID, { audience }, userID).catch(() => {});
     return res.json(response);
   } catch (err) {
     const msg = String(err?.message || err);
