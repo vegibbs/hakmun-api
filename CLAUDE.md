@@ -19,7 +19,10 @@ HakMun API is a Node.js/Express REST API backend for a Korean language learning 
 
 ## Database Migrations
 
-Migrations live in `db/migrations/` as numbered SQL files (`NNN_description.sql`).
+Migrations live in `db/migrations/`. Two file types are supported:
+- **SQL** (`NNN_description.sql`) — idempotent DDL/DML, runs directly
+- **JS** (`NNN_description.js`) — exports `async up(client)` for env-var-dependent logic (e.g. creating DB users)
+
 The runner is `db/migrate.js` — Node.js, uses `pg`, no system dependencies.
 
 **Three hard rules:**
@@ -33,7 +36,7 @@ npm run migrate:list      # show applied/pending status
 npm run migrate:dry-run   # show what would run without running
 ```
 
-Migrations run automatically on every Railway deploy (start script: `node db/migrate.js && node server.js`). For local or manual runs, `DATABASE_URL` must be set — use the public proxy URL from `.env`.
+Migrations run automatically on every Railway deploy (start script: `node db/migrate.js && node server.js`). The runner uses `DATABASE_MIGRATION_URL` (superuser) with fallback to `DATABASE_URL`. Migrations require DDL privileges — the app runtime user (`hakmun_app`) does not have them.
 
 **Tracking:** `schema_migrations` table — one row per applied migration file.
 
@@ -65,7 +68,7 @@ There is no automated test suite, linter, or build step.
 
 - `auth/` — Apple Sign-In verification (`apple.js`), JWT session management and entitlements (`session.js`)
 - `db/` — PostgreSQL connection pool with SSL, timeouts, and startup fingerprinting (`pool.js`)
-- `util/` — Environment parsing with fail-fast (`env.js`), JSON logger with Better Stack shipping (`log.js`), OpenAI client wrapper (`openai.js`), timeout helpers (`time.js`)
+- `util/` — Environment parsing with fail-fast (`env.js`), JSON logger with Better Stack shipping (`log.js`), OpenAI client wrapper (`openai.js`), timeout helpers (`time.js`), audit log writer (`audit.js`)
 - `routes/` — All API route handlers, mounted under `/v1/`
 - `ops/` — Smoke test script
 
@@ -104,9 +107,26 @@ Server-side only (key never exposed). JSON-only structured output enforced. 25-s
 
 S3-compatible (AWS SDK) for audio and PDF uploads via multer. Presigned URLs for retrieval. MIME type allowlist with per-type size limits (25MB audio, 10MB PDF).
 
+## Database Security
+
+**Two DB credentials, two roles:**
+
+| Var | User | Privileges | Used by |
+|-----|------|------------|---------|
+| `DATABASE_MIGRATION_URL` | `postgres` (superuser) | DDL + DML | `db/migrate.js` at deploy time |
+| `DATABASE_URL` | `hakmun_app` | DML only (SELECT/INSERT/UPDATE/DELETE) | App at runtime |
+
+`hakmun_app` cannot CREATE/DROP tables, CREATE USERS, or modify schema. If `DATABASE_MIGRATION_URL` is not set, the runner falls back to `DATABASE_URL` (local dev only — local DB is assumed to be superuser).
+
+**Audit log:** `audit_log` table is append-only at the DB level — `hakmun_app` has INSERT only; UPDATE and DELETE are revoked. Records cannot be erased by the application. Key events logged: `user.signin`, `admin.user_create`, `admin.user_update`, `admin.user_flags_update`, `admin.profile_link`, `admin.profile_unlink`. Use `util/audit.js` for all new audit writes.
+
+**Postgres:** Internal-only (`postgres.railway.internal`). No public TCP proxy. Not reachable from outside Railway's network.
+
 ## Required Environment Variables
 
 Checked at boot (fail-fast): `DATABASE_URL`, `SESSION_JWT_SECRET`, `APPLE_CLIENT_IDS`, `NODE_ENV`, `ROOT_ADMIN_USER_IDS` (production only).
+
+Set in Railway, not required at boot: `DATABASE_MIGRATION_URL` (superuser, for migrations), `HAKMUN_APP_DB_PASSWORD` (only needed when creating the `hakmun_app` user — already done).
 
 ## Common Code Patterns
 
