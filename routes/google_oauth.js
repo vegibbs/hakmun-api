@@ -190,4 +190,22 @@ router.get("/v1/auth/google/callback", async (req, res) => {
   }
 });
 
+// DELETE /v1/auth/google/disconnect
+router.delete("/v1/auth/google/disconnect", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    await dbQuery(
+      `DELETE FROM google_oauth_connections WHERE user_id = $1::uuid`,
+      [userId]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("google oauth disconnect failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
 module.exports = router;
