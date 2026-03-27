@@ -96,6 +96,7 @@ app.use(require("./routes/unmatched_vocab_admin"));
 app.use(require("./routes/vocab_builder"));
 app.use(require("./routes/vocab_images"));
 app.use(require("./routes/numbers_drills"));
+app.use(require("./routes/songs"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)

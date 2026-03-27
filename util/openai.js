@@ -667,9 +667,90 @@ async function validatePracticeSentences(sentences, glossLang, timeoutMs) {
   throw lastError || new Error("openai_failed");
 }
 
+/**
+ * Translate Korean song lyrics into literal + natural English.
+ *
+ * @param {string[]} lines - Array of Korean lyric strings. Empty strings = stanza breaks.
+ * @param {number} [timeoutMs] - Custom timeout override
+ * @returns {Object} { lines: [{ ko, literal, natural }, ...] }
+ */
+async function translateSongLyrics(lines, timeoutMs) {
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return { lines: [] };
+  }
+
+  // Separate non-empty lines for translation; blanks pass through
+  const indexedLines = lines.map((l, i) => ({ index: i, ko: l.trim() }));
+  const nonEmpty = indexedLines.filter(l => l.ko.length > 0);
+
+  if (nonEmpty.length === 0) {
+    return { lines: lines.map(() => ({ ko: "", literal: "", natural: "" })) };
+  }
+
+  const koBlock = nonEmpty.map((l, i) => `${i + 1}. ${l.ko}`).join("\n");
+
+  const prompt = `You are a Korean-to-English translator specializing in Korean song lyrics.
+
+INPUT:
+${nonEmpty.length} numbered Korean song lyric lines.
+
+TASK:
+For each numbered line, produce:
+- "literal": a word-for-word English translation that preserves Korean word order as closely as possible (e.g., "나는 너를 사랑해" → "I you love")
+- "natural": an idiomatic English translation that reads naturally (e.g., "나는 너를 사랑해" → "I love you")
+
+RULES:
+- Return ONLY valid JSON. No markdown. No comments. No explanations.
+- The JSON must be an object with a single key "lines" containing an array.
+- Each element: { "index": <1-based number>, "literal": "...", "natural": "..." }
+- Preserve the exact order and count of lines.
+- For onomatopoeia, exclamations, or non-translatable sounds (e.g., "라라라"), keep them as-is in both fields.
+- Song lyrics can be poetic, metaphorical, or colloquial — translate the intended meaning.
+- Keep translations concise — match the brevity of the original line.
+
+LYRICS:
+${koBlock}`;
+
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const raw = await callOpenAIOnce(prompt, timeoutMs);
+      const parsed = JSON.parse(raw);
+      const translated = parsed.lines || parsed;
+
+      // Rebuild full array including blank stanza-break lines
+      const result = lines.map((original, i) => {
+        const trimmed = original.trim();
+        if (trimmed.length === 0) {
+          return { ko: "", literal: "", natural: "" };
+        }
+        // Find matching translation by original non-empty index
+        const nonEmptyIdx = nonEmpty.findIndex(l => l.index === i);
+        const t = translated[nonEmptyIdx];
+        return {
+          ko: trimmed,
+          literal: (t && t.literal) || "",
+          natural: (t && t.natural) || ""
+        };
+      });
+
+      return { lines: result };
+    } catch (err) {
+      lastError = err;
+      if (attempt < MAX_RETRIES) {
+        await sleep(500);
+        continue;
+      }
+    }
+  }
+
+  throw lastError || new Error("openai_failed");
+}
+
 module.exports = {
   analyzeTextForImport,
   callOpenAIOnce,
   generatePracticeSentences,
-  validatePracticeSentences
+  validatePracticeSentences,
+  translateSongLyrics
 };
