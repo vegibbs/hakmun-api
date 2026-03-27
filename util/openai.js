@@ -747,10 +747,201 @@ ${koBlock}`;
   throw lastError || new Error("openai_failed");
 }
 
+// ---------------------------------------------------------------------------
+// alignLyricsToAudio — Whisper-based forced alignment
+// ---------------------------------------------------------------------------
+// Takes an audio buffer and an array of Korean lyric lines.
+// Sends audio to Whisper for transcription with word-level timestamps,
+// then matches Whisper segments back to the known lyrics.
+//
+// Returns: { timings: [{ index, startMs, endMs }, ...] }
+//   - One entry per line (including stanza breaks with interpolated times)
+// ---------------------------------------------------------------------------
+
+async function alignLyricsToAudio(audioBuffer, originalFilename, lines, timeoutMs = 120_000) {
+  if (!audioBuffer || !Array.isArray(lines) || lines.length === 0) {
+    return { timings: [] };
+  }
+
+  // Build form data for Whisper API
+  const FormData = (await import("form-data")).default;
+  const form = new FormData();
+  form.append("file", audioBuffer, {
+    filename: originalFilename || "audio.m4a",
+    contentType: "audio/mp4"
+  });
+  form.append("model", "whisper-1");
+  form.append("language", "ko");
+  form.append("response_format", "verbose_json");
+  form.append("timestamp_granularities[]", "segment");
+
+  // Use the Korean lyrics as a prompt to guide Whisper alignment
+  const nonEmptyLines = lines.filter(l => l.trim().length > 0);
+  if (nonEmptyLines.length > 0) {
+    form.append("prompt", nonEmptyLines.join("\n"));
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  let whisperResult;
+  try {
+    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form,
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Whisper API error ${resp.status}: ${errText}`);
+    }
+
+    whisperResult = await resp.json();
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === "AbortError") {
+      throw new Error("openai_timeout: Whisper alignment timed out");
+    }
+    throw err;
+  }
+
+  // whisperResult.segments: [{ start, end, text }, ...]
+  const segments = whisperResult.segments || [];
+
+  // Match Whisper segments to our lyric lines using fuzzy Korean text matching.
+  // Strategy: greedily assign segments to lines in order.
+  const timings = [];
+  let segIdx = 0;
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const lineText = lines[lineIdx].trim();
+
+    // Stanza break — will be interpolated after
+    if (lineText.length === 0) {
+      timings.push({ index: lineIdx, startMs: null, endMs: null, isBreak: true });
+      continue;
+    }
+
+    // Find the best matching segment(s) for this line.
+    // A single lyric line may span multiple Whisper segments, or
+    // multiple lyric lines may fit in one segment.
+    // Greedy approach: consume segments whose text overlaps with this line.
+    let startMs = null;
+    let endMs = null;
+
+    if (segIdx < segments.length) {
+      startMs = Math.round(segments[segIdx].start * 1000);
+
+      // Consume segments until we've covered enough text or hit the next line
+      const nextLineText = findNextNonEmptyLine(lines, lineIdx + 1);
+      let consumed = segments[segIdx].text.trim();
+      endMs = Math.round(segments[segIdx].end * 1000);
+
+      // Check if this segment likely contains just this line
+      // If the next segment's text matches the next lyric line better, stop here
+      while (segIdx + 1 < segments.length) {
+        const nextSeg = segments[segIdx + 1];
+        const nextSegText = nextSeg.text.trim();
+
+        // If the next segment matches the next lyric line, stop consuming
+        if (nextLineText && koSimilarity(nextSegText, nextLineText) > 0.3) {
+          break;
+        }
+
+        // If we've consumed enough text relative to this line, stop
+        if (consumed.length >= lineText.length * 0.8) {
+          break;
+        }
+
+        segIdx++;
+        consumed += nextSegText;
+        endMs = Math.round(segments[segIdx].end * 1000);
+      }
+
+      segIdx++;
+    }
+
+    timings.push({ index: lineIdx, startMs, endMs, isBreak: false });
+  }
+
+  // Interpolate stanza break timings
+  for (let i = 0; i < timings.length; i++) {
+    if (!timings[i].isBreak) continue;
+
+    const prevEnd = findPrevEndMs(timings, i);
+    const nextStart = findNextStartMs(timings, i);
+
+    if (prevEnd !== null && nextStart !== null) {
+      timings[i].startMs = prevEnd;
+      timings[i].endMs = nextStart;
+    } else if (prevEnd !== null) {
+      timings[i].startMs = prevEnd;
+      timings[i].endMs = prevEnd + 500;
+    } else if (nextStart !== null) {
+      timings[i].startMs = Math.max(0, nextStart - 500);
+      timings[i].endMs = nextStart;
+    }
+  }
+
+  // Clean up — remove isBreak flag from output
+  return {
+    timings: timings.map(t => ({
+      index: t.index,
+      startMs: t.startMs,
+      endMs: t.endMs
+    }))
+  };
+}
+
+// Helper: find the next non-empty line text
+function findNextNonEmptyLine(lines, fromIdx) {
+  for (let i = fromIdx; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length > 0) return t;
+  }
+  return null;
+}
+
+// Helper: find the endMs of the previous timed line
+function findPrevEndMs(timings, idx) {
+  for (let i = idx - 1; i >= 0; i--) {
+    if (timings[i].endMs !== null) return timings[i].endMs;
+  }
+  return null;
+}
+
+// Helper: find the startMs of the next timed line
+function findNextStartMs(timings, idx) {
+  for (let i = idx + 1; i < timings.length; i++) {
+    if (timings[i].startMs !== null) return timings[i].startMs;
+  }
+  return null;
+}
+
+// Simple Korean text similarity (character overlap ratio)
+function koSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const sa = new Set(a.replace(/\s/g, ""));
+  const sb = new Set(b.replace(/\s/g, ""));
+  if (sa.size === 0 || sb.size === 0) return 0;
+  let overlap = 0;
+  for (const c of sa) {
+    if (sb.has(c)) overlap++;
+  }
+  return overlap / Math.max(sa.size, sb.size);
+}
+
 module.exports = {
   analyzeTextForImport,
   callOpenAIOnce,
   generatePracticeSentences,
   validatePracticeSentences,
-  translateSongLyrics
+  translateSongLyrics,
+  alignLyricsToAudio
 };
