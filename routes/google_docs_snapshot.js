@@ -566,6 +566,14 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       logger.warn("[google-snapshot] document_id lookup failed", { err: String(e.message || e) });
     }
 
+    logger.info("[google-snapshot] highlight counts", {
+      imported_texts: imported_texts.length,
+      imported_fragment_texts: imported_fragment_texts.length,
+      practice_list_texts: practice_list_texts.length,
+      fileId,
+      document_id: user_document_id
+    });
+
     return res.status(201).json({
       ok: true,
       file_id: fileId,
