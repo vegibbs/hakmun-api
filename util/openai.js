@@ -786,60 +786,77 @@ async function alignLyricsToAudio(audioBuffer, originalFilename, lines, timeoutM
   // whisperResult.segments: [{ start, end, text }, ...]
   const segments = whisperResult.segments || [];
 
-  // Match Whisper segments to our lyric lines using fuzzy Korean text matching.
-  // Strategy: greedily assign segments to lines in order.
+  // ---------- Build a character-level timeline from Whisper segments ----------
+  // Each character gets an interpolated timestamp based on its position
+  // within its segment. This lets us find precise timing for any substring.
+  const charTimeline = []; // [{ char, ms }]
+  for (const seg of segments) {
+    const text = seg.text;
+    if (!text || text.length === 0) continue;
+    const startMs = Math.round(seg.start * 1000);
+    const endMs = Math.round(seg.end * 1000);
+    const duration = endMs - startMs;
+    for (let i = 0; i < text.length; i++) {
+      charTimeline.push({
+        char: text[i],
+        ms: startMs + Math.round((i / text.length) * duration)
+      });
+    }
+  }
+
+  // Build the full Whisper transcript (stripped of spaces for matching)
+  const whisperFull = charTimeline.map(c => c.char).join("");
+  const whisperStripped = whisperFull.replace(/\s/g, "");
+
+  // Build a mapping: stripped index -> charTimeline index
+  const strippedToOriginal = [];
+  for (let i = 0; i < whisperFull.length; i++) {
+    if (!/\s/.test(whisperFull[i])) {
+      strippedToOriginal.push(i);
+    }
+  }
+
+  // ---------- Match each lyric line to a position in the timeline ----------
+  // Use sequential substring search: for each non-empty line, find the best
+  // match in the stripped Whisper text starting from where the previous line ended.
+  // This preserves order and prevents drift.
+
   const timings = [];
-  let segIdx = 0;
+  let searchFrom = 0; // position in whisperStripped to search from
 
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
     const lineText = lines[lineIdx].trim();
 
-    // Stanza break — will be interpolated after
     if (lineText.length === 0) {
       timings.push({ index: lineIdx, startMs: null, endMs: null, isBreak: true });
       continue;
     }
 
-    // Find the best matching segment(s) for this line.
-    // A single lyric line may span multiple Whisper segments, or
-    // multiple lyric lines may fit in one segment.
-    // Greedy approach: consume segments whose text overlaps with this line.
-    let startMs = null;
-    let endMs = null;
-
-    if (segIdx < segments.length) {
-      startMs = Math.round(segments[segIdx].start * 1000);
-
-      // Consume segments until we've covered enough text or hit the next line
-      const nextLineText = findNextNonEmptyLine(lines, lineIdx + 1);
-      let consumed = segments[segIdx].text.trim();
-      endMs = Math.round(segments[segIdx].end * 1000);
-
-      // Check if this segment likely contains just this line
-      // If the next segment's text matches the next lyric line better, stop here
-      while (segIdx + 1 < segments.length) {
-        const nextSeg = segments[segIdx + 1];
-        const nextSegText = nextSeg.text.trim();
-
-        // If the next segment matches the next lyric line, stop consuming
-        if (nextLineText && koSimilarity(nextSegText, nextLineText) > 0.3) {
-          break;
-        }
-
-        // If we've consumed enough text relative to this line, stop
-        if (consumed.length >= lineText.length * 0.8) {
-          break;
-        }
-
-        segIdx++;
-        consumed += nextSegText;
-        endMs = Math.round(segments[segIdx].end * 1000);
-      }
-
-      segIdx++;
+    const lineStripped = lineText.replace(/\s/g, "");
+    if (lineStripped.length === 0) {
+      timings.push({ index: lineIdx, startMs: null, endMs: null, isBreak: true });
+      continue;
     }
 
-    timings.push({ index: lineIdx, startMs, endMs, isBreak: false });
+    // Find best match position using sliding window with scoring
+    const match = findBestMatch(whisperStripped, lineStripped, searchFrom);
+
+    if (match) {
+      // Map stripped positions back to charTimeline positions
+      const origStart = strippedToOriginal[match.start];
+      const origEnd = strippedToOriginal[Math.min(match.end - 1, strippedToOriginal.length - 1)];
+
+      const startMs = charTimeline[origStart]?.ms ?? null;
+      const endMs = charTimeline[origEnd]?.ms ?? null;
+
+      timings.push({ index: lineIdx, startMs, endMs, isBreak: false });
+
+      // Advance search position past this match
+      searchFrom = match.end;
+    } else {
+      // No match found — leave timing null
+      timings.push({ index: lineIdx, startMs: null, endMs: null, isBreak: false });
+    }
   }
 
   // Interpolate stanza break timings
@@ -861,7 +878,6 @@ async function alignLyricsToAudio(audioBuffer, originalFilename, lines, timeoutM
     }
   }
 
-  // Clean up — remove isBreak flag from output
   return {
     timings: timings.map(t => ({
       index: t.index,
@@ -871,13 +887,69 @@ async function alignLyricsToAudio(audioBuffer, originalFilename, lines, timeoutM
   };
 }
 
-// Helper: find the next non-empty line text
-function findNextNonEmptyLine(lines, fromIdx) {
-  for (let i = fromIdx; i < lines.length; i++) {
-    const t = lines[i].trim();
-    if (t.length > 0) return t;
+// Find the best matching position for `needle` in `haystack` starting from `fromIdx`.
+// Uses a sliding window with character similarity scoring to handle minor
+// transcription differences (Whisper may hear slightly different characters).
+function findBestMatch(haystack, needle, fromIdx) {
+  if (needle.length === 0 || fromIdx >= haystack.length) return null;
+
+  // First try: exact substring match
+  const exactPos = haystack.indexOf(needle, fromIdx);
+  if (exactPos !== -1 && exactPos < fromIdx + haystack.length * 0.5) {
+    return { start: exactPos, end: exactPos + needle.length };
   }
-  return null;
+
+  // Second try: sliding window fuzzy match
+  // Search a reasonable window ahead (not the entire remaining text)
+  const searchEnd = Math.min(haystack.length, fromIdx + needle.length * 8);
+  let bestScore = 0;
+  let bestPos = -1;
+  const windowSize = needle.length;
+
+  for (let pos = fromIdx; pos <= searchEnd - Math.floor(windowSize * 0.5); pos++) {
+    // Try windows of similar size to the needle (±30%)
+    for (const wMult of [1.0, 0.85, 1.15, 0.7, 1.3]) {
+      const wSize = Math.round(windowSize * wMult);
+      if (pos + wSize > haystack.length) continue;
+
+      const window = haystack.substring(pos, pos + wSize);
+      const score = charMatchScore(window, needle);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestPos = pos;
+        // If we find a very good match, stop early
+        if (score > 0.85) {
+          return { start: bestPos, end: bestPos + wSize };
+        }
+      }
+    }
+  }
+
+  // Accept if score is reasonable (> 40% character match)
+  if (bestScore > 0.4 && bestPos !== -1) {
+    return { start: bestPos, end: bestPos + windowSize };
+  }
+
+  // Last resort: just advance proportionally based on position in the lyrics
+  // This prevents total failure — timing will be approximate
+  return { start: fromIdx, end: fromIdx + needle.length };
+}
+
+// Character-level match score: what fraction of characters in `a` appear in `b`
+// in roughly the right order (using longest common subsequence ratio)
+function charMatchScore(a, b) {
+  if (!a || !b) return 0;
+  // Simple: count matching characters (order-preserving)
+  let bi = 0;
+  let matches = 0;
+  for (let ai = 0; ai < a.length && bi < b.length; ai++) {
+    if (a[ai] === b[bi]) {
+      matches++;
+      bi++;
+    }
+  }
+  return matches / Math.max(a.length, b.length);
 }
 
 // Helper: find the endMs of the previous timed line
@@ -894,19 +966,6 @@ function findNextStartMs(timings, idx) {
     if (timings[i].startMs !== null) return timings[i].startMs;
   }
   return null;
-}
-
-// Simple Korean text similarity (character overlap ratio)
-function koSimilarity(a, b) {
-  if (!a || !b) return 0;
-  const sa = new Set(a.replace(/\s/g, ""));
-  const sb = new Set(b.replace(/\s/g, ""));
-  if (sa.size === 0 || sb.size === 0) return 0;
-  let overlap = 0;
-  for (const c of sa) {
-    if (sb.has(c)) overlap++;
-  }
-  return overlap / Math.max(sa.size, sb.size);
 }
 
 module.exports = {
