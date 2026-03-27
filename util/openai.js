@@ -763,53 +763,25 @@ async function alignLyricsToAudio(audioBuffer, originalFilename, lines, timeoutM
     return { timings: [] };
   }
 
-  // Build form data for Whisper API
-  const FormData = (await import("form-data")).default;
-  const form = new FormData();
-  form.append("file", audioBuffer, {
-    filename: originalFilename || "audio.m4a",
-    contentType: "audio/mp4"
-  });
-  form.append("model", "whisper-1");
-  form.append("language", "ko");
-  form.append("response_format", "verbose_json");
-  form.append("timestamp_granularities[]", "segment");
+  const OpenAI = require("openai");
+  const client = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: timeoutMs });
+
+  // Create a File object from the buffer for the SDK
+  const filename = originalFilename || "audio.m4a";
+  const file = new File([audioBuffer], filename, { type: "audio/mp4" });
 
   // Use the Korean lyrics as a prompt to guide Whisper alignment
   const nonEmptyLines = lines.filter(l => l.trim().length > 0);
-  if (nonEmptyLines.length > 0) {
-    form.append("prompt", nonEmptyLines.join("\n"));
-  }
+  const prompt = nonEmptyLines.length > 0 ? nonEmptyLines.join("\n") : undefined;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  let whisperResult;
-  try {
-    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        ...form.getHeaders()
-      },
-      body: form,
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Whisper API error ${resp.status}: ${errText}`);
-    }
-
-    whisperResult = await resp.json();
-  } catch (err) {
-    clearTimeout(timeout);
-    if (err.name === "AbortError") {
-      throw new Error("openai_timeout: Whisper alignment timed out");
-    }
-    throw err;
-  }
+  const whisperResult = await client.audio.transcriptions.create({
+    file,
+    model: "whisper-1",
+    language: "ko",
+    response_format: "verbose_json",
+    timestamp_granularities: ["segment"],
+    ...(prompt ? { prompt } : {})
+  });
 
   // whisperResult.segments: [{ start, end, text }, ...]
   const segments = whisperResult.segments || [];
