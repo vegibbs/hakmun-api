@@ -238,6 +238,10 @@ router.post("/v1/documents/sources", requireSession, async (req, res) => {
     return res.json({ ok: true, source: upsertR.rows?.[0] || null });
   } catch (err) {
     const msg = String(err?.message || err);
+    if (err?.code === "GOOGLE_NOT_CONNECTED" || msg.startsWith("google_refresh_failed:")) {
+      logger.warn("[document-sources] Google reconnect required", { err: msg });
+      return res.status(401).json({ ok: false, error: "GOOGLE_RECONNECT_REQUIRED", reconnect_hint: "/v1/auth/google/start" });
+    }
     if (err?.code === "GOOGLE_DOCS_GET_FAILED" || msg.includes("GOOGLE_DOCS_GET_FAILED")) {
       logger.error("[document-sources] upsert failed", { err: msg });
       return res.status(400).json({ ok: false, error: "GOOGLE_RECONNECT_REQUIRED" });
