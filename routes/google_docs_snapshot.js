@@ -571,7 +571,9 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       imported_fragment_texts: imported_fragment_texts.length,
       practice_list_texts: practice_list_texts.length,
       fileId,
-      document_id: user_document_id
+      document_id: user_document_id,
+      sample_imported: imported_texts.slice(0, 5),
+      sample_fragments: imported_fragment_texts.slice(0, 3)
     });
 
     return res.status(201).json({
