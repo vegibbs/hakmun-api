@@ -26,37 +26,42 @@ router.get("/v1/daily-sentence", requireSession, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD in UTC
 
-    // 1. Check for teacher override
-    const overrideR = await dbQuery(
-      `SELECT
-         ci.content_item_id,
-         ci.text,
-         ci.notes,
-         ci.cefr_level,
-         ci.topic,
-         ds.assigned_by,
-         'override' AS source
-       FROM daily_sentences ds
-       JOIN content_items ci ON ci.content_item_id = ds.content_item_id
-       WHERE ds.sentence_date = $1::date
-       LIMIT 1`,
-      [today]
-    );
+    // 1. Check for teacher override (gracefully skip if table doesn't exist yet)
+    try {
+      const overrideR = await dbQuery(
+        `SELECT
+           ci.content_item_id,
+           ci.text,
+           ci.notes,
+           ci.cefr_level,
+           ci.topic,
+           ds.assigned_by,
+           'override' AS source
+         FROM daily_sentences ds
+         JOIN content_items ci ON ci.content_item_id = ds.content_item_id
+         WHERE ds.sentence_date = $1::date
+         LIMIT 1`,
+        [today]
+      );
 
-    if (overrideR.rows?.length > 0) {
-      const row = overrideR.rows[0];
-      return res.json({
-        ok: true,
-        sentence: {
-          content_item_id: row.content_item_id,
-          ko: row.text,
-          en: row.notes || null,
-          cefr_level: row.cefr_level || null,
-          topic: row.topic || null,
-          source: "override",
-          date: today
-        }
-      });
+      if (overrideR.rows?.length > 0) {
+        const row = overrideR.rows[0];
+        return res.json({
+          ok: true,
+          sentence: {
+            content_item_id: row.content_item_id,
+            ko: row.text,
+            en: row.notes || null,
+            cefr_level: row.cefr_level || null,
+            topic: row.topic || null,
+            source: "override",
+            date: today
+          }
+        });
+      }
+    } catch (overrideErr) {
+      // Table may not exist yet — fall through to global pool
+      console.warn("daily-sentence override check skipped:", overrideErr.message);
     }
 
     // 2. Deterministic pick from global approved B1–B2 sentences
