@@ -97,6 +97,7 @@ app.use(require("./routes/vocab_builder"));
 app.use(require("./routes/vocab_images"));
 app.use(require("./routes/numbers_drills"));
 app.use(require("./routes/songs"));
+app.use(require("./routes/daily_sentence"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
