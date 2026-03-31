@@ -115,6 +115,20 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
 
     await client.query("COMMIT");
 
+    // Notify Discord when a new user is created
+    const webhookUrl = process.env.DISCORD_SIGNUP_WEBHOOK_URL;
+    if (webhookUrl) {
+      fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: `🎉 **New HakMun user** created!\nHandle: \`${primaryHandle}\`\nUser ID: \`${user.user_id}\`\nRole: ${user.role}`
+        })
+      }).catch((err) =>
+        logger.warn("[discord] signup webhook failed", { err: err?.message || String(err) })
+      );
+    }
+
     return {
       user: {
         user_id: user.user_id,

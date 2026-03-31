@@ -185,10 +185,25 @@ async function ensureCanonicalUser({ appleSubject, audience, email }, rid) {
         `
         insert into users (user_id, apple_user_id, last_seen_at, role, is_active, is_admin, is_root_admin)
         values (gen_random_uuid(), null, now(), 'student', true, false, false)
-        returning user_id
+        returning user_id, created_at
         `
       );
       canonicalUserID = created.rows[0].user_id;
+
+      // Notify Discord when a new user joins
+      const webhookUrl = process.env.DISCORD_SIGNUP_WEBHOOK_URL;
+      if (webhookUrl) {
+        const ts = created.rows[0].created_at;
+        fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: `🎉 **New HakMun user** joined!\nUser ID: \`${canonicalUserID}\`\nTime: ${ts}`
+          })
+        }).catch((err) =>
+          logger.warn("[discord] signup webhook failed", { rid, err: err?.message || String(err) })
+        );
+      }
     }
 
     // Bind this (sub,aud) to canonical user.
