@@ -72,8 +72,64 @@ async function ensureGoogleDocumentRow({ userId, googleDocUrl, snapshotAssetId, 
   return documentId;
 }
 
+/**
+ * Ensure a documents row exists for any source type and user.
+ * Returns the document_id (existing or newly created).
+ *
+ * @param {Object} opts
+ * @param {string} opts.userId - User UUID
+ * @param {string} opts.sourceKind - "hakdoc", "google_doc", "paste", etc.
+ * @param {string} opts.sourceId - Source identifier (hakdoc_id UUID, Google Doc URL, etc.)
+ * @param {string} opts.title - Document title
+ * @returns {string} document_id UUID
+ */
+async function ensureDocumentRow({ userId, sourceKind, sourceId, title }) {
+  if (!sourceKind) throw new Error("SOURCE_KIND_REQUIRED");
+
+  const sourceUri = cleanString(sourceId, 4000) || null;
+
+  // Try to find existing row if we have a source URI
+  if (sourceUri) {
+    const r = await withTimeout(
+      pool.query(
+        `SELECT document_id
+           FROM documents
+          WHERE owner_user_id = $1::uuid
+            AND source_kind = $2
+            AND source_uri = $3
+          LIMIT 1`,
+        [userId, sourceKind, sourceUri]
+      ),
+      QUERY_TIMEOUT_MS,
+      "db-find-document-generic"
+    );
+
+    const existing = r.rows?.[0]?.document_id || null;
+    if (existing) return existing;
+  }
+
+  const documentId = crypto.randomUUID();
+  const t = cleanString(title, 140) || sourceKind;
+
+  await withTimeout(
+    pool.query(
+      `INSERT INTO documents (
+         document_id, owner_user_id, asset_id, source_kind, source_uri, title, ingest_status
+       ) VALUES (
+         $1::uuid, $2::uuid, NULL, $3, $4, $5, 'verified'
+       )`,
+      [documentId, userId, sourceKind, sourceUri, t]
+    ),
+    QUERY_TIMEOUT_MS,
+    "db-insert-document-generic"
+  );
+
+  return documentId;
+}
+
 module.exports = {
   ensureGoogleDocumentRow,
+  ensureDocumentRow,
   looksLikeUUID,
   cleanString
 };

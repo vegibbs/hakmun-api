@@ -879,6 +879,90 @@ router.get(
 );
 
 // ===========================================================================
+// STUDENT JOURNAL (teacher views student's practice completions)
+// ===========================================================================
+
+// GET /v1/classes/:classId/members/:userId/completions — teacher views a student's journal
+router.get(
+  "/v1/classes/:classId/members/:userId/completions",
+  requireSession,
+  async (req, res) => {
+    try {
+      const callerId = getUserId(req);
+      if (!callerId)
+        return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+      const { classId, userId: studentId } = req.params;
+
+      // Verify caller is the class teacher
+      const ownerR = await withTimeout(
+        pool.query(
+          `SELECT class_id FROM classes WHERE class_id = $1::uuid AND teacher_id = $2::uuid`,
+          [classId, callerId]
+        ),
+        8000,
+        "db-check-class-owner-journal"
+      );
+      if (ownerR.rows.length === 0) {
+        return res.status(403).json({ ok: false, error: "NOT_TEACHER" });
+      }
+
+      // Verify student is a member of the class
+      const memberR = await withTimeout(
+        pool.query(
+          `SELECT 1 FROM class_members WHERE class_id = $1::uuid AND user_id = $2::uuid`,
+          [classId, studentId]
+        ),
+        8000,
+        "db-check-student-membership"
+      );
+      if (memberR.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "MEMBER_NOT_FOUND" });
+      }
+
+      // Fetch student's practice completions
+      let sql = `SELECT completion_id, item_id, module, completed_at,
+                        cefr_level, topic, source_lesson, meta
+                   FROM practice_completions
+                  WHERE user_id = $1::uuid`;
+      const params = [studentId];
+      let idx = 2;
+
+      if (req.query.module) {
+        sql += ` AND module = $${idx}::text`;
+        params.push(String(req.query.module));
+        idx++;
+      }
+
+      if (req.query.since) {
+        sql += ` AND completed_at >= $${idx}::timestamptz`;
+        params.push(req.query.since);
+        idx++;
+      }
+
+      sql += ` ORDER BY completed_at DESC`;
+
+      const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 5000);
+      sql += ` LIMIT $${idx}::int`;
+      params.push(limit);
+
+      const r = await withTimeout(
+        pool.query(sql, params),
+        10000,
+        "db-teacher-view-student-completions"
+      );
+
+      return res.json({ ok: true, completions: r.rows || [] });
+    } catch (err) {
+      logger.error("[classes] teacher view student completions failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
+
+// ===========================================================================
 // DOCUMENTS (attach/detach)
 // ===========================================================================
 
