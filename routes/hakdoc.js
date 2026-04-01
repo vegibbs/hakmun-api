@@ -7,6 +7,8 @@ const { requireSession } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
+const { storageConfigured, makeS3Client, bucketName, PutObjectCommand, GetObjectCommand } = require("../util/s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const router = express.Router();
 
@@ -56,7 +58,8 @@ router.get("/v1/hakdocs", requireSession, async (req, res) => {
     const r = await withTimeout(
       pool.query(
         `SELECT h.hakdoc_id, h.title, h.student_id, h.class_code,
-                h.raw_text, h.created_at, h.updated_at,
+                h.raw_text, h.content_format, h.content_version,
+                h.created_at, h.updated_at,
                 COUNT(s.session_id)::int AS session_count
            FROM hakdocs h
            LEFT JOIN hakdoc_sessions s ON s.hakdoc_id = h.hakdoc_id
@@ -87,7 +90,9 @@ router.get("/v1/hakdocs/:hakdocId", requireSession, async (req, res) => {
     // Fetch hakdoc
     const docR = await withTimeout(
       pool.query(
-        `SELECT hakdoc_id, teacher_id, title, student_id, class_code, raw_text, created_at, updated_at
+        `SELECT hakdoc_id, teacher_id, title, student_id, class_code, raw_text,
+                content_key, content_version, content_format,
+                created_at, updated_at
            FROM hakdocs
           WHERE hakdoc_id = $1::uuid AND teacher_id = $2::uuid`,
         [hakdocId, userId]
@@ -230,6 +235,347 @@ router.delete("/v1/hakdocs/:hakdocId", requireSession, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     logger.error("[hakdoc] delete failed", { err: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ===========================================================================
+// CONTENT (v2 — S3-backed document body)
+// ===========================================================================
+
+// GET /v1/hakdocs/:hakdocId/content — get document content
+// Returns signed S3 URL if content_key exists, or inline raw_text for v1 docs.
+router.get("/v1/hakdocs/:hakdocId/content", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { hakdocId } = req.params;
+
+    const r = await withTimeout(
+      pool.query(
+        `SELECT hakdoc_id, teacher_id, student_id, content_key, content_version, content_format, raw_text
+           FROM hakdocs
+          WHERE hakdoc_id = $1::uuid
+            AND (teacher_id = $2::uuid OR student_id = $2::uuid)`,
+        [hakdocId, userId]
+      ),
+      8000,
+      "db-get-hakdoc-content"
+    );
+
+    if (r.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const doc = r.rows[0];
+
+    // v2: content stored in S3
+    if (doc.content_key && doc.content_format === "hakdoc-v2") {
+      if (!storageConfigured()) {
+        return res.status(503).json({ ok: false, error: "STORAGE_NOT_CONFIGURED" });
+      }
+
+      const s3 = makeS3Client();
+      const url = await withTimeout(
+        getSignedUrl(
+          s3,
+          new GetObjectCommand({ Bucket: bucketName(), Key: doc.content_key }),
+          { expiresIn: 3600 }
+        ),
+        8000,
+        "sign-content-url"
+      );
+
+      return res.json({
+        ok: true,
+        format: "hakdoc-v2",
+        version: doc.content_version,
+        content_url: url,
+        expires_in: 3600,
+      });
+    }
+
+    // v1 fallback: inline raw_text
+    return res.json({
+      ok: true,
+      format: "v1",
+      version: 0,
+      raw_text: doc.raw_text || "",
+    });
+  } catch (err) {
+    logger.error("[hakdoc] get content failed", { err: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// PUT /v1/hakdocs/:hakdocId/content — save document content to S3
+// Body: { content: "HDM markdown string" }
+router.put("/v1/hakdocs/:hakdocId/content", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    if (!storageConfigured()) {
+      return res.status(503).json({ ok: false, error: "STORAGE_NOT_CONFIGURED" });
+    }
+
+    const { hakdocId } = req.params;
+    const content = req.body?.content;
+
+    if (typeof content !== "string") {
+      return res.status(400).json({ ok: false, error: "CONTENT_REQUIRED" });
+    }
+
+    // Verify ownership (teacher or student can edit — last-write-wins)
+    const docR = await withTimeout(
+      pool.query(
+        `SELECT hakdoc_id, content_version
+           FROM hakdocs
+          WHERE hakdoc_id = $1::uuid
+            AND (teacher_id = $2::uuid OR student_id = $2::uuid)`,
+        [hakdocId, userId]
+      ),
+      8000,
+      "db-check-hakdoc-content-owner"
+    );
+
+    if (docR.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const nextVersion = (docR.rows[0].content_version || 0) + 1;
+    const contentKey = `hakdocs/${hakdocId}/content-v${nextVersion}.txt`;
+
+    // Write to S3
+    const s3 = makeS3Client();
+    await withTimeout(
+      s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName(),
+          Key: contentKey,
+          Body: Buffer.from(content, "utf-8"),
+          ContentType: "text/plain; charset=utf-8",
+        })
+      ),
+      15000,
+      "s3-put-content"
+    );
+
+    // Update DB metadata
+    const r = await withTimeout(
+      pool.query(
+        `UPDATE hakdocs
+            SET content_key = $1,
+                content_version = $2,
+                content_format = 'hakdoc-v2',
+                updated_at = NOW()
+          WHERE hakdoc_id = $3::uuid
+         RETURNING hakdoc_id, content_key, content_version, content_format, updated_at`,
+        [contentKey, nextVersion, hakdocId]
+      ),
+      8000,
+      "db-update-hakdoc-content"
+    );
+
+    logger.info("[hakdoc] content saved", {
+      hakdocId,
+      userId,
+      version: nextVersion,
+      contentKey,
+      sizeBytes: Buffer.byteLength(content, "utf-8"),
+    });
+
+    return res.json({
+      ok: true,
+      version: nextVersion,
+      content_key: contentKey,
+      updated_at: r.rows[0]?.updated_at,
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[hakdoc] save content failed", { err: msg });
+
+    if (msg.startsWith("timeout:s3-put-content")) {
+      return res.status(503).json({ ok: false, error: "STORAGE_TIMEOUT" });
+    }
+
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// ===========================================================================
+// HAKDOC ASSETS (images/audio scoped to a hakdoc)
+// ===========================================================================
+
+const multer = require("multer");
+const crypto = require("crypto");
+
+const uploadHakdocAsset = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
+
+const HAKDOC_ASSET_ALLOWED = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "audio/mpeg",
+  "audio/m4a",
+  "audio/wav",
+  "audio/x-wav",
+]);
+
+function hakdocAssetExt(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m === "image/png") return "png";
+  if (m === "image/jpeg") return "jpg";
+  if (m === "image/gif") return "gif";
+  if (m === "image/webp") return "webp";
+  if (m === "audio/mpeg") return "mp3";
+  if (m === "audio/m4a") return "m4a";
+  if (m === "audio/wav" || m === "audio/x-wav") return "wav";
+  return "bin";
+}
+
+// POST /v1/hakdocs/:hakdocId/assets — upload an asset (image/audio) for a hakdoc
+router.post("/v1/hakdocs/:hakdocId/assets", requireSession, uploadHakdocAsset.single("file"), async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    if (!storageConfigured()) {
+      return res.status(503).json({ ok: false, error: "STORAGE_NOT_CONFIGURED" });
+    }
+
+    const { hakdocId } = req.params;
+
+    // Verify ownership
+    const docR = await withTimeout(
+      pool.query(
+        `SELECT hakdoc_id FROM hakdocs
+          WHERE hakdoc_id = $1::uuid
+            AND (teacher_id = $2::uuid OR student_id = $2::uuid)`,
+        [hakdocId, userId]
+      ),
+      8000,
+      "db-check-hakdoc-asset-owner"
+    );
+    if (docR.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "HAKDOC_NOT_FOUND" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "FILE_REQUIRED" });
+    }
+
+    const mime = String(req.file.mimetype || "").toLowerCase().trim();
+    if (!HAKDOC_ASSET_ALLOWED.has(mime)) {
+      return res.status(415).json({ ok: false, error: "UNSUPPORTED_TYPE", mime_type: mime });
+    }
+
+    const ext = hakdocAssetExt(mime);
+    const assetId = crypto.randomUUID();
+    const objectKey = `hakdocs/${hakdocId}/assets/${assetId}.${ext}`;
+    const relativePath = `assets/${assetId}.${ext}`;
+
+    const s3 = makeS3Client();
+    await withTimeout(
+      s3.send(
+        new PutObjectCommand({
+          Bucket: bucketName(),
+          Key: objectKey,
+          Body: req.file.buffer,
+          ContentType: mime,
+        })
+      ),
+      15000,
+      "s3-put-hakdoc-asset"
+    );
+
+    logger.info("[hakdoc] asset uploaded", {
+      hakdocId,
+      userId,
+      assetId,
+      objectKey,
+      mime,
+      sizeBytes: req.file.size,
+    });
+
+    return res.status(201).json({
+      ok: true,
+      asset_id: assetId,
+      relative_path: relativePath,
+      object_key: objectKey,
+      mime_type: mime,
+      size_bytes: req.file.size,
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    logger.error("[hakdoc] asset upload failed", { err: msg });
+
+    if (msg.startsWith("timeout:s3-put-hakdoc-asset")) {
+      return res.status(503).json({ ok: false, error: "STORAGE_TIMEOUT" });
+    }
+
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+// GET /v1/hakdocs/:hakdocId/assets/:assetPath — get signed URL for a hakdoc asset
+// assetPath is the relative path (e.g., "assets/uuid.png")
+router.get("/v1/hakdocs/:hakdocId/assets/*", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    if (!storageConfigured()) {
+      return res.status(503).json({ ok: false, error: "STORAGE_NOT_CONFIGURED" });
+    }
+
+    const { hakdocId } = req.params;
+    const assetPath = req.params[0]; // everything after /assets/
+
+    if (!assetPath || assetPath.includes("..")) {
+      return res.status(400).json({ ok: false, error: "INVALID_PATH" });
+    }
+
+    // Verify access
+    const docR = await withTimeout(
+      pool.query(
+        `SELECT hakdoc_id FROM hakdocs
+          WHERE hakdoc_id = $1::uuid
+            AND (teacher_id = $2::uuid OR student_id = $2::uuid)`,
+        [hakdocId, userId]
+      ),
+      8000,
+      "db-check-hakdoc-asset-read"
+    );
+    if (docR.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const objectKey = `hakdocs/${hakdocId}/assets/${assetPath}`;
+
+    const s3 = makeS3Client();
+    const url = await withTimeout(
+      getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: bucketName(), Key: objectKey }),
+        { expiresIn: 3600 }
+      ),
+      8000,
+      "sign-hakdoc-asset-url"
+    );
+
+    return res.json({
+      ok: true,
+      url,
+      expires_in: 3600,
+    });
+  } catch (err) {
+    logger.error("[hakdoc] asset url failed", { err: String(err?.message || err) });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
