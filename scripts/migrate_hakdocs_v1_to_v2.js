@@ -1,8 +1,10 @@
 // Migrate HakDoc v1 (raw_text HTML) → v2 (HDM plain text in S3)
 //
-// Usage:
-//   RAILWAY_ENVIRONMENT=sandbox railway run --service hakmun-api -- node scripts/migrate_hakdocs_v1_to_v2.js [--dry-run]
-//   RAILWAY_ENVIRONMENT=production railway run --service hakmun-api -- node scripts/migrate_hakdocs_v1_to_v2.js [--dry-run]
+// NOTE: Cannot run locally — requires Railway-internal DB and S3 access.
+// Use run_v1_migration.js (deploy-time gate) or the admin endpoint instead.
+// See routes/admin.js POST /v1/admin/hakdocs/migrate-v2
+//
+// Already executed on both sandbox and production (2026-04-01).
 //
 // What it does:
 //   1. Finds all hakdocs where content_format IS NULL or 'v1' AND raw_text IS NOT NULL
