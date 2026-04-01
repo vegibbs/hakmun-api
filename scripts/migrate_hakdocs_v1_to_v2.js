@@ -16,7 +16,7 @@
 const { pool } = require("../db/pool");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const DRY_RUN = process.argv.includes("--dry-run");
+const DRY_RUN = process.argv.includes("--dry-run") || process.env.V1_MIGRATION_DRY_RUN === "true";
 
 function makeS3Client() {
   return new S3Client({

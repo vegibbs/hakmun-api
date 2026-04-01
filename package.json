@@ -4,7 +4,7 @@
   "description": "HakMun backend API (Railway)",
   "main": "server.js",
   "scripts": {
-    "start": "node db/migrate.js && node server.js",
+    "start": "node db/migrate.js && node scripts/run_v1_migration.js && node server.js",
     "migrate": "node db/migrate.js",
     "migrate:list": "node db/migrate.js --list",
     "migrate:dry-run": "node db/migrate.js --dry-run"
