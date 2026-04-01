@@ -897,4 +897,85 @@ router.get("/v1/grammar-patterns", requireSession, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------------
+// GET /v1/documents/highlights?source_kind=pdf&source_id=xxx
+// Returns imported_texts, imported_fragment_texts, and practice_list_texts
+// for a document identified by source_kind + source_id.
+// Used by PDF and HakDoc views to highlight already-imported lines.
+// ------------------------------------------------------------------
+router.get("/v1/documents/highlights", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const sourceKind = (req.query?.source_kind || "").trim();
+    const sourceId = (req.query?.source_id || "").trim();
+    if (!sourceKind || !sourceId) {
+      return res.status(400).json({ ok: false, error: "SOURCE_KIND_AND_SOURCE_ID_REQUIRED" });
+    }
+
+    // Imported sentences (content_items linked to the document)
+    let imported_texts = [];
+    try {
+      const r = await dbQuery(
+        `SELECT DISTINCT ci.text
+         FROM documents d
+         JOIN document_content_item_links dcil ON dcil.document_id = d.document_id
+         JOIN content_items ci ON ci.content_item_id = dcil.content_item_id
+         WHERE d.owner_user_id = $1::uuid
+           AND d.source_kind = $2
+           AND d.source_uri = $3`,
+        [userId, sourceKind, sourceId]
+      );
+      imported_texts = (r.rows || []).map(row => row.text);
+    } catch (_) {}
+
+    // Imported fragments
+    let imported_fragment_texts = [];
+    try {
+      const r = await dbQuery(
+        `SELECT DISTINCT df.text
+         FROM documents d
+         JOIN document_fragments df ON df.document_id = d.document_id
+         WHERE d.owner_user_id = $1::uuid
+           AND d.source_kind = $2
+           AND d.source_uri = $3`,
+        [userId, sourceKind, sourceId]
+      );
+      imported_fragment_texts = (r.rows || []).map(row => row.text);
+    } catch (_) {}
+
+    // Practice list sentences linked to this document
+    let practice_list_texts = [];
+    try {
+      const r = await dbQuery(
+        `SELECT DISTINCT ci.text
+         FROM lists l
+         JOIN list_items li ON li.list_id = l.id
+         JOIN content_items ci ON ci.content_item_id = li.item_id
+         WHERE l.user_id = $1::uuid
+           AND l.source_kind = 'practice_generation'
+           AND l.source_document_id IN (
+             SELECT document_id FROM documents
+             WHERE owner_user_id = $1::uuid
+               AND source_kind = $2
+               AND source_uri = $3
+           )`,
+        [userId, sourceKind, sourceId]
+      );
+      practice_list_texts = (r.rows || []).map(row => row.text);
+    } catch (_) {}
+
+    return res.json({
+      ok: true,
+      imported_texts,
+      imported_fragment_texts,
+      practice_list_texts
+    });
+  } catch (err) {
+    console.error("document highlights failed:", err);
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
 module.exports = router;
