@@ -914,6 +914,18 @@ router.get("/v1/documents/highlights", requireSession, async (req, res) => {
       return res.status(400).json({ ok: false, error: "SOURCE_KIND_AND_SOURCE_ID_REQUIRED" });
     }
 
+    // Resolve document_id for this source (needed by content viewer)
+    let document_id = null;
+    try {
+      const dr = await dbQuery(
+        `SELECT document_id FROM documents
+         WHERE owner_user_id = $1::uuid AND source_kind = $2 AND source_uri = $3
+         LIMIT 1`,
+        [userId, sourceKind, sourceId]
+      );
+      document_id = dr.rows?.[0]?.document_id || null;
+    } catch (_) {}
+
     // Imported sentences (content_items linked to the document)
     let imported_texts = [];
     try {
@@ -968,6 +980,7 @@ router.get("/v1/documents/highlights", requireSession, async (req, res) => {
 
     return res.json({
       ok: true,
+      document_id,
       imported_texts,
       imported_fragment_texts,
       practice_list_texts
