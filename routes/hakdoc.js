@@ -525,7 +525,7 @@ router.post("/v1/hakdocs/:hakdocId/assets", requireSession, uploadHakdocAsset.si
 
 // GET /v1/hakdocs/:hakdocId/assets/:assetPath — get signed URL for a hakdoc asset
 // assetPath is the relative path (e.g., "assets/uuid.png")
-router.get("/v1/hakdocs/:hakdocId/assets/*", requireSession, async (req, res) => {
+router.get("/v1/hakdocs/:hakdocId/assets/*assetPath", requireSession, async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -535,7 +535,7 @@ router.get("/v1/hakdocs/:hakdocId/assets/*", requireSession, async (req, res) =>
     }
 
     const { hakdocId } = req.params;
-    const assetPath = req.params[0]; // everything after /assets/
+    const assetPath = req.params.assetPath; // everything after /assets/
 
     if (!assetPath || assetPath.includes("..")) {
       return res.status(400).json({ ok: false, error: "INVALID_PATH" });
