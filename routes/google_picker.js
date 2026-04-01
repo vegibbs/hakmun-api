@@ -178,7 +178,7 @@ function buildPickerHTML({ apiKey, clientId, accessToken, appId }) {
     <p>Opening file picker…</p>
   </div>
   <div class="error" id="error" style="display:none"></div>
-  <button class="cancel-btn" id="cancelBtn" style="display:none" onclick="sendCancel()">Cancel</button>
+  <button class="cancel-btn" id="cancelBtn" style="display:none" onclick="sendCancel()">Return to HakMun</button>
 
   <script>
     // Relay console logs to native for debugging
@@ -199,22 +199,14 @@ function buildPickerHTML({ apiKey, clientId, accessToken, appId }) {
     const API_KEY = '${esc(apiKey)}';
     const APP_ID = '${esc(appId)}';
 
-    // Send results back to the native app via WKWebView message handler
+    // Send results back to the native app via custom URL scheme
     function sendResult(files) {
-      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pickerResult) {
-        window.webkit.messageHandlers.pickerResult.postMessage(JSON.stringify({
-          action: 'picked',
-          files: files
-        }));
-      }
+      const encoded = encodeURIComponent(JSON.stringify(files));
+      window.location.href = 'hakmun://picker-done?files=' + encoded;
     }
 
     function sendCancel() {
-      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pickerResult) {
-        window.webkit.messageHandlers.pickerResult.postMessage(JSON.stringify({
-          action: 'cancelled'
-        }));
-      }
+      window.location.href = 'hakmun://picker-cancelled';
     }
 
     function showError(msg) {
@@ -269,8 +261,7 @@ function buildPickerHTML({ apiKey, clientId, accessToken, appId }) {
         const files = data.docs.map(doc => ({
           id: doc.id,
           name: doc.name,
-          url: doc.url,
-          mimeType: doc.mimeType
+          url: doc.url
         }));
         sendResult(files);
       } else if (data.action === google.picker.Action.CANCEL) {
