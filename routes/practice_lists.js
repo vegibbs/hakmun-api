@@ -24,6 +24,186 @@ function getUserId(req) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/practice-lists
+// Returns the user's practice lists (id, name, item_count, created_at).
+// ---------------------------------------------------------------------------
+router.get("/v1/practice-lists", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const result = await withTimeout(
+      pool.query(
+        `SELECT l.id, l.name, l.created_at,
+                COUNT(li.id)::int AS item_count
+         FROM lists l
+         LEFT JOIN list_items li ON li.list_id = l.id
+         WHERE l.user_id = $1::uuid AND l.is_active = true
+         GROUP BY l.id
+         ORDER BY l.created_at DESC
+         LIMIT 50`,
+        [userId]
+      ),
+      QUERY_TIMEOUT_MS,
+      "db-fetch-practice-lists"
+    );
+
+    return res.json({
+      ok: true,
+      lists: result.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        item_count: r.item_count,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    logger.error("[practice-lists] fetch failed", { err: err?.message });
+    return res.status(500).json({ ok: false, error: "FETCH_FAILED" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /v1/practice-lists/:listId/add
+// Adds sentences to an existing practice list.
+// ---------------------------------------------------------------------------
+router.post("/v1/practice-lists/:listId/add", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const listId = req.params.listId;
+    const sentences = Array.isArray(req.body?.sentences) ? req.body.sentences : [];
+
+    if (sentences.length === 0) {
+      return res.status(400).json({ ok: false, error: "NO_SENTENCES" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Verify list exists and belongs to user
+      const listCheck = await withTimeout(
+        client.query(
+          `SELECT id, name FROM lists WHERE id = $1::uuid AND user_id = $2::uuid AND is_active = true`,
+          [listId, userId]
+        ),
+        QUERY_TIMEOUT_MS,
+        "db-check-list-ownership"
+      );
+
+      if (listCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "LIST_NOT_FOUND" });
+      }
+
+      const listName = listCheck.rows[0].name;
+
+      // Get current max position
+      const posR = await withTimeout(
+        client.query(
+          `SELECT COALESCE(MAX(position), 0) AS max_pos FROM list_items WHERE list_id = $1::uuid`,
+          [listId]
+        ),
+        QUERY_TIMEOUT_MS,
+        "db-max-position"
+      );
+      let position = (parseInt(posR.rows[0]?.max_pos, 10) || 0) + 100;
+
+      let itemsAdded = 0;
+
+      for (const s of sentences) {
+        const ko = cleanString(s?.ko, 4000);
+        if (!ko) continue;
+        const en = cleanString(s?.en, 4000) || null;
+        const cefrLevel = cleanString(s?.cefr_level, 4) || null;
+        const topic = cleanString(s?.topic, 40) || null;
+        const naturalness = (typeof s?.naturalness_score === "number" && Number.isFinite(s.naturalness_score))
+          ? s.naturalness_score : null;
+        const politeness = cleanString(s?.politeness, 20) || null;
+        const tense = cleanString(s?.tense, 20) || null;
+
+        // Dedup: check if sentence already exists as a content item
+        let contentItemId = null;
+        const existing = await withTimeout(
+          client.query(
+            `SELECT content_item_id FROM content_items
+             WHERE owner_user_id = $1::uuid AND content_type = 'sentence' AND text = $2 LIMIT 1`,
+            [userId, ko]
+          ),
+          QUERY_TIMEOUT_MS,
+          "db-check-dup-sentence"
+        );
+
+        if (existing.rows.length > 0) {
+          contentItemId = existing.rows[0].content_item_id;
+        } else {
+          contentItemId = crypto.randomUUID();
+          const meta = {};
+          if (cefrLevel) meta.cefr_level = cefrLevel;
+          if (topic) meta.topic = topic;
+          if (naturalness !== null) meta.naturalness_score = naturalness;
+          if (politeness) meta.politeness = politeness;
+          if (tense) meta.tense = tense;
+
+          await withTimeout(
+            client.query(
+              `INSERT INTO content_items (content_item_id, owner_user_id, content_type, text, translation, source_kind, meta, status)
+               VALUES ($1::uuid, $2::uuid, 'sentence', $3, $4, 'practice_generation', $5::jsonb, 'preliminary')`,
+              [contentItemId, userId, ko, en, JSON.stringify(meta)]
+            ),
+            QUERY_TIMEOUT_MS,
+            "db-insert-practice-sentence"
+          );
+        }
+
+        // Check if already in this list
+        const inList = await withTimeout(
+          client.query(
+            `SELECT id FROM list_items WHERE list_id = $1::uuid AND content_item_id = $2::uuid LIMIT 1`,
+            [listId, contentItemId]
+          ),
+          QUERY_TIMEOUT_MS,
+          "db-check-list-membership"
+        );
+
+        if (inList.rows.length === 0) {
+          await withTimeout(
+            client.query(
+              `INSERT INTO list_items (id, list_id, content_item_id, position)
+               VALUES ($1::uuid, $2::uuid, $3::uuid, $4)`,
+              [crypto.randomUUID(), listId, contentItemId, position]
+            ),
+            QUERY_TIMEOUT_MS,
+            "db-add-to-list"
+          );
+          position += 100;
+          itemsAdded++;
+        }
+      }
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        ok: true,
+        list_id: listId,
+        list_name: listName,
+        items_added: itemsAdded,
+      });
+    } catch (innerErr) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw innerErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    logger.error("[practice-lists] add-to-list failed", { err: err?.message, stack: err?.stack });
+    return res.status(500).json({ ok: false, error: "ADD_FAILED" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /v1/practice-lists/generate
 // Auto-imports highlighted content then generates practice sentences via LLM.
 // Returns generated sentences for client-side review (not committed yet).
