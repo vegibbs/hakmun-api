@@ -23,7 +23,7 @@ const { ensureDocumentRow, looksLikeUUID, cleanString } = require("../util/docum
 const router = express.Router();
 
 const MAX_TEXT_CHARS = 500_000;
-const VALID_SOURCE_TYPES = new Set(["hakdoc", "google_doc", "paste", "other"]);
+const VALID_SOURCE_TYPES = new Set(["hakdoc", "google_doc", "pdf", "paste", "other"]);
 const VALID_IMPORT_AS = new Set(["all", "vocab", "sentences", "patterns"]);
 
 function getUserId(req) {
