@@ -3,6 +3,7 @@
 
 const express = require("express");
 const crypto = require("crypto");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
@@ -681,6 +682,135 @@ router.get(
     } catch (err) {
       logger.error("/v1/admin/profiles failed", { rid: req._rid, err: err?.message || String(err) });
       return res.status(500).json({ error: "list profiles failed" });
+    }
+  }
+);
+
+/* ------------------------------------------------------------------
+   POST /v1/admin/hakdocs/migrate-v2?dry_run=true
+   One-shot migration: v1 raw_text HTML → v2 HDM plain text in S3.
+   Must run inside Railway network (needs DB + S3 access).
+------------------------------------------------------------------ */
+
+function htmlToPlainText(html) {
+  if (!html || typeof html !== "string") return "";
+  let text = html;
+  text = text.replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<\/(p|div|li|h[1-6]|tr)>/gi, "\n");
+  text = text.replace(/<(p|div|li|h[1-6]|tr|table|tbody|thead)[^>]*>/gi, "");
+  text = text.replace(/<[^>]+>/g, "");
+  text = text.replace(/&amp;/g, "&");
+  text = text.replace(/&lt;/g, "<");
+  text = text.replace(/&gt;/g, ">");
+  text = text.replace(/&quot;/g, '"');
+  text = text.replace(/&#39;/g, "'");
+  text = text.replace(/&nbsp;/g, " ");
+  text = text.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)));
+  text = text.replace(/\n{3,}/g, "\n\n");
+  return text.trim();
+}
+
+const MIGRATE_DATE_RE = /^\s*(\d{4})[.\-](\d{1,2})[.\-](\d{1,2})\s*$/;
+
+function toHDM(plainText) {
+  return plainText.split("\n").map((line) => {
+    const m = line.trim().match(MIGRATE_DATE_RE);
+    if (m) {
+      const [, y, mo, d] = m;
+      if (+y >= 2000 && +y <= 2100 && +mo >= 1 && +mo <= 12 && +d >= 1 && +d <= 31) {
+        return `## ${y}.${Number(mo)}.${Number(d)}`;
+      }
+    }
+    return line;
+  }).join("\n");
+}
+
+router.post(
+  "/v1/admin/hakdocs/migrate-v2",
+  requireSession,
+  requireRootAdmin,
+  async (req, res) => {
+    const dryRun = req.query.dry_run === "true";
+    const tag = "[migrate-v1-v2]";
+
+    try {
+      const { rows } = await pool.query(`
+        SELECT hakdoc_id, title, raw_text, content_version
+          FROM hakdocs
+         WHERE (content_format IS NULL OR content_format = 'v1')
+           AND raw_text IS NOT NULL AND raw_text != ''
+         ORDER BY created_at ASC
+      `);
+
+      if (rows.length === 0) {
+        return res.json({ message: "Nothing to migrate", migrated: 0, failed: 0 });
+      }
+
+      const s3 = new S3Client({
+        endpoint: process.env.OBJECT_STORAGE_ENDPOINT,
+        region: process.env.OBJECT_STORAGE_REGION || "auto",
+        credentials: {
+          accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID,
+          secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY,
+        },
+        forcePathStyle: true,
+      });
+      const bucket = process.env.OBJECT_STORAGE_BUCKET;
+
+      const results = [];
+      let migrated = 0;
+      let failed = 0;
+
+      for (const row of rows) {
+        const { hakdoc_id, title, raw_text, content_version } = row;
+        try {
+          const plain = htmlToPlainText(raw_text);
+          if (!plain) { results.push({ hakdoc_id, title, status: "skip_empty" }); continue; }
+
+          const hdm = toHDM(plain);
+          const nextVersion = (content_version || 0) + 1;
+          const contentKey = `hakdocs/${hakdoc_id}/content-v${nextVersion}.txt`;
+
+          if (dryRun) {
+            results.push({
+              hakdoc_id, title, status: "dry_run",
+              lines: hdm.split("\n").length,
+              bytes: Buffer.byteLength(hdm, "utf-8"),
+              contentKey,
+              preview: hdm.split("\n").slice(0, 3),
+            });
+            migrated++;
+            continue;
+          }
+
+          await s3.send(new PutObjectCommand({
+            Bucket: bucket, Key: contentKey,
+            Body: Buffer.from(hdm, "utf-8"),
+            ContentType: "text/plain; charset=utf-8",
+          }));
+
+          await pool.query(
+            `UPDATE hakdocs
+                SET content_key = $1, content_version = $2,
+                    content_format = 'hakdoc-v2', updated_at = NOW()
+              WHERE hakdoc_id = $3::uuid`,
+            [contentKey, nextVersion, hakdoc_id]
+          );
+
+          results.push({ hakdoc_id, title, status: "ok", contentKey });
+          migrated++;
+        } catch (err) {
+          results.push({ hakdoc_id, title, status: "fail", error: err.message });
+          failed++;
+        }
+      }
+
+      logger.info(`${tag} ${dryRun ? "DRY RUN" : "LIVE"}`, { migrated, failed, total: rows.length });
+      return res.json({ dryRun, migrated, failed, total: rows.length, results });
+    } catch (err) {
+      logger.error(`${tag} fatal`, { err: err?.message || String(err) });
+      return res.status(500).json({ error: "migration failed" });
     }
   }
 );
