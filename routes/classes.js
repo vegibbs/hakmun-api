@@ -258,7 +258,11 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
                   CASE
                     WHEN cd.document_type = 'google_doc'
                       THEN (SELECT ds.source_uri FROM saved_document_sources ds WHERE ds.saved_source_id = cd.document_id::uuid)
-                  END AS source_uri
+                  END AS source_uri,
+                  CASE
+                    WHEN cd.document_type = 'hakdoc'
+                      THEN (SELECT h.content_format FROM hakdocs h WHERE h.hakdoc_id = cd.document_id::uuid)
+                  END AS content_format
              FROM class_documents cd
             WHERE cd.class_id = $1::uuid
             ORDER BY cd.attached_at ASC`,
