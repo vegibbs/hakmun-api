@@ -5,7 +5,8 @@
 //   GET /v1/auth/google/callback     (stores tokens)
 //
 // Scopes (locked):
-// - drive.file (per-file access via Picker selection)
+// - drive.readonly (file access + export metadata)
+// - documents.readonly (Docs API read-only viewer)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -79,7 +80,7 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
     const stateSecret = mustEnv("GOOGLE_OAUTH_STATE_SECRET");
 
     const scope = [
-      "https://www.googleapis.com/auth/drive.file"
+      "https://www.googleapis.com/auth/documents.readonly"
     ].join(" ");
 
     const nonce = crypto.randomBytes(16).toString("hex");
@@ -202,74 +203,6 @@ router.delete("/v1/auth/google/disconnect", requireSession, async (req, res) => 
     return res.json({ ok: true });
   } catch (err) {
     console.error("google oauth disconnect failed:", err);
-    return res.status(500).json({ ok: false, error: "INTERNAL" });
-  }
-});
-
-// GET /v1/auth/google/picker-config
-// Returns credentials needed by Google Picker JS on the client
-router.get("/v1/auth/google/picker-config", requireSession, async (req, res) => {
-  try {
-    const userId = getUserId(req);
-    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
-
-    const clientId = mustEnv("GOOGLE_OAUTH_CLIENT_ID");
-    const apiKey = mustEnv("GOOGLE_PICKER_API_KEY");
-
-    // Get current access token (refresh if expired)
-    const connR = await dbQuery(
-      `SELECT refresh_token, access_token, access_token_expires_at
-       FROM google_oauth_connections WHERE user_id = $1::uuid LIMIT 1`,
-      [userId]
-    );
-
-    const conn = connR.rows?.[0];
-    if (!conn?.refresh_token) {
-      return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
-    }
-
-    let accessToken = conn.access_token || null;
-    const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
-    const stillValid = accessToken && expiresAt && (expiresAt - Date.now() > 60_000);
-
-    if (!stillValid) {
-      const clientSecret = mustEnv("GOOGLE_OAUTH_CLIENT_SECRET");
-      const params = new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: conn.refresh_token,
-        grant_type: "refresh_token"
-      });
-
-      const resp = await fetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: params.toString()
-      });
-
-      const json = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        return res.status(401).json({ ok: false, error: "GOOGLE_RECONNECT_REQUIRED" });
-      }
-
-      accessToken = json.access_token;
-      const expiresIso = new Date(Date.now() + (json.expires_in || 3600) * 1000).toISOString();
-      await dbQuery(
-        `UPDATE google_oauth_connections
-           SET access_token = $2, access_token_expires_at = $3::timestamptz, updated_at = now()
-         WHERE user_id = $1::uuid`,
-        [userId, accessToken, expiresIso]
-      );
-    }
-
-    return res.json({
-      ok: true,
-      client_id: clientId,
-      api_key: apiKey,
-      access_token: accessToken
-    });
-  } catch (err) {
-    console.error("google picker-config failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
