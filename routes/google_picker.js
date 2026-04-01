@@ -181,6 +181,20 @@ function buildPickerHTML({ apiKey, clientId, accessToken, appId }) {
   <button class="cancel-btn" id="cancelBtn" style="display:none" onclick="sendCancel()">Cancel</button>
 
   <script>
+    // Relay console logs to native for debugging
+    const _origLog = console.log;
+    const _origErr = console.error;
+    function nativeLog(level, args) {
+      try {
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pickerLog) {
+          window.webkit.messageHandlers.pickerLog.postMessage(level + ': ' + Array.from(args).join(' '));
+        }
+      } catch(e) {}
+    }
+    console.log = function() { nativeLog('LOG', arguments); _origLog.apply(console, arguments); };
+    console.error = function() { nativeLog('ERR', arguments); _origErr.apply(console, arguments); };
+    window.onerror = function(msg, url, line) { nativeLog('ERR', ['Uncaught: ' + msg + ' at ' + url + ':' + line]); };
+
     const ACCESS_TOKEN = '${esc(accessToken)}';
     const API_KEY = '${esc(apiKey)}';
     const APP_ID = '${esc(appId)}';
