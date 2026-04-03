@@ -222,8 +222,12 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
                   u.display_name, uh.handle AS primary_handle,
                   u.profile_photo_object_key,
                   u.share_progress_default,
+                  u.allow_teacher_adjust_default,
+                  u.customize_learning,
                   u.share_city, u.share_country,
-                  u.location_city, u.location_country
+                  u.location_city, u.location_country,
+                  u.primary_language,
+                  u.cefr_current, u.cefr_target
              FROM class_members cm
              JOIN users u ON u.user_id = cm.user_id
              LEFT JOIN user_handles uh
@@ -323,11 +327,23 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
           primary_handle: m.primary_handle,
           profile_photo_url: profilePhotoUrl,
           share_progress_default: m.share_progress_default,
+          allow_teacher_adjust_default: m.allow_teacher_adjust_default,
         };
 
         // Location — gated by share flags
         if (m.share_city) member.location_city = m.location_city;
         if (m.share_country) member.location_country = m.location_country;
+
+        // Language — always included for teacher view
+        if (isTeacher) {
+          member.primary_language = m.primary_language || "en";
+        }
+
+        // Learning level — gated by allow_teacher_adjust_default
+        if (isTeacher && Boolean(m.allow_teacher_adjust_default)) {
+          member.cefr_current = m.cefr_current || null;
+          member.cefr_target = m.cefr_target || null;
+        }
 
         // Activity stats — only for teacher view and only if student shares progress
         if (isTeacher && shareProgress && activity) {
