@@ -47,7 +47,11 @@ router.get(
                     u.share_city,
                     u.share_country,
                     u.location_city,
-                    u.location_country
+                    u.location_country,
+                    u.allow_teacher_adjust_default,
+                    u.primary_language,
+                    u.cefr_current,
+                    u.cefr_target
                FROM class_members cm
                JOIN classes c ON c.class_id = cm.class_id AND c.teacher_id = $1::uuid
                JOIN users u ON u.user_id = cm.user_id
@@ -135,6 +139,16 @@ router.get(
           // Location — gated by share flags
           if (s.share_city) student.location_city = s.location_city;
           if (s.share_country) student.location_country = s.location_country;
+
+          // Teacher-adjust fields
+          student.allow_teacher_adjust_default = s.allow_teacher_adjust_default;
+          student.primary_language = s.primary_language || "en";
+
+          // Learning level — gated by allow_teacher_adjust_default
+          if (Boolean(s.allow_teacher_adjust_default)) {
+            student.cefr_current = s.cefr_current || null;
+            student.cefr_target = s.cefr_target || null;
+          }
 
           // Activity stats — only if student shares progress
           if (shareProgress && activity) {
@@ -269,6 +283,72 @@ router.put(
       return res.json({ ok: true, ...r.rows[0] });
     } catch (err) {
       logger.error("[teachers] update notes failed", {
+        err: String(err?.message || err),
+      });
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
+
+// ===========================================================================
+// PATCH /v1/teachers/students/:studentId/target-level
+// Teacher sets a student's CEFR target level (requires allow_teacher_adjust_default)
+// ===========================================================================
+
+router.patch(
+  "/v1/teachers/students/:studentId/target-level",
+  requireSession,
+  requireRole("teacher", "approver", "admin"),
+  async (req, res) => {
+    try {
+      const teacherId = getUserId(req);
+      if (!teacherId)
+        return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+      const { studentId } = req.params;
+      const { cefr_target } = req.body;
+
+      // Validate CEFR level
+      const validLevels = ["A1", "A2", "B1", "B2", "C1", "C2"];
+      if (cefr_target !== null && !validLevels.includes(cefr_target)) {
+        return res.status(400).json({ ok: false, error: "INVALID_LEVEL" });
+      }
+
+      // Verify teacher-student relationship
+      const hasRelationship = await verifyTeacherStudentRelationship(
+        teacherId,
+        studentId
+      );
+      if (!hasRelationship) {
+        return res.status(403).json({ ok: false, error: "NO_RELATIONSHIP" });
+      }
+
+      // Verify student allows teacher adjustment
+      const flagR = await withTimeout(
+        pool.query(
+          `SELECT allow_teacher_adjust_default FROM users WHERE user_id = $1::uuid`,
+          [studentId]
+        ),
+        8000,
+        "db-check-teacher-adjust-flag"
+      );
+      if (!flagR.rows.length || !Boolean(flagR.rows[0].allow_teacher_adjust_default)) {
+        return res.status(403).json({ ok: false, error: "STUDENT_DOES_NOT_ALLOW_ADJUST" });
+      }
+
+      // Update
+      await withTimeout(
+        pool.query(
+          `UPDATE users SET cefr_target = $1 WHERE user_id = $2::uuid`,
+          [cefr_target, studentId]
+        ),
+        8000,
+        "db-set-student-target-level"
+      );
+
+      return res.json({ ok: true, cefr_target });
+    } catch (err) {
+      logger.error("[teachers] set target level failed", {
         err: String(err?.message || err),
       });
       return res.status(500).json({ ok: false, error: "INTERNAL" });
