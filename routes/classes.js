@@ -7,6 +7,7 @@ const { requireSession, requireRole } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
+const { signImageUrl } = require("../util/s3");
 
 const router = express.Router();
 
@@ -211,12 +212,18 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
 
-    // Fetch members, lists, documents in parallel
-    const [membersR, listsR, docsR] = await Promise.all([
+    const isTeacher = classR.rows[0].teacher_id === userId;
+
+    // Fetch members, lists, documents, and activity stats in parallel
+    const [membersR, listsR, docsR, activityR] = await Promise.all([
       withTimeout(
         pool.query(
           `SELECT cm.id, cm.class_id, cm.user_id, cm.role, cm.joined_at,
-                  u.display_name, uh.handle AS primary_handle
+                  u.display_name, uh.handle AS primary_handle,
+                  u.profile_photo_object_key,
+                  u.share_progress_default,
+                  u.share_city, u.share_country,
+                  u.location_city, u.location_country
              FROM class_members cm
              JOIN users u ON u.user_id = cm.user_id
              LEFT JOIN user_handles uh
@@ -271,12 +278,72 @@ router.get("/v1/classes/:classId", requireSession, async (req, res) => {
         8000,
         "db-get-class-documents"
       ),
+      // Activity stats per student (only meaningful for teachers)
+      isTeacher
+        ? withTimeout(
+            pool.query(
+              `SELECT pe.user_id,
+                      MAX(pe.ts) AS last_practice_at,
+                      COUNT(*) FILTER (WHERE pe.ts >= NOW() - INTERVAL '7 days')::int AS practice_count_7d,
+                      COUNT(*) FILTER (WHERE pe.ts >= NOW() - INTERVAL '30 days')::int AS practice_count_30d
+                 FROM practice_events pe
+                WHERE pe.user_id = ANY(
+                  SELECT cm2.user_id FROM class_members cm2
+                   WHERE cm2.class_id = $1::uuid AND cm2.role = 'student'
+                )
+                GROUP BY pe.user_id`,
+              [classId]
+            ),
+            10000,
+            "db-get-class-activity"
+          )
+        : Promise.resolve({ rows: [] }),
     ]);
+
+    // Build activity lookup map
+    const activityMap = {};
+    for (const row of activityR.rows) {
+      activityMap[row.user_id] = row;
+    }
+
+    // Process members: sign photo URLs, apply privacy filters, attach activity
+    const members = await Promise.all(
+      membersR.rows.map(async (m) => {
+        const profilePhotoUrl = await signImageUrl(m.profile_photo_object_key);
+        const shareProgress = Boolean(m.share_progress_default);
+        const activity = activityMap[m.user_id];
+
+        const member = {
+          id: m.id,
+          class_id: m.class_id,
+          user_id: m.user_id,
+          role: m.role,
+          joined_at: m.joined_at,
+          display_name: m.display_name,
+          primary_handle: m.primary_handle,
+          profile_photo_url: profilePhotoUrl,
+          share_progress_default: m.share_progress_default,
+        };
+
+        // Location — gated by share flags
+        if (m.share_city) member.location_city = m.location_city;
+        if (m.share_country) member.location_country = m.location_country;
+
+        // Activity stats — only for teacher view and only if student shares progress
+        if (isTeacher && shareProgress && activity) {
+          member.last_practice_at = activity.last_practice_at;
+          member.practice_count_7d = activity.practice_count_7d;
+          member.practice_count_30d = activity.practice_count_30d;
+        }
+
+        return member;
+      })
+    );
 
     return res.json({
       ok: true,
       class_info: classR.rows[0],
-      members: membersR.rows,
+      members,
       lists: listsR.rows,
       documents: docsR.rows,
     });
@@ -922,6 +989,24 @@ router.get(
       );
       if (memberR.rows.length === 0) {
         return res.status(404).json({ ok: false, error: "MEMBER_NOT_FOUND" });
+      }
+
+      // Check student's progress sharing preference
+      const privacyR = await withTimeout(
+        pool.query(
+          `SELECT share_progress_default FROM users WHERE user_id = $1::uuid`,
+          [studentId]
+        ),
+        8000,
+        "db-check-student-privacy"
+      );
+      if (!privacyR.rows[0]?.share_progress_default) {
+        return res.json({
+          ok: true,
+          shared: false,
+          message: "Student has not enabled progress sharing",
+          completions: [],
+        });
       }
 
       // Fetch student's practice completions
