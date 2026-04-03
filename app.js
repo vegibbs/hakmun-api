@@ -92,6 +92,7 @@ app.use(require("./routes/document_fragments"));
 app.use(require("./routes/hakdoc"));
 app.use(require("./routes/content_analyze"));
 app.use(require("./routes/classes"));
+app.use(require("./routes/teachers"));
 app.use(require("./routes/grammar_patterns_admin"));
 app.use(require("./routes/unmatched_vocab_admin"));
 app.use(require("./routes/vocab_builder"));
