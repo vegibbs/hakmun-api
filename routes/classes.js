@@ -3,7 +3,7 @@
 
 const express = require("express");
 const crypto = require("crypto");
-const { requireSession, requireRole } = require("../auth/session");
+const { requireSession, requireEntitlement } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
@@ -143,7 +143,7 @@ router.get("/v1/classes", requireSession, async (req, res) => {
 router.post(
   "/v1/classes",
   requireSession,
-  requireRole("teacher", "approver", "admin"),
+  requireEntitlement("teacher:tools"),
   async (req, res) => {
     try {
       const userId = getUserId(req);

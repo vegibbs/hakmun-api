@@ -190,7 +190,7 @@ function computeEntitlementsFromUser(user) {
     };
   }
 
-  const canAccessTeacherTools = role === "teacher" || isApprover;
+  const canAccessTeacherTools = role === "teacher" || isApprover || isAdmin;
   const canApproveContent = isApprover;
   const adminAllowed = isRootAdmin;
 

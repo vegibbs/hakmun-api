@@ -2,7 +2,7 @@
 // PURPOSE: Teacher-centric endpoints — all-students roster, student notes.
 
 const express = require("express");
-const { requireSession, requireRole } = require("../auth/session");
+const { requireSession, requireEntitlement } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
@@ -21,7 +21,7 @@ function getUserId(req) {
 router.get(
   "/v1/teachers/students",
   requireSession,
-  requireRole("teacher", "approver", "admin"),
+  requireEntitlement("teacher:tools"),
   async (req, res) => {
     try {
       const teacherId = getUserId(req);
@@ -200,7 +200,7 @@ async function verifyTeacherStudentRelationship(teacherId, studentId) {
 router.get(
   "/v1/teachers/students/:studentId/notes",
   requireSession,
-  requireRole("teacher", "approver", "admin"),
+  requireEntitlement("teacher:tools"),
   async (req, res) => {
     try {
       const teacherId = getUserId(req);
@@ -247,7 +247,7 @@ router.get(
 router.put(
   "/v1/teachers/students/:studentId/notes",
   requireSession,
-  requireRole("teacher", "approver", "admin"),
+  requireEntitlement("teacher:tools"),
   async (req, res) => {
     try {
       const teacherId = getUserId(req);
@@ -298,7 +298,7 @@ router.put(
 router.patch(
   "/v1/teachers/students/:studentId/target-level",
   requireSession,
-  requireRole("teacher", "approver", "admin"),
+  requireEntitlement("teacher:tools"),
   async (req, res) => {
     try {
       const teacherId = getUserId(req);

@@ -6,7 +6,7 @@
 //   POST /v1/admin/vocab/resolve    — link or dismiss an unmatched item
 
 const express = require("express");
-const { requireSession, requireRole } = require("../auth/session");
+const { requireSession, requireEntitlement } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { withTimeout } = require("../util/time");
 
@@ -18,7 +18,7 @@ function getUserId(req) {
 
 // GET /v1/admin/vocab/unmatched
 // Returns unmatched lemmas ranked by frequency.
-router.get("/v1/admin/vocab/unmatched", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.get("/v1/admin/vocab/unmatched", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -42,7 +42,7 @@ router.get("/v1/admin/vocab/unmatched", requireSession, requireRole("teacher", "
 
 // GET /v1/admin/vocab/suggest?lemma=...&q=...
 // Suggests teaching_vocab entries that match a lemma or keyword.
-router.get("/v1/admin/vocab/suggest", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.get("/v1/admin/vocab/suggest", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -111,7 +111,7 @@ router.get("/v1/admin/vocab/suggest", requireSession, requireRole("teacher", "ap
 // POST /v1/admin/vocab/resolve
 // Body: { lemma, action: "link"|"dismiss", vocab_id? }
 // Resolves an unmatched vocab item by linking or dismissing.
-router.post("/v1/admin/vocab/resolve", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.post("/v1/admin/vocab/resolve", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });

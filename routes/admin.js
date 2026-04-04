@@ -283,7 +283,7 @@ router.post(
       const isActiveRaw = req.body?.isActive;
 
       const role = roleRaw !== undefined && roleRaw !== null ? String(roleRaw).trim() : "student";
-      if (!["student", "teacher", "approver"].includes(role)) {
+      if (!["student", "teacher"].includes(role)) {
         return res.status(400).json({ error: "invalid role" });
       }
 

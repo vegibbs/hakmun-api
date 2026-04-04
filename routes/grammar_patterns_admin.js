@@ -6,7 +6,7 @@
 //   POST /v1/admin/patterns/aliases    — add new aliases
 
 const express = require("express");
-const { requireSession, requireRole } = require("../auth/session");
+const { requireSession, requireEntitlement } = require("../auth/session");
 const { pool } = require("../db/pool");
 const { withTimeout } = require("../util/time");
 
@@ -18,7 +18,7 @@ function getUserId(req) {
 
 // GET /v1/admin/patterns/unmatched
 // Returns unmatched surface forms ranked by frequency, with closest alias suggestions.
-router.get("/v1/admin/patterns/unmatched", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.get("/v1/admin/patterns/unmatched", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -44,7 +44,7 @@ router.get("/v1/admin/patterns/unmatched", requireSession, requireRole("teacher"
 // GET /v1/admin/patterns/suggest?q=reason    (keyword search across display_name, code, aliases)
 // Returns canonical grammar patterns ranked by similarity or keyword match.
 // Each result includes the pattern's code, display_name, pattern_group, and existing aliases.
-router.get("/v1/admin/patterns/suggest", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.get("/v1/admin/patterns/suggest", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
@@ -171,7 +171,7 @@ router.get("/v1/admin/patterns/suggest", requireSession, requireRole("teacher", 
 // POST /v1/admin/patterns/aliases
 // Body: { aliases: [{ pattern_code: "GP_...", alias_raw: "-해요" }] }
 // Adds new aliases and optionally backfills orphaned content_items.
-router.post("/v1/admin/patterns/aliases", requireSession, requireRole("teacher", "approver"), async (req, res) => {
+router.post("/v1/admin/patterns/aliases", requireSession, requireEntitlement("teacher:tools"), async (req, res) => {
   try {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
