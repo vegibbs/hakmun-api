@@ -105,6 +105,7 @@ app.use(require("./routes/translate"));
 app.use(require("./routes/media"));
 app.use(require("./routes/bugs"));
 app.use(require("./routes/collaboration"));
+app.use(require("./routes/collab-topics"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
