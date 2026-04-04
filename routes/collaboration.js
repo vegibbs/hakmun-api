@@ -150,8 +150,12 @@ router.get("/v1/channels", requireSession, async (req, res) => {
     const r = await withTimeout(
       pool.query(
         `SELECT c.id, c.name, c.description, c.is_archived, c.created_at, c.updated_at,
-                cm.role AS member_role,
-                ct.name AS translated_name, ct.description AS translated_description
+                cm.role AS member_role, cm.last_read_at,
+                ct.name AS translated_name, ct.description AS translated_description,
+                (SELECT COUNT(*) FROM messages m
+                 WHERE m.channel_id = c.id
+                   AND m.created_at > COALESCE(cm.last_read_at, cm.joined_at)
+                ) AS unread_count
          FROM channels c
          JOIN channel_members cm ON cm.channel_id = c.id AND cm.user_id = $1
          LEFT JOIN channel_translations ct ON ct.channel_id = c.id AND ct.language = $2
@@ -172,6 +176,7 @@ router.get("/v1/channels", requireSession, async (req, res) => {
       is_archived: row.is_archived,
       created_at: row.created_at,
       updated_at: row.updated_at,
+      unread_count: parseInt(row.unread_count) || 0,
     }));
 
     return res.json({ ok: true, channels });
@@ -415,6 +420,28 @@ router.delete("/v1/channels/:id/members/:userId", requireSession, async (req, re
     return res.json({ ok: true });
   } catch (err) {
     logger.error("[collaboration] remove member failed", { err: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/channels/:id/read — Mark channel as read
+------------------------------------------------------------------ */
+
+router.post("/v1/channels/:id/read", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    await pool.query(
+      `UPDATE channel_members SET last_read_at = now()
+       WHERE channel_id = $1 AND user_id = $2`,
+      [req.params.id, userId]
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    logger.error("[collaboration] mark read failed", { err: String(err?.message || err) });
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
