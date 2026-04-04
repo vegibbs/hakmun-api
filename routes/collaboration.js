@@ -368,6 +368,34 @@ router.put("/v1/channels/:id", requireSession, async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   POST /v1/channels/:id/archive — Toggle archive status (admin only)
+------------------------------------------------------------------ */
+
+router.post("/v1/channels/:id/archive", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    if (!await isChannelAdmin(req.params.id, userId)) {
+      return res.status(403).json({ ok: false, error: "NOT_ADMIN" });
+    }
+
+    const { archive } = req.body || {};
+    const newState = archive !== false; // default to true
+
+    await pool.query(
+      `UPDATE channels SET is_archived = $1, updated_at = now() WHERE id = $2`,
+      [newState, req.params.id]
+    );
+
+    return res.json({ ok: true, is_archived: newState });
+  } catch (err) {
+    logger.error("[collaboration] archive channel failed", { err: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
    POST /v1/channels/:id/members — Add members
 ------------------------------------------------------------------ */
 
@@ -462,9 +490,28 @@ router.get("/v1/channels/:id/messages", requireSession, async (req, res) => {
     const appLang = await getUserAppLanguage(userId);
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const cursor = req.query.cursor || null; // ISO timestamp
+    const search = req.query.search ? req.query.search.trim() : null;
 
     let query, params;
-    if (cursor) {
+    if (search) {
+      // Search matches original text or any translation
+      const searchPattern = `%${search}%`;
+      query = `SELECT m.id, m.author_user_id, m.original_text, m.original_language,
+                      m.translation_status, m.created_at,
+                      u.display_name AS author_display_name,
+                      u.profile_photo_object_key AS author_photo_key,
+                      mt_user.translated_text
+               FROM messages m
+               JOIN users u ON u.user_id = m.author_user_id
+               LEFT JOIN message_translations mt_user ON mt_user.message_id = m.id AND mt_user.language = $3
+               WHERE m.channel_id = $1
+                 AND (m.original_text ILIKE $4
+                      OR EXISTS (SELECT 1 FROM message_translations mt2
+                                 WHERE mt2.message_id = m.id AND mt2.translated_text ILIKE $4))
+               ORDER BY m.created_at DESC
+               LIMIT $2`;
+      params = [req.params.id, limit, appLang || "en", searchPattern];
+    } else if (cursor) {
       query = `SELECT m.id, m.author_user_id, m.original_text, m.original_language,
                       m.translation_status, m.created_at,
                       u.display_name AS author_display_name,
