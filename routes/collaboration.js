@@ -467,6 +467,30 @@ router.get("/v1/channels/:id/messages", requireSession, async (req, res) => {
 
     const r = await withTimeout(pool.query(query, params), 8000, "db-list-messages");
 
+    // Fetch media attachments for all messages in one query
+    const messageIds = r.rows.map(row => row.id);
+    const mediaByMessageId = {};
+    if (messageIds.length > 0) {
+      const mediaR = await pool.query(
+        `SELECT mm.message_id, med.id AS media_id, med.object_key, med.content_type, med.size_bytes
+         FROM message_media mm
+         JOIN media med ON med.id = mm.media_id
+         WHERE mm.message_id = ANY($1)
+         ORDER BY mm.sort_order`,
+        [messageIds]
+      );
+      for (const mrow of mediaR.rows) {
+        if (!mediaByMessageId[mrow.message_id]) mediaByMessageId[mrow.message_id] = [];
+        const url = mrow.object_key ? await signImageUrl(mrow.object_key) : null;
+        mediaByMessageId[mrow.message_id].push({
+          media_id: mrow.media_id,
+          url,
+          content_type: mrow.content_type,
+          size_bytes: mrow.size_bytes,
+        });
+      }
+    }
+
     const messages = [];
     for (const row of r.rows) {
       const authorPhotoUrl = row.author_photo_key
@@ -491,6 +515,7 @@ router.get("/v1/channels/:id/messages", requireSession, async (req, res) => {
         is_translated: !isOriginalInUserLang && row.translated_text != null,
         translation_status: row.translation_status,
         created_at: row.created_at,
+        attachments: mediaByMessageId[row.id] || [],
       });
     }
 
