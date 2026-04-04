@@ -101,6 +101,8 @@ app.use(require("./routes/numbers_drills"));
 app.use(require("./routes/songs"));
 app.use(require("./routes/user_songs"));
 app.use(require("./routes/daily_sentence"));
+app.use(require("./routes/translate"));
+app.use(require("./routes/media"));
 
 // ------------------------------------------------------------------
 // Export app + boot-time A0 validation hook (used by server.js)
