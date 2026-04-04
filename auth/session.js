@@ -173,6 +173,7 @@ function computeEntitlementsFromUser(user) {
   const isActive = Boolean(user?.isActive);
   const isRootAdmin = Boolean(user?.isRootAdmin);
   const isAdmin = Boolean(user?.isAdmin);
+  const isApprover = Boolean(user?.isApprover);
 
   // Fail-closed: inactive users have no entitlements.
   if (!isActive) {
@@ -189,8 +190,8 @@ function computeEntitlementsFromUser(user) {
     };
   }
 
-  const canAccessTeacherTools = role === "teacher" || role === "approver";
-  const canApproveContent = role === "approver";
+  const canAccessTeacherTools = role === "teacher" || isApprover;
+  const canApproveContent = isApprover;
   const adminAllowed = isRootAdmin;
 
   const entitlements = [];
@@ -208,6 +209,7 @@ function computeEntitlementsFromUser(user) {
 
   if (isAdmin) entitlements.push("flag:is_admin");
   if (isRootAdmin) entitlements.push("flag:is_root_admin");
+  if (isApprover) entitlements.push("flag:is_approver");
 
   const capabilities = {
     canUseApp: true,
@@ -252,7 +254,7 @@ async function getUserState(userID) {
 
   const { rows } = await pool.query(
     `
-    select role, is_admin, is_root_admin, is_active, display_name,
+    select role, is_admin, is_root_admin, is_approver, is_active, display_name,
            primary_language, gloss_language,
            customize_learning, share_progress_default, allow_teacher_adjust_default,
            location_city, location_country, share_city, share_country,
@@ -271,6 +273,7 @@ async function getUserState(userID) {
       role: "student",
       is_admin: false,
       is_root_admin: false,
+      is_approver: false,
       is_active: true
     }
   );
@@ -354,6 +357,7 @@ async function requireSession(req, res, next) {
       role: state.role,
       isAdmin: Boolean(state.is_admin),
       isRootAdmin: Boolean(state.is_root_admin),
+      isApprover: Boolean(state.is_approver),
       isActive,
       isTeacher: String(state.role || "student") === "teacher",
       displayName: state.display_name || null,

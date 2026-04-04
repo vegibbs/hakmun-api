@@ -85,6 +85,7 @@ router.get("/v1/session/whoami", requireSession, async (req, res) => {
       role: req.user.role,
       isTeacher: Boolean(req.user.isTeacher),
       isAdmin: Boolean(req.user.isAdmin),
+      isApprover: Boolean(req.user.isApprover),
       isRootAdmin: Boolean(req.user.isRootAdmin),
       isActive: Boolean(req.user.isActive),
 

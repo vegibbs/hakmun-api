@@ -95,7 +95,7 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
       `
       insert into users (user_id, role, is_active, is_admin, is_root_admin)
       values ($1, $2, $3, false, false)
-      returning user_id, role, is_active, is_admin, is_root_admin
+      returning user_id, role, is_active, is_admin, is_root_admin, is_approver
       `,
       [newUserID, role, Boolean(isActive)]
     );
@@ -137,6 +137,7 @@ async function createUserWithPrimaryHandle({ primaryHandle, role = "student", is
         is_active: user.is_active,
         is_admin: user.is_admin,
         is_root_admin: user.is_root_admin,
+        is_approver: user.is_approver,
         primary_handle: primaryHandle
       }
     };
@@ -182,6 +183,7 @@ async function findUsersForAdmin({ search, offset = 0, limit = 50 }) {
         u.is_active,
         u.is_admin,
         u.is_root_admin,
+        u.is_approver,
         u.display_name,
         u.last_seen_at,
         u.created_at,
@@ -206,6 +208,7 @@ async function findUsersForAdmin({ search, offset = 0, limit = 50 }) {
         u.is_active,
         u.is_admin,
         u.is_root_admin,
+        u.is_approver,
         u.display_name,
         u.last_seen_at,
         u.created_at,
@@ -328,7 +331,7 @@ router.get(
   }
 );
 
-// PATCH /v1/admin/users/:userID { role?, isActive? }
+// PATCH /v1/admin/users/:userID { role?, isActive?, isAdmin?, isApprover? }
 router.patch(
   "/v1/admin/users/:userID",
   requireSession,
@@ -343,6 +346,8 @@ router.patch(
 
       const roleRaw = req.body?.role;
       const isActiveRaw = req.body?.isActive;
+      const isAdminRaw = req.body?.isAdmin;
+      const isApproverRaw = req.body?.isApprover;
 
       const updates = [];
       const params = [targetUserID];
@@ -350,7 +355,7 @@ router.patch(
 
       if (roleRaw !== undefined && roleRaw !== null) {
         const role = String(roleRaw).trim();
-        if (!["student", "teacher", "approver"].includes(role)) {
+        if (!["student", "teacher"].includes(role)) {
           return res.status(400).json({ error: "invalid role" });
         }
         updates.push(`role = $${idx++}`);
@@ -363,15 +368,27 @@ router.patch(
         params.push(isActive);
       }
 
+      if (isAdminRaw !== undefined && isAdminRaw !== null) {
+        updates.push(`is_admin = $${idx++}`);
+        params.push(Boolean(isAdminRaw));
+      }
+
+      if (isApproverRaw !== undefined && isApproverRaw !== null) {
+        updates.push(`is_approver = $${idx++}`);
+        params.push(Boolean(isApproverRaw));
+      }
+
       if (!updates.length) {
         return res.status(400).json({ error: "no updates" });
       }
 
       // Never allow demotion of pinned root admins (safety invariant)
       if (isPinnedRootAdmin(targetUserID)) {
-        // Prevent disabling pinned root admin by accident
         if (updates.some((u) => u.startsWith("is_active")) && Boolean(isActiveRaw) === false) {
           return res.status(403).json({ error: "cannot deactivate pinned root admin" });
+        }
+        if (updates.some((u) => u.startsWith("is_admin")) && Boolean(isAdminRaw) === false) {
+          return res.status(403).json({ error: "cannot remove admin from pinned root admin" });
         }
       }
 
@@ -379,7 +396,7 @@ router.patch(
       update users
       set ${updates.join(", ")}
       where user_id = $1
-      returning user_id, role, is_active, is_admin, is_root_admin
+      returning user_id, role, is_active, is_admin, is_root_admin, is_approver
     `;
 
       const { rows } = await pool.query(q, params);
