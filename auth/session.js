@@ -192,7 +192,7 @@ function computeEntitlementsFromUser(user) {
 
   const canAccessTeacherTools = role === "teacher" || isApprover || isAdmin;
   const canApproveContent = isApprover;
-  const adminAllowed = isRootAdmin;
+  const adminAllowed = isAdmin || isRootAdmin;
 
   const entitlements = [];
 
@@ -203,6 +203,7 @@ function computeEntitlementsFromUser(user) {
   if (canApproveContent) entitlements.push("approver:content");
 
   if (adminAllowed) {
+    entitlements.push("admin:root");
     entitlements.push("admin:users:read");
     entitlements.push("admin:users:write");
   }
