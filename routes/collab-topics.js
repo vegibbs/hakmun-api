@@ -98,9 +98,10 @@ async function translateText(text, sourceLang, targetLang) {
 The author is writing in ${langName(sourceLang)}.
 
 Rules:
-- Preserve Korean linguistic examples exactly as-is.
-- Translate the discussion into ${langName(targetLang)}.
+- Text inside quotation marks ("..." or "...") must be preserved EXACTLY as-is. Do NOT translate quoted text.
+- Translate everything else into ${langName(targetLang)}.
 - Keep the tone conversational and natural.
+- Preserve all formatting (headings, lists, line breaks).
 - Return ONLY the translation. No explanations.`;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
