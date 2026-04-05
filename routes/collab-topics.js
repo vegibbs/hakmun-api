@@ -189,7 +189,7 @@ router.get("/v1/classes/:classId/topics", requireSession, async (req, res) => {
 
     const r = await withTimeout(
       pool.query(
-        `SELECT t.id, t.title, t.created_by, t.created_at, t.updated_at,
+        `SELECT t.id, t.class_id, t.title, t.created_by, t.created_at, t.updated_at,
                 CASE WHEN tr.last_read_at IS NULL OR t.updated_at > tr.last_read_at
                      THEN true ELSE false END AS has_unread
            FROM collab_topics t
