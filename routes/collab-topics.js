@@ -177,6 +177,54 @@ async function translateBlock(blockId, text, hash, classId) {
   }
 }
 
+/** Translate topic document content per-paragraph to all needed languages. */
+async function translateTopicContent(topicId, content, hash, classId) {
+  if (!content.trim()) return;
+
+  const paragraphs = content.split("\n\n").filter(p => p.trim());
+  if (paragraphs.length === 0) return;
+
+  // Detect source language from first substantial paragraph
+  const sampleText = paragraphs.find(p => p.trim().length > 10) || paragraphs[0];
+  const sourceLang = await detectLanguage(sampleText);
+  const allLangs = await getClassMemberLanguages(classId);
+  const targetLangs = allLangs.filter(l => l !== sourceLang);
+
+  for (const targetLang of targetLangs) {
+    // Check if we already have a translation with matching hash
+    const existing = await pool.query(
+      `SELECT source_hash FROM collab_topic_translations
+        WHERE topic_id = $1 AND language = $2`,
+      [topicId, targetLang]
+    );
+    if (existing.rows.length > 0 && existing.rows[0].source_hash === hash) continue;
+
+    try {
+      // Translate each paragraph individually for incremental caching
+      const translatedParagraphs = [];
+      for (const para of paragraphs) {
+        const paraHash = contentHash(para);
+        // For now, translate every paragraph (could add per-paragraph cache later)
+        const translated = await translateText(para, sourceLang, targetLang);
+        translatedParagraphs.push(translated);
+      }
+
+      const translatedDoc = translatedParagraphs.join("\n\n");
+      await pool.query(
+        `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (topic_id, language)
+         DO UPDATE SET translated_text = EXCLUDED.translated_text,
+                       source_hash = EXCLUDED.source_hash,
+                       created_at = now()`,
+        [topicId, targetLang, translatedDoc, hash]
+      );
+    } catch (err) {
+      logger.error({ err, topicId, targetLang }, "collab-topic: content translation failed");
+    }
+  }
+}
+
 /* ------------------------------------------------------------------
    GET /v1/classes/:classId/topics — List topics
 ------------------------------------------------------------------ */
@@ -310,6 +358,136 @@ router.delete("/v1/classes/:classId/topics/:topicId", requireSession, async (req
     res.json({ ok: true });
   } catch (err) {
     logger.error({ err }, "DELETE /topics/:id failed");
+    res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/classes/:classId/topics/:topicId/content — Get document content
+------------------------------------------------------------------ */
+
+router.get("/v1/classes/:classId/topics/:topicId/content", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId, topicId } = req.params;
+    const access = await checkClassAccess(classId, userId);
+    if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+
+    const r = await pool.query(
+      `SELECT content, content_hash, updated_at
+         FROM collab_topics
+        WHERE id = $1::uuid AND class_id = $2::uuid`,
+      [topicId, classId]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    // Mark as read
+    await pool.query(
+      `INSERT INTO collab_topic_reads (topic_id, user_id, last_read_at)
+       VALUES ($1::uuid, $2::uuid, now())
+       ON CONFLICT (topic_id, user_id)
+       DO UPDATE SET last_read_at = now()`,
+      [topicId, userId]
+    );
+
+    const row = r.rows[0];
+    res.json({
+      ok: true,
+      content: row.content || "",
+      content_hash: row.content_hash,
+      updated_at: row.updated_at,
+    });
+  } catch (err) {
+    logger.error({ err }, "GET /content failed");
+    res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   PUT /v1/classes/:classId/topics/:topicId/content — Save document content
+------------------------------------------------------------------ */
+
+router.put("/v1/classes/:classId/topics/:topicId/content", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId, topicId } = req.params;
+    const access = await checkClassAccess(classId, userId);
+    if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+
+    const topicCheck = await pool.query(
+      `SELECT 1 FROM collab_topics WHERE id = $1::uuid AND class_id = $2::uuid`,
+      [topicId, classId]
+    );
+    if (topicCheck.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const { content } = req.body;
+    if (typeof content !== "string") return res.status(400).json({ ok: false, error: "CONTENT_REQUIRED" });
+
+    const hash = contentHash(content);
+
+    await pool.query(
+      `UPDATE collab_topics SET content = $1, content_hash = $2, updated_at = now()
+        WHERE id = $3::uuid`,
+      [content, hash, topicId]
+    );
+
+    // Translate in background
+    translateTopicContent(topicId, content, hash, classId).catch(err => {
+      logger.error({ err, topicId }, "collab-topic: content translation failed");
+    });
+
+    res.json({ ok: true, content_hash: hash });
+  } catch (err) {
+    logger.error({ err }, "PUT /content failed");
+    res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   GET /v1/classes/:classId/topics/:topicId/translation — Get translated content
+------------------------------------------------------------------ */
+
+router.get("/v1/classes/:classId/topics/:topicId/translation", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId, topicId } = req.params;
+    const access = await checkClassAccess(classId, userId);
+    if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+
+    // Get reader's language
+    const userR = await pool.query(
+      `SELECT primary_language FROM users WHERE user_id = $1::uuid`, [userId]
+    );
+    const lang = userR.rows[0]?.primary_language || "en";
+
+    // Get current content hash
+    const topicR = await pool.query(
+      `SELECT content_hash FROM collab_topics WHERE id = $1::uuid AND class_id = $2::uuid`,
+      [topicId, classId]
+    );
+    if (topicR.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    const currentHash = topicR.rows[0].content_hash;
+
+    // Only return translation if source_hash matches (not stale)
+    const transR = await pool.query(
+      `SELECT translated_text, source_hash FROM collab_topic_translations
+        WHERE topic_id = $1::uuid AND language = $2`,
+      [topicId, lang]
+    );
+
+    if (transR.rows.length === 0 || transR.rows[0].source_hash !== currentHash) {
+      return res.json({ ok: true, translated_content: null, stale: transR.rows.length > 0 });
+    }
+
+    res.json({ ok: true, translated_content: transR.rows[0].translated_text, stale: false });
+  } catch (err) {
+    logger.error({ err }, "GET /translation failed");
     res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
