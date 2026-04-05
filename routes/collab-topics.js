@@ -508,6 +508,54 @@ router.post("/v1/classes/:classId/topics/:topicId/translate", requireSession, as
 });
 
 /* ------------------------------------------------------------------
+   PUT /v1/classes/:classId/topics/:topicId/translation — Save translated content directly
+   Used when a user edits the translated version of the document.
+------------------------------------------------------------------ */
+
+router.put("/v1/classes/:classId/topics/:topicId/translation", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId, topicId } = req.params;
+    const access = await checkClassAccess(classId, userId);
+    if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+
+    const topicCheck = await pool.query(
+      `SELECT content_hash FROM collab_topics WHERE id = $1::uuid AND class_id = $2::uuid`,
+      [topicId, classId]
+    );
+    if (topicCheck.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const { content, language } = req.body;
+    if (typeof content !== "string") return res.status(400).json({ ok: false, error: "CONTENT_REQUIRED" });
+    if (!language) return res.status(400).json({ ok: false, error: "LANGUAGE_REQUIRED" });
+
+    const sourceHash = topicCheck.rows[0].content_hash || "";
+
+    await pool.query(
+      `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
+       VALUES ($1::uuid, $2, $3, $4)
+       ON CONFLICT (topic_id, language)
+       DO UPDATE SET translated_text = EXCLUDED.translated_text,
+                     source_hash = EXCLUDED.source_hash,
+                     created_at = now()`,
+      [topicId, language, content, sourceHash]
+    );
+
+    // Update topic timestamp
+    await pool.query(
+      `UPDATE collab_topics SET updated_at = now() WHERE id = $1::uuid`, [topicId]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error({ err }, "PUT /translation failed");
+    res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
    GET /v1/classes/:classId/topics/:topicId/translation — Get translated content
 ------------------------------------------------------------------ */
 
