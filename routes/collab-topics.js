@@ -452,53 +452,107 @@ router.post("/v1/classes/:classId/topics/:topicId/translate", requireSession, as
     const access = await checkClassAccess(classId, userId);
     if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
 
-    // Save content first if provided
-    const { content } = req.body;
-    let hash;
-    if (typeof content === "string") {
-      hash = contentHash(content);
+    const { content, source_language } = req.body;
+    if (typeof content !== "string" || !content.trim()) {
+      return res.json({ ok: true, paragraphs_sent: 0, paragraphs_cached: 0 });
+    }
+
+    const hash = contentHash(content);
+    const sourceLang = source_language || "en";
+
+    // Save the source content to the right place
+    if (sourceLang === "en") {
+      // English content goes to the main content column
       await pool.query(
         `UPDATE collab_topics SET content = $1, content_hash = $2, updated_at = now()
           WHERE id = $3::uuid`,
         [content, hash, topicId]
       );
     } else {
-      // Use existing content
-      const r = await pool.query(
-        `SELECT content, content_hash FROM collab_topics WHERE id = $1::uuid AND class_id = $2::uuid`,
-        [topicId, classId]
+      // Non-English content goes to the translations table as the source
+      await pool.query(
+        `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
+         VALUES ($1::uuid, $2, $3, $4)
+         ON CONFLICT (topic_id, language)
+         DO UPDATE SET translated_text = EXCLUDED.translated_text,
+                       source_hash = EXCLUDED.source_hash,
+                       created_at = now()`,
+        [topicId, sourceLang, content, hash]
       );
-      if (r.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-      hash = r.rows[0].content_hash;
-      if (!r.rows[0].content?.trim()) return res.json({ ok: true, content_hash: hash, paragraphs_sent: 0, paragraphs_cached: 0 });
+      await pool.query(
+        `UPDATE collab_topics SET updated_at = now() WHERE id = $1::uuid`, [topicId]
+      );
     }
 
-    const topicR = await pool.query(
-      `SELECT content FROM collab_topics WHERE id = $1::uuid`, [topicId]
-    );
-    const currentContent = topicR.rows[0]?.content || "";
+    // Translate to all other class member languages
+    const allLangs = await getClassMemberLanguages(classId);
+    const targetLangs = allLangs.filter(l => l !== sourceLang);
+    if (targetLangs.length === 0) {
+      return res.json({ ok: true, paragraphs_sent: 0, paragraphs_cached: 0 });
+    }
 
-    const result = await translateTopicContent(topicId, currentContent, hash, classId);
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "OPENAI_NOT_CONFIGURED" });
+    }
 
-    // Return the translation for the requesting user's language
-    const userR = await pool.query(
-      `SELECT primary_language FROM users WHERE user_id = $1::uuid`, [userId]
-    );
-    const userLang = userR.rows[0]?.primary_language || "en";
-    const transR = await pool.query(
-      `SELECT translated_text, source_hash FROM collab_topic_translations
-        WHERE topic_id = $1::uuid AND language = $2`,
-      [topicId, userLang]
-    );
-    const translation = transR.rows[0] || null;
+    const paragraphs = content.split("\n\n").filter(p => p.trim());
+    let totalSent = 0;
+    let totalCached = 0;
+
+    for (const targetLang of targetLangs) {
+      const translatedParagraphs = [];
+      for (const para of paragraphs) {
+        const paraHash = contentHash(para);
+        const cached = await pool.query(
+          `SELECT translated_text FROM collab_paragraph_cache
+            WHERE source_hash = $1 AND source_lang = $2 AND target_lang = $3`,
+          [paraHash, sourceLang, targetLang]
+        );
+        if (cached.rows.length > 0) {
+          translatedParagraphs.push(cached.rows[0].translated_text);
+          totalCached++;
+        } else {
+          const translated = await translateText(para, sourceLang, targetLang);
+          translatedParagraphs.push(translated);
+          totalSent++;
+          await pool.query(
+            `INSERT INTO collab_paragraph_cache (source_hash, source_lang, target_lang, translated_text)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (source_hash, source_lang, target_lang)
+             DO UPDATE SET translated_text = EXCLUDED.translated_text, created_at = now()`,
+            [paraHash, sourceLang, targetLang, translated]
+          );
+        }
+      }
+
+      const translatedDoc = translatedParagraphs.join("\n\n");
+
+      if (targetLang === "en") {
+        // If translating TO English, update the main content column
+        const enHash = contentHash(translatedDoc);
+        await pool.query(
+          `UPDATE collab_topics SET content = $1, content_hash = $2, updated_at = now()
+            WHERE id = $3::uuid`,
+          [translatedDoc, enHash, topicId]
+        );
+      } else {
+        // Store as a translation
+        await pool.query(
+          `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (topic_id, language)
+           DO UPDATE SET translated_text = EXCLUDED.translated_text,
+                         source_hash = EXCLUDED.source_hash,
+                         created_at = now()`,
+          [topicId, targetLang, translatedDoc, hash]
+        );
+      }
+    }
 
     res.json({
       ok: true,
-      content_hash: hash,
-      paragraphs_sent: result.paragraphsSent,
-      paragraphs_cached: result.paragraphsCached,
-      translation: translation ? translation.translated_text : null,
-      translation_source_hash: translation ? translation.source_hash : null,
+      paragraphs_sent: totalSent,
+      paragraphs_cached: totalCached,
     });
   } catch (err) {
     logger.error({ err, topicId: req.params.topicId }, "POST /translate failed");
