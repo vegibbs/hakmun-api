@@ -127,11 +127,17 @@ Rules:
 }
 
 /** Translate topic document content per-paragraph to all needed languages. */
+/**
+ * Translate topic content with per-paragraph caching.
+ * Only paragraphs without a cached translation are sent to the API.
+ * Returns { paragraphsSent, paragraphsCached }.
+ */
 async function translateTopicContent(topicId, content, hash, classId) {
-  if (!content.trim()) return;
+  if (!content.trim()) return { paragraphsSent: 0, paragraphsCached: 0 };
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not configured");
 
   const paragraphs = content.split("\n\n").filter(p => p.trim());
-  if (paragraphs.length === 0) return;
+  if (paragraphs.length === 0) return { paragraphsSent: 0, paragraphsCached: 0 };
 
   // Detect source language from first substantial paragraph
   const sampleText = paragraphs.find(p => p.trim().length > 10) || paragraphs[0];
@@ -139,39 +145,64 @@ async function translateTopicContent(topicId, content, hash, classId) {
   const allLangs = await getClassMemberLanguages(classId);
   const targetLangs = allLangs.filter(l => l !== sourceLang);
 
+  let totalSent = 0;
+  let totalCached = 0;
+
   for (const targetLang of targetLangs) {
-    // Check if we already have a translation with matching hash
+    // Check if full document translation is already current
     const existing = await pool.query(
       `SELECT source_hash FROM collab_topic_translations
         WHERE topic_id = $1 AND language = $2`,
       [topicId, targetLang]
     );
-    if (existing.rows.length > 0 && existing.rows[0].source_hash === hash) continue;
+    if (existing.rows.length > 0 && existing.rows[0].source_hash === hash) {
+      totalCached += paragraphs.length;
+      continue;
+    }
 
-    try {
-      // Translate each paragraph individually for incremental caching
-      const translatedParagraphs = [];
-      for (const para of paragraphs) {
-        const paraHash = contentHash(para);
-        // For now, translate every paragraph (could add per-paragraph cache later)
+    const translatedParagraphs = [];
+    for (const para of paragraphs) {
+      const paraHash = contentHash(para);
+
+      // Check paragraph cache
+      const cached = await pool.query(
+        `SELECT translated_text FROM collab_paragraph_cache
+          WHERE source_hash = $1 AND source_lang = $2 AND target_lang = $3`,
+        [paraHash, sourceLang, targetLang]
+      );
+
+      if (cached.rows.length > 0) {
+        translatedParagraphs.push(cached.rows[0].translated_text);
+        totalCached++;
+      } else {
         const translated = await translateText(para, sourceLang, targetLang);
         translatedParagraphs.push(translated);
-      }
+        totalSent++;
 
-      const translatedDoc = translatedParagraphs.join("\n\n");
-      await pool.query(
-        `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (topic_id, language)
-         DO UPDATE SET translated_text = EXCLUDED.translated_text,
-                       source_hash = EXCLUDED.source_hash,
-                       created_at = now()`,
-        [topicId, targetLang, translatedDoc, hash]
-      );
-    } catch (err) {
-      logger.error({ err, topicId, targetLang }, "collab-topic: content translation failed");
+        // Cache the paragraph translation
+        await pool.query(
+          `INSERT INTO collab_paragraph_cache (source_hash, source_lang, target_lang, translated_text)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (source_hash, source_lang, target_lang)
+           DO UPDATE SET translated_text = EXCLUDED.translated_text, created_at = now()`,
+          [paraHash, sourceLang, targetLang, translated]
+        );
+      }
     }
+
+    const translatedDoc = translatedParagraphs.join("\n\n");
+    await pool.query(
+      `INSERT INTO collab_topic_translations (topic_id, language, translated_text, source_hash)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (topic_id, language)
+       DO UPDATE SET translated_text = EXCLUDED.translated_text,
+                     source_hash = EXCLUDED.source_hash,
+                     created_at = now()`,
+      [topicId, targetLang, translatedDoc, hash]
+    );
   }
+
+  return { paragraphsSent: totalSent, paragraphsCached: totalCached };
 }
 
 /* ------------------------------------------------------------------
@@ -323,6 +354,12 @@ router.get("/v1/classes/:classId/topics/:topicId/content", requireSession, async
     const access = await checkClassAccess(classId, userId);
     if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
 
+    // Get user's language for auto-display
+    const userR = await pool.query(
+      `SELECT primary_language FROM users WHERE user_id = $1::uuid`, [userId]
+    );
+    const userLang = userR.rows[0]?.primary_language || "en";
+
     const r = await pool.query(
       `SELECT content, content_hash, updated_at
          FROM collab_topics
@@ -340,12 +377,23 @@ router.get("/v1/classes/:classId/topics/:topicId/content", requireSession, async
       [topicId, userId]
     );
 
+    // Check if a translation exists for the user's language
+    const transR = await pool.query(
+      `SELECT translated_text, source_hash FROM collab_topic_translations
+        WHERE topic_id = $1::uuid AND language = $2`,
+      [topicId, userLang]
+    );
+    const translation = transR.rows[0] || null;
+
     const row = r.rows[0];
     res.json({
       ok: true,
       content: row.content || "",
       content_hash: row.content_hash,
       updated_at: row.updated_at,
+      translation: translation ? translation.translated_text : null,
+      translation_source_hash: translation ? translation.source_hash : null,
+      translation_stale: translation ? translation.source_hash !== row.content_hash : null,
     });
   } catch (err) {
     logger.error({ err }, "GET /content failed");
@@ -383,15 +431,79 @@ router.put("/v1/classes/:classId/topics/:topicId/content", requireSession, async
       [content, hash, topicId]
     );
 
-    // Translate in background
-    translateTopicContent(topicId, content, hash, classId).catch(err => {
-      logger.error({ err, topicId }, "collab-topic: content translation failed");
-    });
-
     res.json({ ok: true, content_hash: hash });
   } catch (err) {
     logger.error({ err }, "PUT /content failed");
     res.status(500).json({ ok: false, error: "INTERNAL" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   POST /v1/classes/:classId/topics/:topicId/translate — Trigger translation
+   Saves content first, then translates only changed paragraphs.
+------------------------------------------------------------------ */
+
+router.post("/v1/classes/:classId/topics/:topicId/translate", requireSession, async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { classId, topicId } = req.params;
+    const access = await checkClassAccess(classId, userId);
+    if (!access.isMember) return res.status(403).json({ ok: false, error: "NOT_MEMBER" });
+
+    // Save content first if provided
+    const { content } = req.body;
+    let hash;
+    if (typeof content === "string") {
+      hash = contentHash(content);
+      await pool.query(
+        `UPDATE collab_topics SET content = $1, content_hash = $2, updated_at = now()
+          WHERE id = $3::uuid`,
+        [content, hash, topicId]
+      );
+    } else {
+      // Use existing content
+      const r = await pool.query(
+        `SELECT content, content_hash FROM collab_topics WHERE id = $1::uuid AND class_id = $2::uuid`,
+        [topicId, classId]
+      );
+      if (r.rows.length === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      hash = r.rows[0].content_hash;
+      if (!r.rows[0].content?.trim()) return res.json({ ok: true, content_hash: hash, paragraphs_sent: 0, paragraphs_cached: 0 });
+    }
+
+    const topicR = await pool.query(
+      `SELECT content FROM collab_topics WHERE id = $1::uuid`, [topicId]
+    );
+    const currentContent = topicR.rows[0]?.content || "";
+
+    const result = await translateTopicContent(topicId, currentContent, hash, classId);
+
+    // Return the translation for the requesting user's language
+    const userR = await pool.query(
+      `SELECT primary_language FROM users WHERE user_id = $1::uuid`, [userId]
+    );
+    const userLang = userR.rows[0]?.primary_language || "en";
+    const transR = await pool.query(
+      `SELECT translated_text, source_hash FROM collab_topic_translations
+        WHERE topic_id = $1::uuid AND language = $2`,
+      [topicId, userLang]
+    );
+    const translation = transR.rows[0] || null;
+
+    res.json({
+      ok: true,
+      content_hash: hash,
+      paragraphs_sent: result.paragraphsSent,
+      paragraphs_cached: result.paragraphsCached,
+      translation: translation ? translation.translated_text : null,
+      translation_source_hash: translation ? translation.source_hash : null,
+    });
+  } catch (err) {
+    logger.error({ err, topicId: req.params.topicId }, "POST /translate failed");
+    const msg = err.message === "OPENAI_API_KEY not configured" ? "OPENAI_NOT_CONFIGURED" : "INTERNAL";
+    res.status(500).json({ ok: false, error: msg });
   }
 });
 
