@@ -723,4 +723,164 @@ describe("PATCH /v1/content/items/:id (Phase 2 fields)", () => {
 
     expect(res.body.error).toBe("INVALID_OPERATIONAL_STATUS");
   });
+
+  // ================================================================
+  // Phase 3 — Promote to Global
+  // ================================================================
+
+  const NEW_GLOBAL_ITEM_ID = "ffff0000-0000-4000-f000-000000000006";
+  const NEW_REGISTRY_ID = "ffff0000-0000-4000-f000-000000000007";
+
+  // Test 15: Promote personal item → new global item with preliminary state
+  test("15. promote personal item → 201, new global content item", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // Mock: fetch source content item
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          content_item_id: ITEM_ID,
+          content_type: "sentence",
+          text: "테스트 문장입니다.",
+          language: "ko",
+          notes: null,
+          cefr_level: "A1",
+          topic: null,
+          naturalness_score: null,
+          politeness: null,
+          politeness_en: null,
+          tense: null,
+        },
+      ],
+    });
+
+    // Mock: check for existing global registry entry (none)
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    // Mock: duplicate content_items row
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          content_item_id: NEW_GLOBAL_ITEM_ID,
+          content_type: "sentence",
+          text: "테스트 문장입니다.",
+          language: "ko",
+          notes: null,
+          cefr_level: "A1",
+          topic: null,
+          naturalness_score: null,
+          politeness: null,
+          politeness_en: null,
+          tense: null,
+          created_at: "2026-04-06T00:00:00Z",
+          updated_at: "2026-04-06T00:00:00Z",
+        },
+      ],
+    });
+
+    // Mock: create global registry entry
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          id: NEW_REGISTRY_ID,
+          audience: "global",
+          global_state: "preliminary",
+          operational_status: "active",
+          owner_user_id: APPROVER_A_ID,
+          last_edited_by: APPROVER_A_ID,
+          last_edited_at: "2026-04-06T00:00:00Z",
+          module_tags: [],
+          created_at: "2026-04-06T00:00:00Z",
+          updated_at: "2026-04-06T00:00:00Z",
+        },
+      ],
+    });
+
+    const res = await request(app)
+      .post("/v1/library/global/items/promote")
+      .send({ content_item_id: ITEM_ID })
+      .expect(201);
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.item.content_item_id).toBe(NEW_GLOBAL_ITEM_ID);
+    expect(res.body.item.audience).toBe("global");
+    expect(res.body.item.global_state).toBe("preliminary");
+    expect(res.body.item.last_edited_by).toBe(APPROVER_A_ID);
+    expect(res.body.item.text).toBe("테스트 문장입니다.");
+  });
+
+  // Test 16: Promote same item again → 409 Conflict
+  test("16. promote already-global item → 409", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // Mock: fetch source content item
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          content_item_id: ITEM_ID,
+          content_type: "sentence",
+          text: "테스트 문장입니다.",
+          language: "ko",
+          notes: null,
+          cefr_level: null,
+          topic: null,
+          naturalness_score: null,
+          politeness: null,
+          politeness_en: null,
+          tense: null,
+        },
+      ],
+    });
+
+    // Mock: existing global registry entry found
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: REGISTRY_ID }],
+    });
+
+    const res = await request(app)
+      .post("/v1/library/global/items/promote")
+      .send({ content_item_id: ITEM_ID })
+      .expect(409);
+
+    expect(res.body.error).toBe("ALREADY_GLOBAL");
+  });
+
+  // Test 17: Non-approver cannot promote → 403
+  test("17. student cannot promote → 403", async () => {
+    mockUser = studentUser(STUDENT_ID);
+
+    const res = await request(app)
+      .post("/v1/library/global/items/promote")
+      .send({ content_item_id: ITEM_ID })
+      .expect(403);
+
+    expect(res.body.error).toBe("insufficient entitlement");
+  });
+
+  // Test 18: Promote nonexistent item → 404
+  test("18. promote nonexistent item → 404", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // Mock: source content item not found
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const res = await request(app)
+      .post("/v1/library/global/items/promote")
+      .send({ content_item_id: ITEM_ID })
+      .expect(404);
+
+    expect(res.body.error).toBe("NOT_FOUND");
+  });
+
+  // Test 19: Missing content_item_id → 400
+  test("19. promote without content_item_id → 400", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    const res = await request(app)
+      .post("/v1/library/global/items/promote")
+      .send({})
+      .expect(400);
+
+    expect(res.body.error).toBe("CONTENT_ITEM_ID_REQUIRED");
+  });
 });

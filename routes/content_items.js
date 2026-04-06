@@ -1195,6 +1195,140 @@ router.get("/v1/documents/highlights", requireSession, async (req, res) => {
 });
 
 // ------------------------------------------------------------------
+// POST /v1/library/global/items/promote
+// Body: { content_item_id: "..." }
+// Promotes a personal content item to the global pool.
+// Duplicates the content_items row and creates a new registry entry
+// with audience='global', global_state='preliminary'.
+// The personal copy stays intact — promotion is duplication, not move.
+// Returns 409 if the content item already has a global registry entry.
+// ------------------------------------------------------------------
+router.post(
+  "/v1/library/global/items/promote",
+  requireSession,
+  requireEntitlement("approver:content"),
+  async (req, res) => {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const contentItemId = req.body?.content_item_id;
+    if (!contentItemId) {
+      return res.status(400).json({ ok: false, error: "CONTENT_ITEM_ID_REQUIRED" });
+    }
+
+    const client = db && typeof db.connect === "function" ? await db.connect() : null;
+    const q = client ? client.query.bind(client) : dbQuery;
+
+    try {
+      if (client) await q("BEGIN", []);
+
+      // 1. Fetch the source content item
+      const srcResult = await q(
+        `SELECT ci.content_item_id, ci.content_type, ci.text, ci.language, ci.notes,
+                ci.cefr_level, ci.topic, ci.naturalness_score, ci.politeness, ci.politeness_en, ci.tense
+         FROM content_items ci
+         WHERE ci.content_item_id = $1::uuid`,
+        [contentItemId]
+      );
+
+      if (srcResult.rows.length === 0) {
+        if (client) await q("ROLLBACK", []);
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      const src = srcResult.rows[0];
+
+      // 2. Check if this content item already has a global registry entry
+      const existingGlobal = await q(
+        `SELECT id FROM library_registry_items
+         WHERE content_id = $1::uuid AND audience = 'global'
+         LIMIT 1`,
+        [contentItemId]
+      );
+
+      if (existingGlobal.rows.length > 0) {
+        if (client) await q("ROLLBACK", []);
+        return res.status(409).json({
+          ok: false,
+          error: "ALREADY_GLOBAL",
+          message: "This content item already exists in the global library",
+        });
+      }
+
+      // 3. Duplicate the content_items row
+      const dupResult = await q(
+        `INSERT INTO content_items
+           (owner_user_id, content_type, text, language, notes,
+            cefr_level, topic, naturalness_score, politeness, politeness_en, tense)
+         VALUES ($1::uuid, $2::text, $3::text, $4::text, $5,
+                 $6, $7, $8, $9, $10, $11)
+         RETURNING content_item_id, content_type, text, language, notes,
+                   cefr_level, topic, naturalness_score, politeness, politeness_en, tense,
+                   created_at, updated_at`,
+        [
+          userId, src.content_type, src.text, src.language, src.notes,
+          src.cefr_level, src.topic, src.naturalness_score, src.politeness,
+          src.politeness_en, src.tense,
+        ]
+      );
+      const newItem = dupResult.rows[0];
+
+      // 4. Create global registry entry for the new content item
+      const regResult = await q(
+        `INSERT INTO library_registry_items
+           (content_type, content_id, owner_user_id, audience, global_state,
+            operational_status, last_edited_by, last_edited_at)
+         VALUES ($1::text, $2::uuid, $3::uuid, 'global', 'preliminary',
+                 'active', $3::uuid, now())
+         RETURNING id, audience, global_state, operational_status, owner_user_id,
+                   last_edited_by, last_edited_at, module_tags,
+                   created_at, updated_at`,
+        [newItem.content_type, newItem.content_item_id, userId]
+      );
+      const reg = regResult.rows[0];
+
+      if (client) await q("COMMIT", []);
+
+      return res.status(201).json({
+        ok: true,
+        item: {
+          content_item_id: newItem.content_item_id,
+          content_type: newItem.content_type,
+          text: newItem.text,
+          language: newItem.language,
+          notes: newItem.notes,
+          cefr_level: newItem.cefr_level,
+          topic: newItem.topic,
+          naturalness_score: newItem.naturalness_score,
+          politeness: newItem.politeness,
+          politeness_en: newItem.politeness_en,
+          tense: newItem.tense,
+          created_at: newItem.created_at,
+          updated_at: newItem.updated_at,
+          registry_item_id: reg.id,
+          audience: reg.audience,
+          global_state: reg.global_state,
+          operational_status: reg.operational_status,
+          registry_owner_user_id: reg.owner_user_id,
+          last_edited_by: reg.last_edited_by,
+          last_edited_at: reg.last_edited_at,
+          module_tags: reg.module_tags,
+          has_audio: false,
+        },
+      });
+    } catch (err) {
+      if (client) {
+        try { await client.query("ROLLBACK"); } catch (_) {}
+      }
+      console.error("promote to global failed:", err);
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    } finally {
+      if (client) client.release();
+    }
+  }
+);
+
+// ------------------------------------------------------------------
 // PATCH /v1/library/global/items/:contentItemId/state
 // Body: { global_state: "approved" | "rejected" }
 // Transition global_state on a content item. Approver-only.
