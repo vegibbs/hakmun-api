@@ -143,7 +143,7 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
       return res.status(502).json({ ok: false, error: "OPENAI_NO_VALID_SENTENCES" });
     }
 
-    // 3. Insert into content_items + library_registry_items as global/approved
+    // 3. Insert into content_items + library_registry_items as global/preliminary
     //    Then link vocabulary and grammar patterns.
     const { pool } = db;
     const client = await pool.connect();
@@ -173,7 +173,7 @@ router.post("/v1/generate/sentences", requireSession, async (req, res) => {
           INSERT INTO library_registry_items
             (content_type, content_id, owner_user_id, audience, global_state, operational_status)
           VALUES
-            ('sentence', $1::uuid, $2::uuid, 'global', 'approved', 'active')
+            ('sentence', $1::uuid, $2::uuid, 'global', 'preliminary', 'active')
           RETURNING id, audience, global_state, operational_status
           `,
           [item.content_item_id, userId]
