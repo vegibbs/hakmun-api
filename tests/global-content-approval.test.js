@@ -1,7 +1,7 @@
 /**
  * Tests for Global Content Approval & Editing (Work Queue #13)
  *
- * 8 test cases from the execution doc:
+ * Phase 1 (8 test cases):
  *   1. State transition — approve
  *   2. State transition — reject
  *   3. Edit resets to preliminary
@@ -10,6 +10,14 @@
  *   6. Non-approver cannot edit global items
  *   7. Student filter (non-approver sees approved only)
  *   8. Approver filter (all items / filtered)
+ *
+ * Phase 2 (tests 9-14):
+ *   9.  PATCH accepts metadata fields (cefr_level, topic, politeness, tense)
+ *   10. PATCH accepts module_tags
+ *   11. PATCH accepts operational_status
+ *   12. Metadata-only edits don't reset global_state
+ *   13. module_tags validation (rejects invalid)
+ *   14. GET with module_tag filter
  */
 
 // ── Mock db/pool before anything else ──────────────────────────
@@ -119,6 +127,7 @@ function fullDtoRow(overrides = {}) {
     last_reviewed_at: null,
     last_edited_by: null,
     last_edited_at: null,
+    module_tags: [],
     has_audio: false,
     ...overrides,
   };
@@ -478,5 +487,240 @@ describe("GET /v1/library/global/items", () => {
     // Params should include 'preliminary' as the state filter
     const params = mockQuery.mock.calls[0][1];
     expect(params).toContain("preliminary");
+  });
+
+  // ================================================================
+  // Test 14: GET with module_tag filter
+  // ================================================================
+  test("14. module_tag filter narrows results", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    mockQuery.mockResolvedValueOnce({
+      rows: [fullDtoRow({ module_tags: ["numbers:time"] })],
+    });
+
+    const res = await request(app)
+      .get("/v1/library/global/items?content_type=sentence&module_tag=numbers:time")
+      .expect(200);
+
+    expect(res.body.ok).toBe(true);
+
+    // Verify the SQL used the @> JSONB containment operator
+    const sql = mockQuery.mock.calls[0][0];
+    expect(sql).toContain("module_tags");
+    expect(sql).toContain("@>");
+
+    // Verify the params include the JSONB array with the tag
+    const params = mockQuery.mock.calls[0][1];
+    expect(params).toContain(JSON.stringify(["numbers:time"]));
+  });
+});
+
+// ================================================================
+// Phase 2 Tests: Metadata & Module Tags
+// ================================================================
+describe("PATCH /v1/content/items/:id (Phase 2 fields)", () => {
+  // ================================================================
+  // Test 9: PATCH accepts metadata fields
+  // ================================================================
+  test("9. metadata fields (cefr_level, topic, politeness, tense) accepted", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // regCheck
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        registry_id: REGISTRY_ID,
+        audience: "global",
+        global_state: "approved",
+        current_text: "테스트 문장입니다.",
+        owner_user_id: null,
+      }],
+    });
+    // UPDATE content_items
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        content_item_id: ITEM_ID,
+        content_type: "sentence",
+        text: "테스트 문장입니다.",
+        notes: null,
+        cefr_level: "B1",
+        topic: "daily life",
+        politeness: "formal",
+        tense: "present",
+      }],
+    });
+    // UPDATE registry (editor tracking, no text change so no state reset)
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    // Full DTO fetch
+    mockQuery.mockResolvedValueOnce({
+      rows: [fullDtoRow({
+        cefr_level: "B1",
+        topic: "daily life",
+        politeness: "formal",
+        tense: "present",
+        global_state: "approved",
+      })],
+    });
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({
+        cefr_level: "B1",
+        topic: "daily life",
+        politeness: "formal",
+        tense: "present",
+      })
+      .expect(200);
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.item.cefr_level).toBe("B1");
+    expect(res.body.item.topic).toBe("daily life");
+
+    // Verify content_items UPDATE included the metadata fields
+    const updateSql = mockQuery.mock.calls[1][0];
+    expect(updateSql).toContain("cefr_level");
+    expect(updateSql).toContain("topic");
+    expect(updateSql).toContain("politeness");
+    expect(updateSql).toContain("tense");
+  });
+
+  // ================================================================
+  // Test 10: PATCH accepts module_tags
+  // ================================================================
+  test("10. module_tags accepted and persisted on registry", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // regCheck
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        registry_id: REGISTRY_ID,
+        audience: "global",
+        global_state: "approved",
+        current_text: "테스트 문장입니다.",
+        owner_user_id: null,
+      }],
+    });
+    // No content_items update (only registry fields)
+    // UPDATE registry (module_tags + editor tracking)
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    // Full DTO fetch
+    mockQuery.mockResolvedValueOnce({
+      rows: [fullDtoRow({
+        module_tags: ["numbers:time", "numbers:counters"],
+        global_state: "approved",
+      })],
+    });
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({ module_tags: ["numbers:time", "numbers:counters"] })
+      .expect(200);
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.item.module_tags).toEqual(["numbers:time", "numbers:counters"]);
+
+    // Verify registry UPDATE included module_tags
+    const regSql = mockQuery.mock.calls[1][0];
+    expect(regSql).toContain("module_tags");
+  });
+
+  // ================================================================
+  // Test 11: PATCH accepts operational_status
+  // ================================================================
+  test("11. operational_status update on registry", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // regCheck
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        registry_id: REGISTRY_ID,
+        audience: "global",
+        global_state: "approved",
+        current_text: "테스트 문장입니다.",
+        owner_user_id: null,
+      }],
+    });
+    // UPDATE registry
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    // Full DTO fetch
+    mockQuery.mockResolvedValueOnce({
+      rows: [fullDtoRow({ operational_status: "inactive", global_state: "approved" })],
+    });
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({ operational_status: "inactive" })
+      .expect(200);
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.item.operational_status).toBe("inactive");
+  });
+
+  // ================================================================
+  // Test 12: Metadata-only edits don't reset global_state
+  // ================================================================
+  test("12. metadata-only edit preserves approved state", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    // regCheck
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        registry_id: REGISTRY_ID,
+        audience: "global",
+        global_state: "approved",
+        current_text: "테스트 문장입니다.",
+        owner_user_id: null,
+      }],
+    });
+    // UPDATE content_items (cefr_level only)
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        content_item_id: ITEM_ID,
+        cefr_level: "B2",
+      }],
+    });
+    // UPDATE registry (editor tracking, no text change)
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    // Full DTO fetch
+    mockQuery.mockResolvedValueOnce({
+      rows: [fullDtoRow({ cefr_level: "B2", global_state: "approved" })],
+    });
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({ cefr_level: "B2" })
+      .expect(200);
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.item.global_state).toBe("approved");
+
+    // The registry update should NOT contain 'preliminary'
+    const regCall = mockQuery.mock.calls[2];
+    expect(regCall[0]).not.toContain("preliminary");
+  });
+
+  // ================================================================
+  // Test 13: Invalid module_tags rejected
+  // ================================================================
+  test("13. invalid module_tags → 400", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({ module_tags: "not-an-array" })
+      .expect(400);
+
+    expect(res.body.error).toBe("INVALID_MODULE_TAGS");
+  });
+
+  test("13b. invalid operational_status → 400", async () => {
+    mockUser = approverUser(APPROVER_A_ID);
+
+    const res = await request(app)
+      .patch(`/v1/content/items/${ITEM_ID}`)
+      .send({ operational_status: "deleted" })
+      .expect(400);
+
+    expect(res.body.error).toBe("INVALID_OPERATIONAL_STATUS");
   });
 });

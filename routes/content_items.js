@@ -144,6 +144,9 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
       ? normalizeGlobalState(req.query.global_state)
       : null;
 
+    // Module tag filter (e.g. ?module_tag=numbers:time)
+    const moduleTag = req.query?.module_tag || null;
+
     // Build WHERE clause for global_state
     let stateFilter;
     const params = [contentType];
@@ -160,6 +163,13 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
       // Non-approver → approved only
       stateFilter = `AND lri.global_state = $${paramIdx++}`;
       params.push("approved");
+    }
+
+    // Module tag filter clause
+    let moduleTagFilter = "";
+    if (moduleTag) {
+      moduleTagFilter = `AND lri.module_tags @> $${paramIdx++}::jsonb`;
+      params.push(JSON.stringify([moduleTag]));
     }
 
     const sql = `
@@ -187,6 +197,7 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         lri.last_reviewed_at,
         lri.last_edited_by,
         lri.last_edited_at,
+        lri.module_tags,
 
         gl.grammar_links,
         vl.vocab_ids,
@@ -219,7 +230,8 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
       WHERE ci.content_type = $1::text
         AND lri.audience = 'global'
         ${stateFilter}
-        AND lri.operational_status = 'active'
+        ${moduleTagFilter}
+        ${isApprover ? "" : "AND lri.operational_status = 'active'"}
       ORDER BY ci.created_at DESC
       LIMIT 5000
     `;
@@ -460,25 +472,45 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
 
 // ------------------------------------------------------------------
 // PATCH /v1/content/items/:contentItemId
-// Body: { text?: "...", notes?: "..." }
+// Body: { text?, notes?, cefr_level?, topic?, politeness?, tense?,
+//         module_tags?, operational_status? }
 // Owner-scoped for personal items; approver-scoped for global items.
 // When editing global items:
 //   - Requires approver:content entitlement
 //   - If text actually changes, auto-resets global_state to 'preliminary'
 //   - Sets last_edited_by / last_edited_at on the registry row
+//   - module_tags and operational_status update library_registry_items
 // ------------------------------------------------------------------
 router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res) => {
   const userId = getUserId(req);
   if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
   const { contentItemId } = req.params;
-  const { text, notes } = req.body || {};
+  const { text, notes, cefr_level, topic, politeness, tense,
+          module_tags, operational_status } = req.body || {};
 
-  if (text === undefined && notes === undefined) {
+  const hasContentFields = text !== undefined || notes !== undefined ||
+    cefr_level !== undefined || topic !== undefined ||
+    politeness !== undefined || tense !== undefined;
+  const hasRegistryFields = module_tags !== undefined || operational_status !== undefined;
+
+  if (!hasContentFields && !hasRegistryFields) {
     return res.status(400).json({ ok: false, error: "NO_FIELDS_PROVIDED" });
   }
   if (text !== undefined && (typeof text !== "string" || text.trim().length === 0)) {
     return res.status(400).json({ ok: false, error: "TEXT_EMPTY" });
+  }
+  // Validate module_tags is an array of strings
+  if (module_tags !== undefined) {
+    if (!Array.isArray(module_tags) || !module_tags.every(t => typeof t === "string")) {
+      return res.status(400).json({ ok: false, error: "INVALID_MODULE_TAGS" });
+    }
+  }
+  // Validate operational_status
+  if (operational_status !== undefined) {
+    if (!["active", "inactive"].includes(operational_status)) {
+      return res.status(400).json({ ok: false, error: "INVALID_OPERATIONAL_STATUS" });
+    }
   }
 
   try {
@@ -514,7 +546,7 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
       }
     }
 
-    // Build the UPDATE for content_items
+    // Build the UPDATE for content_items (text, notes, metadata fields)
     const setClauses = [];
     const params = [];
     let idx = 1;
@@ -527,51 +559,84 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
       setClauses.push(`notes = $${idx++}`);
       params.push(notes === null ? null : notes.trim());
     }
-    setClauses.push(`updated_at = now()`);
-
-    params.push(contentItemId);
-
-    const sql = `
-      UPDATE content_items
-      SET ${setClauses.join(", ")}
-      WHERE content_item_id = $${idx++}
-      RETURNING content_item_id, content_type, text, notes,
-                cefr_level, topic,
-                owner_user_id, created_at, updated_at
-    `;
-
-    const { rows } = await dbQuery(sql, params);
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    if (cefr_level !== undefined) {
+      setClauses.push(`cefr_level = $${idx++}`);
+      params.push(cefr_level === null ? null : cefr_level);
+    }
+    if (topic !== undefined) {
+      setClauses.push(`topic = $${idx++}`);
+      params.push(topic === null ? null : topic);
+    }
+    if (politeness !== undefined) {
+      setClauses.push(`politeness = $${idx++}`);
+      params.push(politeness === null ? null : politeness);
+    }
+    if (tense !== undefined) {
+      setClauses.push(`tense = $${idx++}`);
+      params.push(tense === null ? null : tense);
     }
 
-    const updatedItem = rows[0];
+    // Only run content_items UPDATE if there are content fields to change
+    let updatedItem = null;
+    if (setClauses.length > 0) {
+      setClauses.push(`updated_at = now()`);
+      params.push(contentItemId);
 
-    // For global items: if text actually changed, reset global_state to preliminary
+      const sql = `
+        UPDATE content_items
+        SET ${setClauses.join(", ")}
+        WHERE content_item_id = $${idx++}
+        RETURNING content_item_id, content_type, text, notes,
+                  cefr_level, topic, politeness, tense,
+                  owner_user_id, created_at, updated_at
+      `;
+
+      const { rows } = await dbQuery(sql, params);
+      if (rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+      updatedItem = rows[0];
+    }
+
+    // For global items: update registry row
     if (isGlobal && reg.registry_id) {
       const textChanged = text !== undefined && text.trim() !== reg.current_text;
 
+      // Build registry SET clauses
+      const regSet = [];
+      const regParams = [];
+      let rIdx = 1;
+
+      // Always track editor
+      regSet.push(`last_edited_by = $${rIdx++}::uuid`);
+      regParams.push(userId);
+      regSet.push(`last_edited_at = now()`);
+      regSet.push(`updated_at = now()`);
+
+      // Text change resets approval state
       if (textChanged) {
-        await dbQuery(
-          `UPDATE library_registry_items
-           SET global_state = 'preliminary',
-               last_edited_by = $1::uuid,
-               last_edited_at = now(),
-               updated_at = now()
-           WHERE id = $2::uuid`,
-          [userId, reg.registry_id]
-        );
-      } else {
-        // Notes-only edit: track the editor but don't reset state
-        await dbQuery(
-          `UPDATE library_registry_items
-           SET last_edited_by = $1::uuid,
-               last_edited_at = now(),
-               updated_at = now()
-           WHERE id = $2::uuid`,
-          [userId, reg.registry_id]
-        );
+        regSet.push(`global_state = 'preliminary'`);
       }
+
+      // Module tags
+      if (module_tags !== undefined) {
+        regSet.push(`module_tags = $${rIdx++}::jsonb`);
+        regParams.push(JSON.stringify(module_tags));
+      }
+
+      // Operational status
+      if (operational_status !== undefined) {
+        regSet.push(`operational_status = $${rIdx++}`);
+        regParams.push(operational_status);
+      }
+
+      regParams.push(reg.registry_id);
+      await dbQuery(
+        `UPDATE library_registry_items
+         SET ${regSet.join(", ")}
+         WHERE id = $${rIdx++}::uuid`,
+        regParams
+      );
     }
 
     // Fetch full item with registry fields for uniform DTO response
@@ -594,6 +659,7 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
          lri.audience,
          lri.global_state,
          lri.operational_status,
+         lri.module_tags,
          lri.owner_user_id AS registry_owner_user_id,
          lri.last_reviewed_by,
          lri.last_reviewed_at,
