@@ -76,6 +76,7 @@ app.use(require("./routes/krdict_search"));
 app.use(require("./routes/teaching_vocab_admin"));
 app.use(require("./routes/google_docs"));
 app.use(require("./routes/google_oauth"));
+app.use(require("./routes/google_picker"));
 app.use(require("./routes/google_docs_import"));
 app.use(require("./routes/google_docs_view"));
 app.use(require("./routes/google_docs_ingest"));

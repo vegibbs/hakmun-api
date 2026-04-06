@@ -5,8 +5,7 @@
 //   GET /v1/auth/google/callback     (stores tokens)
 //
 // Scopes (locked):
-// - drive.readonly (file access + export metadata)
-// - documents.readonly (Docs API read-only viewer)
+// - drive.file (per-file access via Picker selection, non-sensitive)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -80,7 +79,7 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
     const stateSecret = mustEnv("GOOGLE_OAUTH_STATE_SECRET");
 
     const scope = [
-      "https://www.googleapis.com/auth/documents.readonly"
+      "https://www.googleapis.com/auth/drive.file"
     ].join(" ");
 
     const nonce = crypto.randomBytes(16).toString("hex");
