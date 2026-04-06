@@ -7,7 +7,8 @@
     "start": "node db/migrate.js && node server.js",
     "migrate": "node db/migrate.js",
     "migrate:list": "node db/migrate.js --list",
-    "migrate:dry-run": "node db/migrate.js --dry-run"
+    "migrate:dry-run": "node db/migrate.js --dry-run",
+    "test": "jest --verbose"
   },
   "keywords": [],
   "author": "",
@@ -20,5 +21,9 @@
     "multer": "^1.4.5-lts.1",
     "openai": "^4.0.0",
     "pg": "^8.11.5"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "supertest": "^7.2.2"
   }
 }
