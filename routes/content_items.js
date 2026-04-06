@@ -17,7 +17,7 @@
 const express = require("express");
 const router = express.Router();
 
-const { requireSession } = require("../auth/session");
+const { requireSession, requireEntitlement } = require("../auth/session");
 const db = require("../db/pool");
 const { signImageUrls } = require("../util/s3");
 
@@ -117,13 +117,18 @@ router.get("/v1/content/items", requireSession, async (req, res) => {
 
 // ------------------------------------------------------------------
 // GET /v1/library/global/items?content_type=sentence&global_state=approved
-// Global library list (approved by default).
+// Global library list.
+//
+// Filter logic:
+// - If global_state param is specified → filter to that value
+// - If global_state param is omitted:
+//   - Approvers (approver:content) → return all (preliminary + approved + rejected)
+//   - Non-approvers → return only approved
 //
 // NOTE:
 // - This endpoint is intentionally separate from /v1/content/items.
 // - It returns the same row shape as /v1/content/items so the frontend can decode
 //   using ContentItemDTO without introducing new client models.
-// - Access control for preliminary/rejected can be added later (teacher-only).
 // ------------------------------------------------------------------
 router.get("/v1/library/global/items", requireSession, async (req, res) => {
   try {
@@ -131,7 +136,31 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
     if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
 
     const contentType = normalizeContentType(req.query?.content_type) || "sentence";
-    const globalState = normalizeGlobalState(req.query?.global_state) || "approved";
+    const ents = req.user?.entitlements || [];
+    const isApprover = Array.isArray(ents) && ents.includes("approver:content");
+
+    // Determine global_state filter
+    const requestedState = req.query?.global_state
+      ? normalizeGlobalState(req.query.global_state)
+      : null;
+
+    // Build WHERE clause for global_state
+    let stateFilter;
+    const params = [contentType];
+    let paramIdx = 2;
+
+    if (requestedState) {
+      // Explicit filter requested
+      stateFilter = `AND lri.global_state = $${paramIdx++}`;
+      params.push(requestedState);
+    } else if (isApprover) {
+      // Approver with no filter → show all non-null states
+      stateFilter = `AND lri.global_state IS NOT NULL`;
+    } else {
+      // Non-approver → approved only
+      stateFilter = `AND lri.global_state = $${paramIdx++}`;
+      params.push("approved");
+    }
 
     const sql = `
       SELECT
@@ -154,6 +183,10 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
         lri.global_state,
         lri.operational_status,
         lri.owner_user_id      AS registry_owner_user_id,
+        lri.last_reviewed_by,
+        lri.last_reviewed_at,
+        lri.last_edited_by,
+        lri.last_edited_at,
 
         gl.grammar_links,
         vl.vocab_ids,
@@ -185,13 +218,13 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
       ) aud ON true
       WHERE ci.content_type = $1::text
         AND lri.audience = 'global'
-        AND lri.global_state = $2::text
+        ${stateFilter}
         AND lri.operational_status = 'active'
       ORDER BY ci.created_at DESC
       LIMIT 5000
     `;
 
-    const { rows } = await dbQuery(sql, [contentType, globalState]);
+    const { rows } = await dbQuery(sql, params);
     return res.json({ ok: true, items: rows || [] });
   } catch (err) {
     console.error("global items list failed:", err);
@@ -428,7 +461,11 @@ router.get("/v1/content/items/coverage", requireSession, async (req, res) => {
 // ------------------------------------------------------------------
 // PATCH /v1/content/items/:contentItemId
 // Body: { text?: "...", notes?: "..." }
-// Owner-scoped update of text and/or notes fields.
+// Owner-scoped for personal items; approver-scoped for global items.
+// When editing global items:
+//   - Requires approver:content entitlement
+//   - If text actually changes, auto-resets global_state to 'preliminary'
+//   - Sets last_edited_by / last_edited_at on the registry row
 // ------------------------------------------------------------------
 router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res) => {
   const userId = getUserId(req);
@@ -445,6 +482,39 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
   }
 
   try {
+    // Check if this is a global content item
+    const regCheck = await dbQuery(
+      `SELECT lri.id AS registry_id, lri.audience, lri.global_state,
+              ci.text AS current_text, ci.owner_user_id
+       FROM content_items ci
+       LEFT JOIN library_registry_items lri
+         ON lri.content_type = ci.content_type
+        AND lri.content_id = ci.content_item_id
+       WHERE ci.content_item_id = $1::uuid
+       LIMIT 1`,
+      [contentItemId]
+    );
+
+    if (regCheck.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const reg = regCheck.rows[0];
+    const isGlobal = reg.audience === "global";
+
+    // Authorization: global items require approver:content; personal items require ownership
+    if (isGlobal) {
+      const ents = req.user?.entitlements || [];
+      if (!Array.isArray(ents) || !ents.includes("approver:content")) {
+        return res.status(403).json({ ok: false, error: "APPROVER_REQUIRED" });
+      }
+    } else {
+      if (reg.owner_user_id !== userId) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+    }
+
+    // Build the UPDATE for content_items
     const setClauses = [];
     const params = [];
     let idx = 1;
@@ -459,16 +529,14 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
     }
     setClauses.push(`updated_at = now()`);
 
-    params.push(contentItemId); // $idx
-    params.push(userId);        // $idx+1
+    params.push(contentItemId);
 
     const sql = `
       UPDATE content_items
       SET ${setClauses.join(", ")}
       WHERE content_item_id = $${idx++}
-        AND owner_user_id = $${idx}
       RETURNING content_item_id, content_type, text, notes,
-                cefr_level, topic, global_state, source,
+                cefr_level, topic,
                 owner_user_id, created_at, updated_at
     `;
 
@@ -477,7 +545,76 @@ router.patch("/v1/content/items/:contentItemId", requireSession, async (req, res
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
 
-    return res.json({ ok: true, item: rows[0] });
+    const updatedItem = rows[0];
+
+    // For global items: if text actually changed, reset global_state to preliminary
+    if (isGlobal && reg.registry_id) {
+      const textChanged = text !== undefined && text.trim() !== reg.current_text;
+
+      if (textChanged) {
+        await dbQuery(
+          `UPDATE library_registry_items
+           SET global_state = 'preliminary',
+               last_edited_by = $1::uuid,
+               last_edited_at = now(),
+               updated_at = now()
+           WHERE id = $2::uuid`,
+          [userId, reg.registry_id]
+        );
+      } else {
+        // Notes-only edit: track the editor but don't reset state
+        await dbQuery(
+          `UPDATE library_registry_items
+           SET last_edited_by = $1::uuid,
+               last_edited_at = now(),
+               updated_at = now()
+           WHERE id = $2::uuid`,
+          [userId, reg.registry_id]
+        );
+      }
+    }
+
+    // Fetch full item with registry fields for uniform DTO response
+    const fullResult = await dbQuery(
+      `SELECT
+         ci.content_item_id,
+         ci.content_type,
+         ci.text,
+         ci.language,
+         ci.notes,
+         ci.cefr_level,
+         ci.topic,
+         ci.naturalness_score,
+         ci.politeness,
+         ci.politeness_en,
+         ci.tense,
+         ci.created_at,
+         ci.updated_at,
+         lri.id AS registry_item_id,
+         lri.audience,
+         lri.global_state,
+         lri.operational_status,
+         lri.owner_user_id AS registry_owner_user_id,
+         lri.last_reviewed_by,
+         lri.last_reviewed_at,
+         lri.last_edited_by,
+         lri.last_edited_at,
+         COALESCE(aud.has_audio, false) AS has_audio
+       FROM content_items ci
+       LEFT JOIN library_registry_items lri
+         ON lri.content_type = ci.content_type
+        AND lri.content_id = ci.content_item_id
+       LEFT JOIN LATERAL (
+         SELECT true AS has_audio
+         FROM content_item_audio_variants cav
+         WHERE cav.content_item_id = ci.content_item_id
+         LIMIT 1
+       ) aud ON true
+       WHERE ci.content_item_id = $1::uuid`,
+      [contentItemId]
+    );
+
+    return res.json({ ok: true, item: fullResult.rows[0] || updatedItem });
   } catch (err) {
     console.error("content item update failed:", err);
     return res.status(500).json({ ok: false, error: "INTERNAL" });
@@ -990,5 +1127,129 @@ router.get("/v1/documents/highlights", requireSession, async (req, res) => {
     return res.status(500).json({ ok: false, error: "INTERNAL" });
   }
 });
+
+// ------------------------------------------------------------------
+// PATCH /v1/library/global/items/:contentItemId/state
+// Body: { global_state: "approved" | "rejected" }
+// Transition global_state on a content item. Approver-only.
+// Different-approver enforcement: if last_edited_by == caller, cannot approve.
+// ------------------------------------------------------------------
+router.patch(
+  "/v1/library/global/items/:contentItemId/state",
+  requireSession,
+  requireEntitlement("approver:content"),
+  async (req, res) => {
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "NO_SESSION" });
+
+    const { contentItemId } = req.params;
+    const newState = normalizeGlobalState(req.body?.global_state);
+
+    if (!newState || newState === "preliminary") {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_STATE",
+        message: "global_state must be 'approved' or 'rejected'",
+      });
+    }
+
+    try {
+      // Fetch the registry row for this content item
+      const regResult = await dbQuery(
+        `SELECT lri.id, lri.global_state, lri.last_edited_by, lri.content_id
+         FROM library_registry_items lri
+         WHERE lri.content_id = $1::uuid
+           AND lri.audience = 'global'
+           AND lri.operational_status = 'active'
+         LIMIT 1`,
+        [contentItemId]
+      );
+
+      if (regResult.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      }
+
+      const reg = regResult.rows[0];
+
+      // Different-approver enforcement: if caller edited this item, they cannot approve it
+      if (newState === "approved" && reg.last_edited_by === userId) {
+        return res.status(403).json({
+          ok: false,
+          error: "SAME_EDITOR_CANNOT_APPROVE",
+          message: "A different approver must confirm edited content",
+        });
+      }
+
+      // Update the registry row
+      const updateResult = await dbQuery(
+        `UPDATE library_registry_items
+         SET global_state = $1,
+             last_reviewed_by = $2::uuid,
+             last_reviewed_at = now(),
+             updated_at = now()
+         WHERE id = $3::uuid
+         RETURNING id, content_type, content_id, audience, global_state,
+                   operational_status, owner_user_id,
+                   last_reviewed_by, last_reviewed_at,
+                   last_edited_by, last_edited_at,
+                   created_at, updated_at`,
+        [newState, userId, reg.id]
+      );
+
+      if (updateResult.rows.length === 0) {
+        return res.status(500).json({ ok: false, error: "UPDATE_FAILED" });
+      }
+
+      // Fetch the full content item to return the unified DTO
+      const itemResult = await dbQuery(
+        `SELECT
+           ci.content_item_id,
+           ci.content_type,
+           ci.text,
+           ci.language,
+           ci.notes,
+           ci.cefr_level,
+           ci.topic,
+           ci.naturalness_score,
+           ci.politeness,
+           ci.politeness_en,
+           ci.tense,
+           ci.created_at,
+           ci.updated_at,
+           lri.id AS registry_item_id,
+           lri.audience,
+           lri.global_state,
+           lri.operational_status,
+           lri.owner_user_id AS registry_owner_user_id,
+           lri.last_reviewed_by,
+           lri.last_reviewed_at,
+           lri.last_edited_by,
+           lri.last_edited_at,
+           COALESCE(aud.has_audio, false) AS has_audio
+         FROM content_items ci
+         JOIN library_registry_items lri
+           ON lri.content_type = ci.content_type
+          AND lri.content_id = ci.content_item_id
+         LEFT JOIN LATERAL (
+           SELECT true AS has_audio
+           FROM content_item_audio_variants cav
+           WHERE cav.content_item_id = ci.content_item_id
+           LIMIT 1
+         ) aud ON true
+         WHERE ci.content_item_id = $1::uuid`,
+        [contentItemId]
+      );
+
+      if (itemResult.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: "ITEM_NOT_FOUND" });
+      }
+
+      return res.json({ ok: true, item: itemResult.rows[0] });
+    } catch (err) {
+      console.error("global content state transition failed:", err);
+      return res.status(500).json({ ok: false, error: "INTERNAL" });
+    }
+  }
+);
 
 module.exports = router;
