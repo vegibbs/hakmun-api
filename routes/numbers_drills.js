@@ -49,7 +49,7 @@ router.get("/v1/numbers/drills", requireSession, async (req, res) => {
          AND lri.content_id = ci.content_item_id
         WHERE 'module:numbers' = ANY(ci.tags)
           AND lri.audience = 'global'
-          AND lri.global_state = 'approved'
+          AND lri.global_state IN ('preliminary', 'approved')
           AND lri.operational_status = 'active'
       ) combined
       ORDER BY ko
@@ -75,7 +75,7 @@ router.get("/v1/numbers/drills", requireSession, async (req, res) => {
            ON lri.content_type = ci.content_type AND lri.content_id = ci.content_item_id
          WHERE 'module:numbers' = ANY(ci.tags)
            AND lri.audience = 'global'
-           AND lri.global_state = 'approved'
+           AND lri.global_state IN ('preliminary', 'approved')
            AND lri.operational_status = 'active') AS with_valid_lri,
         (SELECT count(*) FROM content_items ci
          LEFT JOIN library_registry_items lri
