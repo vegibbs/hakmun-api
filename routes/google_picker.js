@@ -286,8 +286,9 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
     // Load the Picker API in the background
     gapi.load('picker', { callback: function() { pickerApiReady = true; } });
 
-    // Detect iOS/iPadOS — GIS popup flow doesn't work on mobile Safari
-    // (redirects full-page to a broken "Sign in / Allow cookies" screen).
+    // Detect iOS/iPadOS — GIS popup flow doesn't work in mobile Safari.
+    // On iOS the app opens this page in a WKWebView instead of Safari,
+    // and we skip GIS entirely (use the server-refreshed token directly).
     var isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
@@ -298,8 +299,9 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
       btn.style.display = 'none';
 
       if (isIOS) {
-        // On iOS, skip GIS entirely — use the server-refreshed token directly.
-        // The server already holds a valid access token from our OAuth flow.
+        // On iOS (WKWebView), skip GIS entirely — use the server-refreshed
+        // token directly. The WKWebView's cookie store allows the Picker
+        // iframe to function without browser-side Google auth.
         showPicker(SERVER_TOKEN);
         return;
       }
