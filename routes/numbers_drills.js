@@ -77,6 +77,16 @@ router.get("/v1/numbers/drills", requireSession, async (req, res) => {
            AND lri.audience = 'global'
            AND lri.global_state = 'approved'
            AND lri.operational_status = 'active') AS with_valid_lri,
+        (SELECT count(*) FROM content_items ci
+         LEFT JOIN library_registry_items lri
+           ON lri.content_type = ci.content_type AND lri.content_id = ci.content_item_id
+         WHERE 'module:numbers' = ANY(ci.tags)
+           AND lri.content_id IS NULL) AS no_lri_at_all,
+        (SELECT count(*) FROM content_items ci
+         JOIN library_registry_items lri
+           ON lri.content_type = ci.content_type AND lri.content_id = ci.content_item_id
+         WHERE 'module:numbers' = ANY(ci.tags)
+           AND (lri.global_state != 'approved' OR lri.operational_status != 'active' OR lri.audience != 'global')) AS lri_wrong_state,
         (SELECT count(*) FROM teaching_vocab WHERE 'module:numbers' = ANY(tags)
            AND status IS DISTINCT FROM 'deprecated') AS total_vocab
     `;
