@@ -82,8 +82,14 @@ router.get("/v1/auth/google/start", requireSession, async (req, res) => {
       "https://www.googleapis.com/auth/drive.file"
     ].join(" ");
 
+    // If client passes callback_scheme (e.g. "hakmun"), include it in the signed state
+    // so the callback can redirect to {scheme}://google-auth?success=1 for ASWebAuthenticationSession
+    const callbackScheme = typeof req.query?.callback_scheme === "string" ? req.query.callback_scheme : null;
+
     const nonce = crypto.randomBytes(16).toString("hex");
-    const state = signState({ uid: userId, nonce, ts: Date.now() }, stateSecret);
+    const statePayload = { uid: userId, nonce, ts: Date.now() };
+    if (callbackScheme) statePayload.cb = callbackScheme;
+    const state = signState(statePayload, stateSecret);
 
     const params = new URLSearchParams({
       client_id: clientId,
@@ -180,6 +186,11 @@ router.get("/v1/auth/google/callback", async (req, res) => {
       `,
       [userId, scopeStr, finalRefresh, accessToken, expiresAt]
     );
+
+    // If the state contained a callback_scheme, redirect to it so ASWebAuthenticationSession auto-closes
+    if (parsed.cb) {
+      return res.redirect(`${parsed.cb}://google-auth?success=1`);
+    }
 
     return res.status(200).send("Google connected. You can return to HakMun.");
   } catch (err) {
