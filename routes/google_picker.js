@@ -181,11 +181,15 @@ router.get("/v1/google-picker", async (req, res) => {
       );
     }
 
+    // Build the current page URL so the sign-in redirect can come back here
+    const pageUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+
     const html = pickerPageHTML({
       accessToken,
       pickerApiKey,
       clientId,
-      callbackScheme
+      callbackScheme,
+      pageUrl
     });
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -203,7 +207,7 @@ router.get("/v1/google-picker", async (req, res) => {
   }
 });
 
-function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme }) {
+function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, pageUrl }) {
   // Escape values for safe embedding in JS string literals
   const esc = (s) => String(s || "")
     .replace(/\\/g, "\\\\")
@@ -234,18 +238,52 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme })
     .status {
       text-align: center;
       font-size: 16px;
+      max-width: 360px;
     }
-    .error { color: #d32f2f; }
+    .signin-btn {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 10px 24px;
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .signin-btn:hover { background: #1765cc; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
   <div id="status" class="status">Loading Google Drive&hellip;</div>
+  <div id="signin" class="status hidden">
+    <p>Sign in to your Google account to select a document.</p>
+    <a id="signin-link" class="signin-btn" href="#">Sign in to Google</a>
+  </div>
 
   <script src="https://apis.google.com/js/api.js"></script>
   <script>
     var OAUTH_TOKEN = '${esc(accessToken)}';
     var API_KEY = '${esc(pickerApiKey)}';
+    var CLIENT_ID = '${esc(clientId)}';
     var CALLBACK_SCHEME = '${esc(callbackScheme)}';
+    var PAGE_URL = '${esc(pageUrl)}';
+
+    var pickerLoaded = false;
+    var pickerTimeout = null;
+
+    function showSignIn() {
+      document.getElementById('status').style.display = 'none';
+      document.getElementById('signin').style.display = 'block';
+
+      // Build Google sign-in URL that redirects back to this Picker page
+      var signinUrl = 'https://accounts.google.com/ServiceLogin'
+        + '?continue=' + encodeURIComponent(PAGE_URL);
+      document.getElementById('signin-link').href = signinUrl;
+    }
 
     function onPickerApiLoad() {
       try {
@@ -264,10 +302,11 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme })
           .build();
 
         picker.setVisible(true);
+        pickerLoaded = true;
+        if (pickerTimeout) clearTimeout(pickerTimeout);
         document.getElementById('status').style.display = 'none';
       } catch (e) {
-        document.getElementById('status').className = 'status error';
-        document.getElementById('status').textContent = 'Could not load the file picker. Please try again.';
+        showSignIn();
       }
     }
 
@@ -283,6 +322,14 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme })
         window.location.href = CALLBACK_SCHEME + '://google-picker?cancelled=1';
       }
     }
+
+    // If the Picker hasn't rendered after 4 seconds, cookies are probably blocked.
+    // Show the sign-in flow instead of a dead-end error.
+    pickerTimeout = setTimeout(function() {
+      if (!pickerLoaded) {
+        showSignIn();
+      }
+    }, 4000);
 
     gapi.load('picker', { callback: onPickerApiLoad });
   </script>
