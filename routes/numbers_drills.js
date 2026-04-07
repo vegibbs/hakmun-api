@@ -57,9 +57,37 @@ router.get("/v1/numbers/drills", requireSession, async (req, res) => {
 
     const { rows } = await dbQuery(sql);
 
+    // Diagnostic: count by source and section to identify missing data
+    const bySource = {};
+    const bySection = {};
+    for (const row of rows) {
+      bySource[row.source] = (bySource[row.source] || 0) + 1;
+      const sec = (row.tags || []).find(t => t.startsWith("section:")) || "unknown";
+      bySection[sec] = (bySection[sec] || 0) + 1;
+    }
+
+    // Diagnostic: check content_items that exist but may lack valid LRI entries
+    const diagSql = `
+      SELECT
+        (SELECT count(*) FROM content_items WHERE 'module:numbers' = ANY(tags)) AS total_content_items,
+        (SELECT count(*) FROM content_items ci
+         JOIN library_registry_items lri
+           ON lri.content_type = ci.content_type AND lri.content_id = ci.content_item_id
+         WHERE 'module:numbers' = ANY(ci.tags)
+           AND lri.audience = 'global'
+           AND lri.global_state = 'approved'
+           AND lri.operational_status = 'active') AS with_valid_lri,
+        (SELECT count(*) FROM teaching_vocab WHERE 'module:numbers' = ANY(tags)
+           AND status IS DISTINCT FROM 'deprecated') AS total_vocab
+    `;
+    const { rows: diagRows } = await dbQuery(diagSql);
+
     logger.info("[numbers] drills fetched", {
       rid: req._rid,
-      count: rows.length
+      count: rows.length,
+      bySource,
+      bySection,
+      diagnostic: diagRows[0],
     });
 
     return res.json({ ok: true, items: rows });
