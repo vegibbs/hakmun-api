@@ -323,10 +323,12 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
       }
 
       try {
-        var docsView = new google.picker.DocsView(google.picker.ViewId.DOCS)
-          .setIncludeFolders(true)
+        // Flat list of Google Docs only — no folders, no navigation clutter
+        var docsView = new google.picker.DocsView()
+          .setIncludeFolders(false)
           .setSelectFolderEnabled(false)
-          .setMimeTypes('application/vnd.google-apps.document');
+          .setMimeTypes('application/vnd.google-apps.document')
+          .setMode(google.picker.DocsViewMode.LIST);
 
         var picker = new google.picker.PickerBuilder()
           .addView(docsView)
@@ -336,6 +338,7 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
           .setOrigin(window.location.protocol + '//' + window.location.host)
           .setTitle('Select a Google Doc')
           .setMaxItems(1)
+          .enableFeature(google.picker.Feature.NAV_HIDDEN)
           .build();
 
         picker.setVisible(true);
