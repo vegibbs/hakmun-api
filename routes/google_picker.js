@@ -114,22 +114,6 @@ router.get("/v1/google-picker", async (req, res) => {
     const pageToken = typeof req.query?.page_token === "string" ? req.query.page_token.trim() : "";
     if (!pageToken) return res.status(400).send("Missing page_token");
 
-    // First visit: redirect through Google sign-in to establish fresh cookies in Safari.
-    // Google auto-redirects back if already signed in (no manual step needed).
-    // The &gauth=1 flag prevents infinite redirect loops.
-    if (req.query.gauth !== "1") {
-      const callbackScheme = typeof req.query?.callback_scheme === "string"
-        ? req.query.callback_scheme.replace(/[^a-zA-Z0-9.-]/g, "")
-        : "hakmun";
-      const pickerUrl = `${req.protocol}://${req.get("host")}/v1/google-picker`
-        + `?page_token=${encodeURIComponent(pageToken)}`
-        + `&callback_scheme=${encodeURIComponent(callbackScheme)}`
-        + `&gauth=1`;
-      const signinUrl = `https://accounts.google.com/ServiceLogin`
-        + `?continue=${encodeURIComponent(pickerUrl)}`;
-      return res.redirect(signinUrl);
-    }
-
     // Validate the page token (reusable within its 5-minute window so Safari can reload if needed)
     const tokenR = await withTimeout(
       pool.query(
@@ -251,57 +235,93 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
     @media (prefers-color-scheme: dark) {
       body { background: #1d1d1f; color: #f5f5f7; }
     }
-    .status {
+    .container {
       text-align: center;
-      font-size: 16px;
       max-width: 360px;
     }
-    .signin-btn {
-      display: inline-block;
-      margin-top: 16px;
-      padding: 10px 24px;
+    .drive-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 28px;
       background: #1a73e8;
       color: #fff;
       border: none;
       border-radius: 8px;
-      font-size: 15px;
+      font-size: 16px;
       font-weight: 500;
       cursor: pointer;
-      text-decoration: none;
     }
-    .signin-btn:hover { background: #1765cc; }
+    .drive-btn:hover { background: #1765cc; }
+    .drive-btn:disabled { background: #94b8e8; cursor: default; }
+    .subtitle {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #888;
+    }
     .hidden { display: none; }
   </style>
 </head>
 <body>
-  <div id="status" class="status">Loading Google Drive&hellip;</div>
-  <div id="signin" class="status hidden">
-    <p>Sign in to your Google account to select a document.</p>
-    <a id="signin-link" class="signin-btn" href="#">Sign in to Google</a>
+  <div class="container">
+    <div id="loading" class="hidden" style="font-size:16px;">Opening Google Drive&hellip;</div>
+    <button id="drive-btn" class="drive-btn" onclick="startPicker()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M7.71 3.39L1.41 14l3.47 6h12.24l3.47-6L14.29 3.39H7.71z" fill="none" stroke="#fff" stroke-width="1.5"/><path d="M4.88 20L8.35 14h12.24" stroke="#fff" stroke-width="1.5"/><path d="M14.29 3.39L10.82 9.39h-9.41" stroke="#fff" stroke-width="1.5"/></svg>
+      Select from Google Drive
+    </button>
+    <div class="subtitle">A Google sign-in window will open</div>
   </div>
 
+  <script src="https://accounts.google.com/gsi/client"></script>
   <script src="https://apis.google.com/js/api.js"></script>
   <script>
-    var OAUTH_TOKEN = '${esc(accessToken)}';
     var API_KEY = '${esc(pickerApiKey)}';
     var CLIENT_ID = '${esc(clientId)}';
     var CALLBACK_SCHEME = '${esc(callbackScheme)}';
-    var PAGE_URL = '${esc(pageUrl)}';
+    var SERVER_TOKEN = '${esc(accessToken)}';
 
-    var pickerLoaded = false;
-    var pickerTimeout = null;
+    var tokenClient = null;
+    var pickerApiReady = false;
 
-    function showSignIn() {
-      document.getElementById('status').style.display = 'none';
-      document.getElementById('signin').style.display = 'block';
+    // Load the Picker API in the background
+    gapi.load('picker', { callback: function() { pickerApiReady = true; } });
 
-      // Build Google sign-in URL that redirects back to this Picker page
-      var signinUrl = 'https://accounts.google.com/ServiceLogin'
-        + '?continue=' + encodeURIComponent(PAGE_URL);
-      document.getElementById('signin-link').href = signinUrl;
+    function startPicker() {
+      var btn = document.getElementById('drive-btn');
+      btn.disabled = true;
+      document.getElementById('loading').style.display = 'block';
+      btn.style.display = 'none';
+
+      // Use GIS to get a browser-side token (handles Safari ITP properly).
+      // The user already authorized drive.file via our server OAuth, so GIS
+      // shows an account picker at most — no consent screen.
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: 'https://www.googleapis.com/auth/drive.file',
+        callback: function(tokenResponse) {
+          if (tokenResponse && tokenResponse.access_token) {
+            showPicker(tokenResponse.access_token);
+          } else {
+            // GIS failed — fall back to server-provided token
+            showPicker(SERVER_TOKEN);
+          }
+        },
+        error_callback: function(err) {
+          // GIS error — fall back to server-provided token
+          showPicker(SERVER_TOKEN);
+        }
+      });
+
+      tokenClient.requestAccessToken({ prompt: '' });
     }
 
-    function onPickerApiLoad() {
+    function showPicker(accessToken) {
+      if (!pickerApiReady) {
+        // Picker API not loaded yet — wait and retry
+        setTimeout(function() { showPicker(accessToken); }, 500);
+        return;
+      }
+
       try {
         var docsView = new google.picker.DocsView(google.picker.ViewId.DOCS)
           .setIncludeFolders(true)
@@ -310,19 +330,18 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
 
         var picker = new google.picker.PickerBuilder()
           .addView(docsView)
-          .setOAuthToken(OAUTH_TOKEN)
+          .setOAuthToken(accessToken)
           .setDeveloperKey(API_KEY)
           .setCallback(pickerCallback)
+          .setOrigin(window.location.protocol + '//' + window.location.host)
           .setTitle('Select a Google Doc')
           .setMaxItems(1)
           .build();
 
         picker.setVisible(true);
-        pickerLoaded = true;
-        if (pickerTimeout) clearTimeout(pickerTimeout);
-        document.getElementById('status').style.display = 'none';
+        document.getElementById('loading').style.display = 'none';
       } catch (e) {
-        showSignIn();
+        document.getElementById('loading').textContent = 'Could not load Google Drive. Please close this tab and try again.';
       }
     }
 
@@ -338,16 +357,6 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
         window.location.href = CALLBACK_SCHEME + '://google-picker?cancelled=1';
       }
     }
-
-    // If the Picker hasn't rendered after 4 seconds, cookies are probably blocked.
-    // Show the sign-in flow instead of a dead-end error.
-    pickerTimeout = setTimeout(function() {
-      if (!pickerLoaded) {
-        showSignIn();
-      }
-    }, 4000);
-
-    gapi.load('picker', { callback: onPickerApiLoad });
   </script>
 </body>
 </html>`;
