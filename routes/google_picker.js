@@ -286,13 +286,25 @@ function pickerPageHTML({ accessToken, pickerApiKey, clientId, callbackScheme, p
     // Load the Picker API in the background
     gapi.load('picker', { callback: function() { pickerApiReady = true; } });
 
+    // Detect iOS/iPadOS — GIS popup flow doesn't work on mobile Safari
+    // (redirects full-page to a broken "Sign in / Allow cookies" screen).
+    var isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
     function startPicker() {
       var btn = document.getElementById('drive-btn');
       btn.disabled = true;
       document.getElementById('loading').style.display = 'block';
       btn.style.display = 'none';
 
-      // Use GIS to get a browser-side token (handles Safari ITP properly).
+      if (isIOS) {
+        // On iOS, skip GIS entirely — use the server-refreshed token directly.
+        // The server already holds a valid access token from our OAuth flow.
+        showPicker(SERVER_TOKEN);
+        return;
+      }
+
+      // On macOS, use GIS to get a browser-side token (handles Safari ITP properly).
       // The user already authorized drive.file via our server OAuth, so GIS
       // shows an account picker at most — no consent screen.
       tokenClient = google.accounts.oauth2.initTokenClient({
