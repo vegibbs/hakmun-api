@@ -114,13 +114,11 @@ router.get("/v1/google-picker", async (req, res) => {
     const pageToken = typeof req.query?.page_token === "string" ? req.query.page_token.trim() : "";
     if (!pageToken) return res.status(400).send("Missing page_token");
 
-    // Validate and consume the page token
+    // Validate the page token (reusable within its 5-minute window so Safari can reload if needed)
     const tokenR = await withTimeout(
       pool.query(
-        `UPDATE google_picker_tokens
-         SET used = true
-         WHERE token = $1 AND used = false AND expires_at > now()
-         RETURNING user_id`,
+        `SELECT user_id FROM google_picker_tokens
+         WHERE token = $1 AND expires_at > now()`,
         [pageToken]
       ),
       8000,
