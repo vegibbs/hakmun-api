@@ -114,6 +114,22 @@ router.get("/v1/google-picker", async (req, res) => {
     const pageToken = typeof req.query?.page_token === "string" ? req.query.page_token.trim() : "";
     if (!pageToken) return res.status(400).send("Missing page_token");
 
+    // First visit: redirect through Google sign-in to establish fresh cookies in Safari.
+    // Google auto-redirects back if already signed in (no manual step needed).
+    // The &gauth=1 flag prevents infinite redirect loops.
+    if (req.query.gauth !== "1") {
+      const callbackScheme = typeof req.query?.callback_scheme === "string"
+        ? req.query.callback_scheme.replace(/[^a-zA-Z0-9.-]/g, "")
+        : "hakmun";
+      const pickerUrl = `${req.protocol}://${req.get("host")}/v1/google-picker`
+        + `?page_token=${encodeURIComponent(pageToken)}`
+        + `&callback_scheme=${encodeURIComponent(callbackScheme)}`
+        + `&gauth=1`;
+      const signinUrl = `https://accounts.google.com/ServiceLogin`
+        + `?continue=${encodeURIComponent(pickerUrl)}`;
+      return res.redirect(signinUrl);
+    }
+
     // Validate the page token (reusable within its 5-minute window so Safari can reload if needed)
     const tokenR = await withTimeout(
       pool.query(
