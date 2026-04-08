@@ -348,28 +348,23 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
 
     // Sessions derived from full doc structure (HEADING_1 dated headers)
     const sessionsAll = buildSessionsFromDocBody(body);
-    if (!Array.isArray(sessionsAll) || sessionsAll.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "GOOGLE_DOC_FORMAT_REQUIRED",
-        detail: "No dated HEADING_1 sessions found (expected YYYY.M.D or YYYY.MM.DD)."
-      });
-    }
+    const hasSessionStructure = Array.isArray(sessionsAll) && sessionsAll.length > 0;
 
-    // Keep only the last 90 days of sessions
-    const sessions = filterSessionsLastNDays(sessionsAll, 90);
-    if (!Array.isArray(sessions) || sessions.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "NO_RECENT_SESSIONS",
-        detail: "No sessions found in the last 90 days."
-      });
+    // If sessions exist, filter to last 90 days; otherwise render the full doc
+    let includeRanges = null;
+    let sessions = [];
+    if (hasSessionStructure) {
+      sessions = filterSessionsLastNDays(sessionsAll, 90);
+      if (sessions.length > 0) {
+        includeRanges = sessions.map(s => ({ start: s.start_block_index, end: s.end_block_index }));
+      } else {
+        // Has dated sessions but none in the last 90 days — render full doc instead of rejecting
+        includeRanges = null;
+      }
     }
-
-    // Include ranges for the selected sessions
-    const includeRanges = sessions.map(s => ({ start: s.start_block_index, end: s.end_block_index }));
 
     function inIncludedRanges(globalIdx) {
+      if (!includeRanges) return true; // no session filter — include everything
       for (const r of includeRanges) {
         if (globalIdx >= r.start && globalIdx <= r.end) return true;
       }
@@ -377,7 +372,7 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
     }
 
     // Build HTML from included blocks with a strict budget
-    const MAX_CHARS = 1_200_000; // snapshot text budget for 90-day window
+    const MAX_CHARS = 1_200_000; // snapshot text budget
     const MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 
     let globalIdx = -1;
@@ -578,7 +573,8 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
       document_id: user_document_id,
       expiresIn: 900,
       sessions_included: sessions.length,
-      days_window: 90,
+      has_session_structure: hasSessionStructure,
+      days_window: includeRanges ? 90 : null,
       imported_texts,
       imported_fragment_texts,
       practice_list_texts
