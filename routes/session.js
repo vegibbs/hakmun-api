@@ -4,7 +4,7 @@
 const express = require("express");
 
 const { logger } = require("../util/log");
-const { requireSession, verifySessionJWT, issueSessionTokens, getUserState } = require("../auth/session");
+const { requireSession, verifySessionJWT, issueSessionTokens, getUserState, touchLastSeen } = require("../auth/session");
 
 const router = express.Router();
 
@@ -36,6 +36,7 @@ router.post("/v1/session/refresh", async (req, res) => {
     }
 
     const tokens = await issueSessionTokens({ userID: decoded.userID });
+    touchLastSeen(decoded.userID).catch(() => {});
     return res.json(tokens);
   } catch (err) {
     // Keep exact alert match strings from the epic.
