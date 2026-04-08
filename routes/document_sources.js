@@ -92,6 +92,14 @@ async function getValidGoogleAccessToken({ userId }) {
     throw err;
   }
 
+  logger.info("[document-sources] google oauth conn", {
+    userId,
+    scopes: conn.scopes || "<empty>",
+    has_refresh_token: !!conn.refresh_token,
+    has_access_token: !!conn.access_token,
+    token_expires: conn.access_token_expires_at || null
+  });
+
   let accessToken = conn.access_token || null;
   const expiresAt = conn.access_token_expires_at ? new Date(conn.access_token_expires_at).getTime() : 0;
   const now = Date.now();
@@ -133,7 +141,8 @@ async function fetchGoogleDocTitle({ accessToken, fileId }) {
     logger.error("[document-sources] docs api failed", {
       fileId,
       status: docsResp.status,
-      body: JSON.stringify(docsJson).slice(0, 500)
+      body: JSON.stringify(docsJson).slice(0, 500),
+      scope_on_token: docsResp.headers?.get?.("www-authenticate") || null
     });
     const err = new Error("GOOGLE_DOCS_GET_FAILED");
     err.code = "GOOGLE_DOCS_GET_FAILED";

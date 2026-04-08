@@ -154,6 +154,14 @@ router.get("/v1/auth/google/callback", async (req, res) => {
     const expiresIn = tokenJson.expires_in || null;
     const scopeStr = tokenJson.scope || "";
 
+    console.log("[google-oauth] token exchange result", {
+      userId,
+      has_access_token: !!accessToken,
+      has_refresh_token: !!refreshToken,
+      scope: scopeStr,
+      expires_in: expiresIn
+    });
+
     const expiresAt = expiresIn ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString() : null;
 
     const existing = await dbQuery(

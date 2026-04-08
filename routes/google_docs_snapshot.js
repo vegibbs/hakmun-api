@@ -326,8 +326,10 @@ router.post("/v1/documents/google/snapshot", requireSession, async (req, res) =>
     if (!docsResp.ok) {
       logger.error("[google-snapshot] docs api failed", {
         fileId,
+        userId,
         status: docsResp.status,
-        body: JSON.stringify(docsJson).slice(0, 500)
+        body: JSON.stringify(docsJson).slice(0, 500),
+        stored_scopes: conn.scopes || "<empty>"
       });
 
       if (docsResp.status === 401 || docsResp.status === 403) {
