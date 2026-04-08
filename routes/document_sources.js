@@ -215,18 +215,26 @@ router.post("/v1/documents/sources", requireSession, async (req, res) => {
     const fileId = extractGoogleDocFileId(url);
     if (!fileId) return res.status(400).json({ ok: false, error: "INVALID_GOOGLE_DOC_LINK" });
 
-    let accessToken;
-    try {
-      accessToken = await getValidGoogleAccessToken({ userId });
-    } catch (e) {
-      if (e?.code === "GOOGLE_NOT_CONNECTED" || String(e?.message || "").includes("GOOGLE_NOT_CONNECTED")) {
-        return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
-      }
-      throw e;
-    }
+    // Use client-provided title (from Picker callback) if available;
+    // otherwise fall back to fetching from Google Docs API.
+    // The Picker's per-file grant lives on the browser's GIS token,
+    // not the server's refresh token, so the API call fails for new users.
+    const clientTitle = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+    let title = clientTitle || null;
 
-    // Fetch title live (metadata only)
-    const title = await fetchGoogleDocTitle({ accessToken, fileId });
+    if (!title) {
+      let accessToken;
+      try {
+        accessToken = await getValidGoogleAccessToken({ userId });
+      } catch (e) {
+        if (e?.code === "GOOGLE_NOT_CONNECTED" || String(e?.message || "").includes("GOOGLE_NOT_CONNECTED")) {
+          return res.status(400).json({ ok: false, error: "GOOGLE_NOT_CONNECTED" });
+        }
+        throw e;
+      }
+
+      title = await fetchGoogleDocTitle({ accessToken, fileId });
+    }
 
     const upsertR = await withTimeout(
       pool.query(
