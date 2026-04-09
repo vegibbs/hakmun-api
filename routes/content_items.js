@@ -157,12 +157,11 @@ router.get("/v1/library/global/items", requireSession, async (req, res) => {
       stateFilter = `AND lri.global_state = $${paramIdx++}`;
       params.push(requestedState);
     } else if (isApprover) {
-      // Approver with no filter → show all non-null states
+      // Approver with no filter → show all non-null states (including rejected for review)
       stateFilter = `AND lri.global_state IS NOT NULL`;
     } else {
-      // Non-approver → approved only
-      stateFilter = `AND lri.global_state = $${paramIdx++}`;
-      params.push("approved");
+      // Non-approver → all global items except rejected
+      stateFilter = `AND lri.global_state IS NOT NULL AND lri.global_state != 'rejected'`;
     }
 
     // Module tag filter clause
