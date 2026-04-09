@@ -387,8 +387,13 @@ router.post("/v1/hanja/:id/practice-session", requireSession, async (req, res) =
     }
 
     // 4. Generate via AI only for words without existing sentences
+    const MAX_SENTENCES = 25;
     let generated = [];
-    if (uncoveredWords.length > 0) {
+    const slotsRemaining = MAX_SENTENCES - foundSentences.length;
+    if (uncoveredWords.length > 0 && slotsRemaining > 0) {
+      // Cap per-word count so we only generate what fits
+      const effectiveCount = Math.min(count, Math.ceil(slotsRemaining / uncoveredWords.length));
+
       // Fetch user CEFR level range
       let cefrLevel = "A1";
       let cefrTarget = null;
@@ -420,7 +425,7 @@ Include the practiced word in the source_words array for each sentence.`;
         cefrLevel,
         cefrTarget,
         glossLang: "en",
-        count,
+        count: effectiveCount,
         perspective,
         politeness,
         timeoutMs: LLM_TIMEOUT
@@ -449,8 +454,7 @@ Include the practiced word in the source_words array for each sentence.`;
       }
     }
 
-    // 5. Combine: existing sentences first, then generated (cap at 20)
-    const MAX_SENTENCES = 20;
+    // 5. Combine: existing sentences first, then generated (cap at 25)
     const allSentences = [...foundSentences, ...generated].slice(0, MAX_SENTENCES);
 
     return res.json({
