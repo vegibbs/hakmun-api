@@ -1,0 +1,110 @@
+name: Security Scan (Phase 1)
+
+# Phase 1 of the atlas-secure program: deterministic, free, low-noise
+# security scanners that run on every push, every PR, and nightly.
+#
+# Stack:
+#   - gitleaks    : secret scanning across full git history
+#   - semgrep     : SAST (OWASP Top 10 + security-audit + JS rules)
+#   - osv-scanner : dependency CVE scanning (package-lock.json)
+#
+# Failure policy: each job is `continue-on-error: true` so one broken
+# scanner doesn't block the others. Findings are uploaded as workflow
+# artifacts for triage. Phase 2 (LLM triage digest) will consume these
+# artifacts from atlas-secure.
+#
+# Do not add `railway run` or anything touching production DBs here.
+# This workflow runs on ephemeral GitHub-hosted runners only.
+
+on:
+  push:
+    branches: [main, sandbox]
+  pull_request:
+    branches: [main, sandbox]
+  schedule:
+    # 07:00 UTC daily = 03:00 ET. Catches new CVEs overnight.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+
+  semgrep:
+    name: SAST (semgrep)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run semgrep
+        run: |
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/javascript \
+            --config p/nodejs \
+            --config p/expressjs \
+            --sarif \
+            --output semgrep.sarif \
+            --metrics=off || true
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  osv-scanner:
+    name: Dependency CVEs (osv-scanner)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run osv-scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v1.9.0
+        with:
+          scan-args: |-
+            --lockfile=package-lock.json
+            --format=sarif
+            --output=osv.sarif
+            ./
+
+      - name: Upload SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osv-sarif
+          path: osv.sarif
+          if-no-files-found: warn
+          retention-days: 30
