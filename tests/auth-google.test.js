@@ -43,8 +43,10 @@ jest.mock("../auth/google", () => ({
 
 // ── Mock auth/apple ───────────────────────────────────────────
 const mockVerifyAppleToken = jest.fn();
+const mockVerifyAppleCode = jest.fn();
 jest.mock("../auth/apple", () => ({
   verifyAppleToken: (...args) => mockVerifyAppleToken(...args),
+  verifyAppleCode: (...args) => mockVerifyAppleCode(...args),
   APPLE_CLIENT_IDS: ["com.vgibbs.hakmun"],
 }));
 
@@ -218,8 +220,8 @@ describe("POST /v1/auth/google", () => {
 });
 
 // ── Apple Sign-In Regression ──────────────────────────────────
-describe("POST /v1/auth/apple (regression)", () => {
-  test("7. still works after ensureCanonicalUser refactor", async () => {
+describe("POST /v1/auth/apple", () => {
+  test("7. native flow still works after web flow addition", async () => {
     mockVerifyAppleToken.mockResolvedValue({
       appleSubject: "apple-sub-123",
       audience: "com.vgibbs.hakmun",
@@ -243,5 +245,55 @@ describe("POST /v1/auth/apple (regression)", () => {
       }),
       expect.any(String)
     );
+  });
+
+  test("8. web flow: successful sign-in with code + redirectUri", async () => {
+    mockVerifyAppleCode.mockResolvedValue({
+      appleSubject: "apple-sub-web-456",
+      audience: "com.hakmun.web",
+      email: "webuser@icloud.com",
+    });
+
+    const res = await request(app)
+      .post("/v1/auth/apple")
+      .send({
+        code: "valid-apple-auth-code",
+        redirectUri: "https://app.hakmunapp.com/auth/apple/callback",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.accessToken).toBe("access-token-123");
+    expect(res.body.user.userID).toBe(TEST_USER_ID);
+
+    expect(mockVerifyAppleCode).toHaveBeenCalledWith(
+      "valid-apple-auth-code",
+      "https://app.hakmunapp.com/auth/apple/callback"
+    );
+    expect(mockEnsureCanonicalUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "apple",
+        subject: "apple-sub-web-456",
+        audience: "com.hakmun.web",
+      }),
+      expect.any(String)
+    );
+  });
+
+  test("9. web flow: rejects missing redirectUri", async () => {
+    const res = await request(app)
+      .post("/v1/auth/apple")
+      .send({ code: "valid-apple-auth-code" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/redirectUri/i);
+  });
+
+  test("10. rejects empty body (neither identityToken nor code)", async () => {
+    const res = await request(app)
+      .post("/v1/auth/apple")
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/identityToken|code/i);
   });
 });

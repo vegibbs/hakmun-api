@@ -7,7 +7,7 @@ const { pool } = require("../db/pool");
 const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
 
-const { verifyAppleToken } = require("../auth/apple");
+const { verifyAppleToken, verifyAppleCode } = require("../auth/apple");
 const { ensureCanonicalUser } = require("../auth/identity");
 const { issueSessionTokens, getUserState, requireSession } = require("../auth/session");
 const { audit } = require("../util/audit");
@@ -31,14 +31,32 @@ function requireJsonField(req, res, fieldName) {
 ------------------------------------------------------------------ */
 router.post("/v1/auth/apple", async (req, res) => {
   logger.info("[/v1/auth/apple] START", { rid: req._rid });
-  res.set("X-HakMun-AuthApple", "v0.12");
+  res.set("X-HakMun-AuthApple", "v0.13");
 
   try {
-    const identityToken = requireJsonField(req, res, "identityToken");
-    if (!identityToken) return;
+    // Two flows:
+    //   Native: { identityToken } — client sends Apple identity JWT directly
+    //   Web:    { code, redirectUri } — client sends authorization code from Apple OAuth redirect
+    const identityToken = req.body?.identityToken;
+    const code = req.body?.code;
 
-    const { appleSubject, audience, email } = await verifyAppleToken(identityToken);
-    logger.info("[/v1/auth/apple] verified", { rid: req._rid, audience, hasEmail: Boolean(email) });
+    let appleSubject, audience, email;
+
+    if (code) {
+      // Web flow: exchange authorization code with Apple
+      const redirectUri = req.body?.redirectUri;
+      if (!redirectUri || String(redirectUri).trim() === "") {
+        return res.status(400).json({ error: "redirectUri is required for web sign-in" });
+      }
+      ({ appleSubject, audience, email } = await verifyAppleCode(String(code), String(redirectUri)));
+      logger.info("[/v1/auth/apple] web flow verified", { rid: req._rid, audience, hasEmail: Boolean(email) });
+    } else if (identityToken) {
+      // Native flow: verify identity token directly
+      ({ appleSubject, audience, email } = await verifyAppleToken(String(identityToken)));
+      logger.info("[/v1/auth/apple] native flow verified", { rid: req._rid, audience, hasEmail: Boolean(email) });
+    } else {
+      return res.status(400).json({ error: "identityToken or code is required" });
+    }
 
     const userID = await withTimeout(
       ensureCanonicalUser({ provider: "apple", subject: appleSubject, audience, email }, req._rid),
@@ -125,8 +143,11 @@ router.post("/v1/auth/apple", async (req, res) => {
     const msg = String(err?.message || err);
     logger.error("/v1/auth/apple failed", { rid: req._rid, err: msg });
 
-    if (msg.startsWith("timeout:apple-jwtVerify")) {
+    if (msg.startsWith("timeout:apple-jwtVerify") || msg.startsWith("timeout:apple-web-jwtVerify")) {
       return res.status(503).json({ error: "apple verification timeout" });
+    }
+    if (msg.startsWith("timeout:apple-token-exchange")) {
+      return res.status(503).json({ error: "apple token exchange timeout" });
     }
     if (msg.startsWith("timeout:ensureCanonicalUser")) {
       return res.status(503).json({ error: "db timeout: ensureCanonicalUser" });
