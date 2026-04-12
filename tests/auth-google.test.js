@@ -5,7 +5,7 @@
  * Tests:
  *   1. Google: rejects missing code
  *   2. Google: rejects missing redirectUri
- *   3. Google: successful sign-in (new user)
+ *   3. Google: returns provisional token for new identity (no auto-create)
  *   4. Google: successful sign-in (existing user)
  *   5. Google: returns 401 on invalid code
  *   6. Google: returns 403 on disabled account
@@ -20,11 +20,15 @@ jest.mock("../db/pool", () => ({
 
 // ── Mock auth/session ─────────────────────────────────────────
 const mockIssueSessionTokens = jest.fn();
+const mockIssueProvisionalToken = jest.fn();
+const mockVerifyProvisionalToken = jest.fn();
 const mockGetUserState = jest.fn();
 const mockTouchLastSeen = jest.fn();
 
 jest.mock("../auth/session", () => ({
   issueSessionTokens: (...args) => mockIssueSessionTokens(...args),
+  issueProvisionalToken: (...args) => mockIssueProvisionalToken(...args),
+  verifyProvisionalToken: (...args) => mockVerifyProvisionalToken(...args),
   getUserState: (...args) => mockGetUserState(...args),
   touchLastSeen: (...args) => mockTouchLastSeen(...args),
   requireSession: (req, res, next) => next(),
@@ -52,8 +56,10 @@ jest.mock("../auth/apple", () => ({
 
 // ── Mock auth/identity ────────────────────────────────────────
 const mockEnsureCanonicalUser = jest.fn();
+const mockFindUserByIdentity = jest.fn();
 jest.mock("../auth/identity", () => ({
   ensureCanonicalUser: (...args) => mockEnsureCanonicalUser(...args),
+  findUserByIdentity: (...args) => mockFindUserByIdentity(...args),
 }));
 
 // ── Mock util/audit ───────────────────────────────────────────
@@ -99,8 +105,10 @@ const TEST_USER_STATE = {
 beforeEach(() => {
   jest.clearAllMocks();
   mockIssueSessionTokens.mockResolvedValue(TEST_TOKENS);
+  mockIssueProvisionalToken.mockResolvedValue("provisional-token-xyz");
   mockGetUserState.mockResolvedValue(TEST_USER_STATE);
   mockEnsureCanonicalUser.mockResolvedValue(TEST_USER_ID);
+  mockFindUserByIdentity.mockResolvedValue(null); // default: unknown identity
   mockTouchLastSeen.mockResolvedValue(undefined);
 });
 
@@ -124,13 +132,14 @@ describe("POST /v1/auth/google", () => {
     expect(res.body.error).toMatch(/redirectUri/i);
   });
 
-  test("3. successful sign-in (new user)", async () => {
+  test("3. returns provisional token for new identity (no auto-create)", async () => {
     mockVerifyGoogleCode.mockResolvedValue({
       googleSubject: "google-sub-123",
       audience: "test-google-client-id",
       email: "test@gmail.com",
       name: "Test User",
     });
+    mockFindUserByIdentity.mockResolvedValue(null); // unknown identity
 
     const res = await request(app)
       .post("/v1/auth/google")
@@ -140,20 +149,15 @@ describe("POST /v1/auth/google", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.accessToken).toBe("access-token-123");
-    expect(res.body.refreshToken).toBe("refresh-token-456");
-    expect(res.body.user.userID).toBe(TEST_USER_ID);
-    expect(res.body.user.role).toBe("student");
+    expect(res.body.status).toBe("new_identity");
+    expect(res.body.provisionalToken).toBe("provisional-token-xyz");
+    expect(res.body.provider).toBe("google");
+    expect(res.body.email).toBe("test@gmail.com");
+    expect(res.body.name).toBe("Test User");
 
-    // Verify ensureCanonicalUser was called with provider: "google"
-    expect(mockEnsureCanonicalUser).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "google",
-        subject: "google-sub-123",
-        audience: "test-google-client-id",
-      }),
-      expect.any(String)
-    );
+    // Should NOT have created a user
+    expect(mockEnsureCanonicalUser).not.toHaveBeenCalled();
+    expect(mockIssueSessionTokens).not.toHaveBeenCalled();
   });
 
   test("4. successful sign-in (existing user)", async () => {
@@ -165,7 +169,7 @@ describe("POST /v1/auth/google", () => {
     });
 
     const existingUserID = "dddddddd-eeee-1111-8888-ffffffffffff";
-    mockEnsureCanonicalUser.mockResolvedValue(existingUserID);
+    mockFindUserByIdentity.mockResolvedValue(existingUserID);
     mockGetUserState.mockResolvedValue({
       ...TEST_USER_STATE,
       role: "teacher",
@@ -179,9 +183,13 @@ describe("POST /v1/auth/google", () => {
       });
 
     expect(res.status).toBe(200);
+    expect(res.body.accessToken).toBe("access-token-123");
     expect(res.body.user.userID).toBe(existingUserID);
     expect(res.body.user.role).toBe("teacher");
     expect(res.body.user.isTeacher).toBe(true);
+
+    // Should NOT have auto-created
+    expect(res.body.status).toBeUndefined();
   });
 
   test("5. returns 401 on invalid code", async () => {
@@ -205,6 +213,7 @@ describe("POST /v1/auth/google", () => {
       email: "disabled@gmail.com",
       name: "Disabled User",
     });
+    mockFindUserByIdentity.mockResolvedValue(TEST_USER_ID);
     mockGetUserState.mockResolvedValue({ ...TEST_USER_STATE, is_active: false });
 
     const res = await request(app)

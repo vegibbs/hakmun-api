@@ -41,6 +41,7 @@ const ROOT_ADMIN_USER_IDS =
 // Session token lifetimes (seconds) — constants as in original
 const SESSION_ACCESS_TTL_SEC = 60 * 30; // 30 minutes
 const SESSION_REFRESH_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
+const PROVISIONAL_TTL_SEC = 60 * 10; // 10 minutes — short-lived for account setup flow
 
 // Session JWT claims
 const SESSION_ISSUER = "hakmun-api";
@@ -322,6 +323,52 @@ async function issueSessionTokens({ userID }) {
   };
 }
 
+/**
+ * Issue a provisional token for the account setup flow.
+ * Encodes a verified provider identity without creating a user.
+ * Cannot be used as a bearer token — requireSession rejects typ !== "access".
+ */
+async function issueProvisionalToken({ provider, sub, audience, email, name }) {
+  const iat = nowSeconds();
+  return new SignJWT({
+    typ: "provisional",
+    provider: String(provider),
+    providerSub: String(sub),
+    providerAudience: String(audience),
+    email: email || null,
+    name: name || null
+  })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer(SESSION_ISSUER)
+    .setAudience(SESSION_AUDIENCE)
+    .setIssuedAt(iat)
+    .setExpirationTime(iat + PROVISIONAL_TTL_SEC)
+    .sign(Buffer.from(SESSION_JWT_SECRET));
+}
+
+/**
+ * Verify a provisional token and return the encoded provider identity.
+ * Throws if expired, invalid, or wrong typ.
+ */
+async function verifyProvisionalToken(token) {
+  const { payload } = await jwtVerify(token, Buffer.from(SESSION_JWT_SECRET), {
+    issuer: SESSION_ISSUER,
+    audience: SESSION_AUDIENCE
+  });
+
+  if (payload.typ !== "provisional") {
+    throw new Error("expected provisional token");
+  }
+
+  return {
+    provider: String(payload.provider),
+    sub: String(payload.providerSub),
+    audience: String(payload.providerAudience),
+    email: payload.email || null,
+    name: payload.name || null
+  };
+}
+
 async function verifySessionJWT(token) {
   const { payload } = await jwtVerify(token, Buffer.from(SESSION_JWT_SECRET), {
     issuer: SESSION_ISSUER,
@@ -402,6 +449,8 @@ module.exports = {
   extractBearerToken,
   verifySessionJWT,
   issueSessionTokens,
+  issueProvisionalToken,
+  verifyProvisionalToken,
 
   // state + entitlements
   getUserState,

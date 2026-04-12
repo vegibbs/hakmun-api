@@ -7,6 +7,43 @@ const { withTimeout } = require("../util/time");
 const { touchLastSeen } = require("./session");
 
 /**
+ * Look up a user by provider identity WITHOUT creating anything.
+ * Returns the user_id if found, null if not.
+ */
+async function findUserByIdentity({ provider, subject, audience }) {
+  // Exact match: provider + subject + audience
+  const rExact = await pool.query(
+    `SELECT user_id FROM auth_identities
+     WHERE provider = $1 AND subject = $2 AND audience = $3
+     LIMIT 1`,
+    [provider, subject, audience]
+  );
+  if (rExact.rows?.[0]?.user_id) return rExact.rows[0].user_id;
+
+  // Same subject, different audience (e.g., web vs native client ID)
+  const rAny = await pool.query(
+    `SELECT user_id FROM auth_identities
+     WHERE provider = $1 AND subject = $2
+     LIMIT 1`,
+    [provider, subject]
+  );
+  if (rAny.rows?.[0]?.user_id) return rAny.rows[0].user_id;
+
+  // Legacy Apple bridge: check users.apple_user_id
+  if (provider === "apple") {
+    const rLegacy = await pool.query(
+      `SELECT user_id FROM users
+       WHERE apple_user_id = $1
+       LIMIT 1`,
+      [subject]
+    );
+    if (rLegacy.rows?.[0]?.user_id) return rLegacy.rows[0].user_id;
+  }
+
+  return null;
+}
+
+/**
  * Resolve or create a canonical user for the given provider identity.
  *
  * @param {object} opts
@@ -208,4 +245,4 @@ async function ensureCanonicalUser({ provider, subject, audience, email }, rid) 
   }
 }
 
-module.exports = { ensureCanonicalUser };
+module.exports = { ensureCanonicalUser, findUserByIdentity };

@@ -8,8 +8,8 @@ const { logger } = require("../util/log");
 const { withTimeout } = require("../util/time");
 
 const { verifyGoogleCode } = require("../auth/google");
-const { ensureCanonicalUser } = require("../auth/identity");
-const { issueSessionTokens, getUserState } = require("../auth/session");
+const { findUserByIdentity, ensureCanonicalUser } = require("../auth/identity");
+const { issueSessionTokens, issueProvisionalToken, getUserState } = require("../auth/session");
 const { audit } = require("../util/audit");
 
 const router = express.Router();
@@ -41,36 +41,76 @@ router.post("/v1/auth/google", async (req, res) => {
       hasEmail: Boolean(email)
     });
 
-    const userID = await withTimeout(
-      ensureCanonicalUser(
-        { provider: "google", subject: googleSubject, audience, email },
-        req._rid
-      ),
-      6000,
-      "ensureCanonicalUser"
+    // Look up without creating — if no user, return provisional token for setup flow
+    const existingUserID = await withTimeout(
+      findUserByIdentity({ provider: "google", subject: googleSubject, audience }),
+      3000,
+      "findUserByIdentity"
     );
-    logger.info("[/v1/auth/google] canonical", { rid: req._rid, userID });
 
-    const state = await withTimeout(getUserState(userID), 6000, "getUserState");
+    if (!existingUserID) {
+      // Unknown identity — issue provisional token for account setup
+      const provisionalToken = await withTimeout(
+        issueProvisionalToken({
+          provider: "google",
+          sub: googleSubject,
+          audience,
+          email,
+          name
+        }),
+        3000,
+        "issueProvisionalToken"
+      );
+
+      logger.info("[/v1/auth/google] new identity, provisional token issued", {
+        rid: req._rid,
+        hasEmail: Boolean(email),
+        hasName: Boolean(name)
+      });
+
+      return res.json({
+        status: "new_identity",
+        provisionalToken,
+        provider: "google",
+        email: email || null,
+        name: name || null
+      });
+    }
+
+    // Known user — issue session tokens
+    logger.info("[/v1/auth/google] canonical", { rid: req._rid, userID: existingUserID });
+
+    const state = await withTimeout(getUserState(existingUserID), 6000, "getUserState");
 
     if (!Boolean(state.is_active)) {
       return res.status(403).json({ error: "account disabled" });
     }
 
+    // Bind this audience if not already bound (handles web vs native client ID difference)
+    ensureCanonicalUser(
+      { provider: "google", subject: googleSubject, audience, email },
+      req._rid
+    ).catch((err) =>
+      logger.warn("[/v1/auth/google] audience bind failed (non-fatal)", {
+        rid: req._rid,
+        err: err?.message || String(err)
+      })
+    );
+
     const tokens = await withTimeout(
-      issueSessionTokens({ userID }),
+      issueSessionTokens({ userID: existingUserID }),
       3000,
       "issueSessionTokens"
     );
 
-    audit(req, "user.signin", "user", userID, { provider: "google", audience }, userID).catch(
+    audit(req, "user.signin", "user", existingUserID, { provider: "google", audience }, existingUserID).catch(
       () => {}
     );
 
     return res.json({
       ...tokens,
       user: {
-        userID,
+        userID: existingUserID,
         role: state.role,
         isTeacher: String(state.role || "student") === "teacher",
         isAdmin: Boolean(state.is_admin),
