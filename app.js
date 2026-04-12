@@ -71,6 +71,7 @@ app.use(require("./routes/health"));
 app.use(require("./routes/dev"));
 
 app.use(require("./routes/auth_apple"));
+app.use(require("./routes/auth_google"));
 app.use(require("./routes/session"));
 
 app.use(require("./routes/profile_photo"));
